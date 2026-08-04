@@ -16,6 +16,10 @@
   },
   "exceptionLogging": "STACKDRIVER",
   "runtimeVersion": "V8",
+  "webapp": {
+    "executeAs": "USER_DEPLOYING",
+    "access": "MYSELF"
+  },
   "oauthScopes": [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/script.scriptapp",

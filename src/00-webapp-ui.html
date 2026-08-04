@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GAS Email Manager - Admin</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2rem; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; }
+    #app-version { font-size: 0.8rem; font-weight: normal; color: #777; margin-left: 0.5rem; }
+    button { padding: 0.5rem 1rem; margin-right: 0.5rem; cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: 0.6; }
+    .result-box { margin-top: 0.5rem; padding: 0.75rem; border: 1px solid #ccc; border-radius: 4px; background: #fafafa; white-space: pre-wrap; font-family: monospace; font-size: 0.85rem; min-height: 1.2rem; }
+    .tab-bar { display: flex; flex-wrap: wrap; gap: 0.25rem; border-bottom: 1px solid #ccc; margin-top: 1.5rem; }
+    .tab-button { background: none; border: none; border-bottom: 3px solid transparent; padding: 0.5rem 1rem; margin-right: 0; font-size: 1rem; color: #444; cursor: pointer; }
+    .tab-button.active { border-bottom-color: #1a1a1a; color: #1a1a1a; font-weight: bold; }
+    .sub-tab-button { font-size: 0.9rem; }
+    .tab-panel { margin-top: 1rem; }
+    .setting-group { margin-bottom: 1rem; }
+    .setting-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.4rem; }
+    .setting-row label { flex: 0 0 24rem; font-size: 0.85rem; }
+    .setting-row input[type="text"], .setting-row input[type="number"] { flex: 1 1 auto; padding: 0.3rem; }
+    .rows-field { margin-bottom: 1rem; }
+    .rows-field > label { display: block; font-size: 0.85rem; margin-bottom: 0.3rem; }
+    table.rows-table { border-collapse: collapse; width: 100%; margin-bottom: 0.5rem; }
+    table.rows-table th, table.rows-table td { border: 1px solid #ccc; padding: 0.3rem; font-size: 0.8rem; }
+    .overridden-tag { color: #a05a00; }
+  </style>
+</head>
+<body>
+  <h1>GAS Email Manager - Admin<span id="app-version"></span></h1>
+  <p>Owner-only admin page. Run the maintenance functions below or edit any Script Property.</p>
+
+  <div class="tab-bar" id="top-tab-bar">
+    <button type="button" class="tab-button active" id="tab-btn-run">Run</button>
+    <button type="button" class="tab-button" id="tab-btn-settings">Settings</button>
+  </div>
+
+  <div id="tab-panel-run" class="tab-panel">
+    <div>
+      <button id="run-process-emails">Run processEmails</button>
+      <button id="run-rebuild-properties">Run rebuildScriptProperties</button>
+      <button id="run-check-syntax">Run checkScriptPropertiesSyntax</button>
+    </div>
+    <div id="run-result" class="result-box"></div>
+  </div>
+
+  <div id="tab-panel-settings" class="tab-panel" style="display: none;">
+    <div class="tab-bar" id="settings-tabs"></div>
+    <div id="settings-container"></div>
+    <div id="settings-status" class="result-box"></div>
+    <button id="save-settings">Save settings</button>
+  </div>
+
+  <script>
+    (function () {
+      var runButtons = [
+        document.getElementById('run-process-emails'),
+        document.getElementById('run-rebuild-properties'),
+        document.getElementById('run-check-syntax')
+      ];
+      var saveButton = document.getElementById('save-settings');
+
+      function setRunButtonsDisabled(disabled) {
+        runButtons.forEach(function (btn) { btn.disabled = disabled; });
+      }
+
+      function renderResult(elementId, text) {
+        document.getElementById(elementId).textContent = text;
+      }
+
+      // --- Top-level tabs (Run / Settings, D-02) -- a plain visibility
+      // toggle over the two panels already in the DOM; no framework, no
+      // reload, no lazy rendering. Run is the active tab on load. -----------
+
+      var topTabButtons = {
+        run: document.getElementById('tab-btn-run'),
+        settings: document.getElementById('tab-btn-settings')
+      };
+      var topTabPanels = {
+        run: document.getElementById('tab-panel-run'),
+        settings: document.getElementById('tab-panel-settings')
+      };
+
+      function switchTopTab(tabName) {
+        Object.keys(topTabPanels).forEach(function (name) {
+          topTabPanels[name].style.display = name === tabName ? 'block' : 'none';
+          topTabButtons[name].classList.toggle('active', name === tabName);
+        });
+      }
+
+      topTabButtons.run.addEventListener('click', function () { switchTopTab('run'); });
+      topTabButtons.settings.addEventListener('click', function () { switchTopTab('settings'); });
+
+      switchTopTab('run');
+
+      // --- Merged run result box (D-03) -- all three run actions share ONE
+      // box; the action's real function name is the label that tells the
+      // owner which result they are looking at. -----------------------------
+
+      function renderRunResult(actionLabel, text) {
+        var container = document.getElementById('run-result');
+        container.replaceChildren();
+        var line = document.createElement('div');
+        line.textContent = actionLabel + ': ' + text;
+        container.appendChild(line);
+      }
+
+      document.getElementById('run-process-emails').addEventListener('click', function () {
+        setRunButtonsDisabled(true);
+        renderRunResult('processEmails', 'Running...');
+        google.script.run
+          .withSuccessHandler(function (result) {
+            setRunButtonsDisabled(false);
+            renderRunResult('processEmails', result.ok ? result.message : 'FAILED: ' + result.message);
+          })
+          .withFailureHandler(function (error) {
+            setRunButtonsDisabled(false);
+            renderRunResult('processEmails', 'FAILED: ' + error.message);
+          })
+          .webappRunProcessEmails();
+      });
+
+      document.getElementById('run-rebuild-properties').addEventListener('click', function () {
+        setRunButtonsDisabled(true);
+        renderRunResult('rebuildScriptProperties', 'Running...');
+        google.script.run
+          .withSuccessHandler(function (result) {
+            setRunButtonsDisabled(false);
+            renderRunResult('rebuildScriptProperties', result.ok ? result.message : 'FAILED: ' + result.message);
+          })
+          .withFailureHandler(function (error) {
+            setRunButtonsDisabled(false);
+            renderRunResult('rebuildScriptProperties', 'FAILED: ' + error.message);
+          })
+          .webappRunRebuildScriptProperties();
+      });
+
+      document.getElementById('run-check-syntax').addEventListener('click', function () {
+        setRunButtonsDisabled(true);
+        renderRunResult('checkScriptPropertiesSyntax', 'Running...');
+        google.script.run
+          .withSuccessHandler(function (result) {
+            setRunButtonsDisabled(false);
+            renderCheckSyntaxResult(result);
+          })
+          .withFailureHandler(function (error) {
+            setRunButtonsDisabled(false);
+            renderRunResult('checkScriptPropertiesSyntax', 'FAILED: ' + error.message);
+          })
+          .webappRunCheckScriptPropertiesSyntax();
+      });
+
+      function renderCheckSyntaxResult(result) {
+        var container = document.getElementById('run-result');
+        container.replaceChildren();
+        var label = 'checkScriptPropertiesSyntax';
+
+        if (!result.ok) {
+          var failLine = document.createElement('div');
+          failLine.textContent = label + ': FAILED: ' + (result.message || 'unknown error');
+          container.appendChild(failLine);
+          return;
+        }
+
+        if (!result.issues || result.issues.length === 0) {
+          var passLine = document.createElement('div');
+          passLine.textContent = label + ': PASS -- all set Script Properties are syntactically valid.';
+          container.appendChild(passLine);
+          return;
+        }
+
+        var summaryLine = document.createElement('div');
+        summaryLine.textContent = label + ': found ' + result.issues.length + ' issue(s):';
+        container.appendChild(summaryLine);
+
+        var list = document.createElement('ul');
+        result.issues.forEach(function (item) {
+          var li = document.createElement('li');
+          li.textContent = item.key + ': ' + item.issue;
+          list.appendChild(li);
+        });
+        container.appendChild(list);
+      }
+
+      // --- Settings editor, driven entirely by webappGetSettings' models,
+      // which are themselves driven by SETTINGS_REGISTRY (D-03) -- nothing
+      // here hardcodes a setting key, type, or default. ---------------------
+
+      var GROUP_PREFIXES = [
+        '01-setup-',
+        '05-action-ics-',
+        '06-action-booking-com-',
+        '07-action-ticketing-portals-',
+        '08-action-transport-tickets-'
+      ];
+
+      // Human-readable sub-tab labels (D-04), keyed by the same prefixes
+      // above. A group with no entry here (e.g. groupForKey's 'other-'
+      // fallback) falls back to the raw group string -- see labelForGroup.
+      var GROUP_LABELS = {
+        '01-setup-': 'Setup',
+        '05-action-ics-': 'ICS Import',
+        '06-action-booking-com-': 'Booking.com',
+        '07-action-ticketing-portals-': 'Ticketing Portals',
+        '08-action-transport-tickets-': 'Transport Tickets'
+      };
+
+      function labelForGroup(group) {
+        return GROUP_LABELS[group] || group;
+      }
+
+      var fieldElementsByKey = {};
+      var settingsGroupPanels = {};
+      var settingsGroupTabButtons = {};
+      var activeSettingsGroup = null;
+
+      function groupForKey(key) {
+        for (var i = 0; i < GROUP_PREFIXES.length; i++) {
+          if (key.indexOf(GROUP_PREFIXES[i]) === 0) {
+            return GROUP_PREFIXES[i];
+          }
+        }
+        return 'other-';
+      }
+
+      function loadVersion() {
+        google.script.run
+          .withSuccessHandler(function (result) {
+            document.getElementById('app-version').textContent = 'v' + result.version;
+          })
+          .withFailureHandler(function () {
+            document.getElementById('app-version').textContent = '';
+          })
+          .webappGetVersion();
+      }
+
+      function loadSettings() {
+        renderResult('settings-status', 'Loading...');
+        google.script.run
+          .withSuccessHandler(function (models) {
+            renderSettings(models);
+            renderResult('settings-status', '');
+          })
+          .withFailureHandler(function (error) {
+            renderResult('settings-status', 'FAILED to load settings: ' + error.message);
+          })
+          .webappGetSettings();
+      }
+
+      // renderSettings -- the ONE place that (re)builds the settings DOM
+      // from server data; called only from loadSettings' success handler
+      // above (initial load AND the post-save reload). Sub-tab switching
+      // (switchSettingsGroup below) NEVER calls this: fieldElementsByKey and
+      // every rows field's rowRefs array hold direct references to live DOM
+      // elements the Save handler reads from, and rebuilding a hidden group
+      // would orphan those references and destroy an unsaved edit. Sub-tab
+      // switching is a pure visibility toggle over panels this function
+      // already rendered.
+      function renderSettings(models) {
+        var container = document.getElementById('settings-container');
+        var tabBar = document.getElementById('settings-tabs');
+        var previousActiveGroup = activeSettingsGroup;
+
+        container.replaceChildren();
+        tabBar.replaceChildren();
+        fieldElementsByKey = {};
+        settingsGroupPanels = {};
+        settingsGroupTabButtons = {};
+
+        var groups = {};
+        var groupOrder = [];
+        models.forEach(function (model) {
+          var group = groupForKey(model.key);
+          if (!groups[group]) {
+            groups[group] = [];
+            groupOrder.push(group);
+          }
+          groups[group].push(model);
+        });
+
+        groupOrder.forEach(function (group) {
+          var tabButton = document.createElement('button');
+          tabButton.type = 'button';
+          tabButton.className = 'tab-button sub-tab-button';
+          tabButton.textContent = labelForGroup(group);
+          tabButton.addEventListener('click', function () {
+            switchSettingsGroup(group);
+          });
+          tabBar.appendChild(tabButton);
+          settingsGroupTabButtons[group] = tabButton;
+
+          var groupDiv = document.createElement('div');
+          groupDiv.className = 'setting-group tab-panel';
+
+          groups[group].forEach(function (model) {
+            groupDiv.appendChild(renderSettingField(model));
+          });
+
+          container.appendChild(groupDiv);
+          settingsGroupPanels[group] = groupDiv;
+        });
+
+        var targetGroup = groupOrder.indexOf(previousActiveGroup) !== -1 ? previousActiveGroup : groupOrder[0];
+        switchSettingsGroup(targetGroup);
+      }
+
+      // switchSettingsGroup -- THE LOAD-BEARING visibility toggle. Sets
+      // style.display on already-rendered group panels and toggles the
+      // active class on their sub-tab buttons; does nothing else. Never
+      // re-renders, never clears a container, never touches
+      // fieldElementsByKey or any rowRefs array.
+      function switchSettingsGroup(group) {
+        activeSettingsGroup = group;
+        Object.keys(settingsGroupPanels).forEach(function (g) {
+          settingsGroupPanels[g].style.display = g === group ? 'block' : 'none';
+          if (settingsGroupTabButtons[g]) {
+            settingsGroupTabButtons[g].classList.toggle('active', g === group);
+          }
+        });
+      }
+
+      function labelTextFor(model) {
+        return model.key + (model.isOverridden ? ' (overridden)' : '');
+      }
+
+      function renderSettingField(model) {
+        if (model.fieldKind === 'rows') {
+          return renderRowsField(model);
+        }
+
+        var row = document.createElement('div');
+        row.className = 'setting-row';
+
+        var label = document.createElement('label');
+        label.textContent = labelTextFor(model);
+
+        var input = document.createElement('input');
+
+        if (model.fieldKind === 'checkbox') {
+          input.type = 'checkbox';
+          input.checked = Boolean(model.value);
+        } else if (model.fieldKind === 'number') {
+          input.type = 'number';
+          input.value = model.value;
+        } else if (model.fieldKind === 'csv') {
+          input.type = 'text';
+          input.value = (model.value || []).join(', ');
+          input.placeholder = 'comma-separated';
+        } else {
+          input.type = 'text';
+          input.value = model.value === null || model.value === undefined ? '' : model.value;
+        }
+
+        row.appendChild(label);
+        row.appendChild(input);
+
+        fieldElementsByKey[model.key] = { model: model, input: input };
+
+        return row;
+      }
+
+      function renderRowsField(model) {
+        var wrapper = document.createElement('div');
+        wrapper.className = 'rows-field';
+
+        var heading = document.createElement('label');
+        heading.textContent = labelTextFor(model);
+        wrapper.appendChild(heading);
+
+        var table = document.createElement('table');
+        table.className = 'rows-table';
+
+        var thead = document.createElement('thead');
+        var headRow = document.createElement('tr');
+        model.rowFields.forEach(function (field) {
+          var th = document.createElement('th');
+          th.textContent = field.label || field.name;
+          headRow.appendChild(th);
+        });
+        var actionsTh = document.createElement('th');
+        headRow.appendChild(actionsTh);
+        thead.appendChild(headRow);
+        table.appendChild(thead);
+
+        var tbody = document.createElement('tbody');
+        table.appendChild(tbody);
+
+        var rowRefs = [];
+
+        function addDataRow(rowValue) {
+          var tr = document.createElement('tr');
+          var refs = {};
+
+          model.rowFields.forEach(function (field) {
+            var td = document.createElement('td');
+            var cellValue = rowValue ? rowValue[field.name] : undefined;
+            var cellInput;
+
+            if (field.kind === 'boolean') {
+              cellInput = document.createElement('input');
+              cellInput.type = 'checkbox';
+              cellInput.checked = Boolean(cellValue);
+            } else if (field.kind === 'enum') {
+              cellInput = document.createElement('select');
+              if (field.allowUnset) {
+                var blankOption = document.createElement('option');
+                blankOption.value = '';
+                blankOption.textContent = field.unsetLabel || '(unset)';
+                cellInput.appendChild(blankOption);
+              }
+              (field.options || []).forEach(function (optionValue) {
+                var option = document.createElement('option');
+                option.value = optionValue;
+                option.textContent = optionValue;
+                cellInput.appendChild(option);
+              });
+              cellInput.value = cellValue === null || cellValue === undefined ? '' : cellValue;
+            } else {
+              cellInput = document.createElement('input');
+              cellInput.type = 'text';
+              cellInput.value = cellValue === null || cellValue === undefined ? '' : cellValue;
+            }
+
+            td.appendChild(cellInput);
+            tr.appendChild(td);
+            refs[field.name] = cellInput;
+          });
+
+          var removeTd = document.createElement('td');
+          var removeButton = document.createElement('button');
+          removeButton.type = 'button';
+          removeButton.textContent = 'Remove';
+          removeButton.addEventListener('click', function () {
+            tbody.removeChild(tr);
+            var idx = rowRefs.indexOf(refs);
+            if (idx !== -1) {
+              rowRefs.splice(idx, 1);
+            }
+          });
+          removeTd.appendChild(removeButton);
+          tr.appendChild(removeTd);
+
+          tbody.appendChild(tr);
+          rowRefs.push(refs);
+        }
+
+        (model.value || []).forEach(function (rowValue) {
+          addDataRow(rowValue);
+        });
+
+        wrapper.appendChild(table);
+
+        var addButton = document.createElement('button');
+        addButton.type = 'button';
+        addButton.textContent = 'Add row';
+        addButton.addEventListener('click', function () {
+          addDataRow(null);
+        });
+        wrapper.appendChild(addButton);
+
+        fieldElementsByKey[model.key] = { model: model, rowRefs: rowRefs };
+
+        return wrapper;
+      }
+
+      function collectSubmittedValue(entry) {
+        var model = entry.model;
+
+        if (model.fieldKind === 'rows') {
+          return entry.rowRefs.map(function (refs) {
+            var row = {};
+            model.rowFields.forEach(function (field) {
+              var el = refs[field.name];
+              row[field.name] = field.kind === 'boolean' ? el.checked : el.value;
+            });
+            return row;
+          });
+        }
+
+        if (model.fieldKind === 'checkbox') {
+          return entry.input.checked;
+        }
+
+        return entry.input.value;
+      }
+
+      saveButton.addEventListener('click', function () {
+        var submitted = {};
+        Object.keys(fieldElementsByKey).forEach(function (key) {
+          submitted[key] = collectSubmittedValue(fieldElementsByKey[key]);
+        });
+
+        saveButton.disabled = true;
+        renderResult('settings-status', 'Saving...');
+
+        google.script.run
+          .withSuccessHandler(function (result) {
+            saveButton.disabled = false;
+            if (result.ok) {
+              renderResult('settings-status', 'Saved ' + result.savedKeys.length + ' setting(s).');
+              loadSettings();
+            } else {
+              var lines = ['Nothing was saved -- fix the following and try again:'];
+              result.errors.forEach(function (e) {
+                lines.push(e.key + ': ' + e.error);
+              });
+              renderResult('settings-status', lines.join('\n'));
+            }
+          })
+          .withFailureHandler(function (error) {
+            saveButton.disabled = false;
+            renderResult('settings-status', 'FAILED to save: ' + error.message);
+          })
+          .webappSaveSettings(submitted);
+      });
+
+      loadSettings();
+      loadVersion();
+    })();
+  </script>
+</body>
+</html>

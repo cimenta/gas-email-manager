@@ -1,4 +1,17 @@
-// Version: 0.8.1
+// Version: 0.9.0
+/**
+ * APP_VERSION — the running application version, rendered next to the admin
+ * web app's page title via webappGetVersion (src/00-webapp.js, D-01). This
+ * const and the literal `// Version:` comment on line 1 above are TWO
+ * INDEPENDENT REPRESENTATIONS of the same fact: push-public.bat parses that
+ * comment text via `findstr /C:"// Version:" src\02-main.js` (token 3) to
+ * detect the release tag, while this const is what the web app actually
+ * reads and displays at runtime. They MUST be bumped together on every
+ * future release -- test/app-version.test.js is the guard that fails the
+ * whole suite the moment they ever drift apart.
+ */
+const APP_VERSION = '0.9.0';
+
 /**
  * processEmails — the named target of the time-driven trigger installed by
  * setup() (see 01-setup.js). Searches Gmail for recent, unprocessed threads,
@@ -96,5 +109,5 @@ function notifyOwnerOfFailure(actionName, thread, error) {
 
 // GAS-safe Node export (inert under the Apps Script runtime).
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { composeFailureBody: composeFailureBody };
+  module.exports = { composeFailureBody: composeFailureBody, APP_VERSION: APP_VERSION };
 }

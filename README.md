@@ -65,6 +65,11 @@ in addition to processed, so nothing is lost silently.
   `PropertiesService`, which `clasp push` never touches, instead of editing
   the checked-in code. See
   [Live settings override](#live-settings-override-script-properties).
+- **Owner-only admin web app** — a one-page UI (deployed separately from the
+  time-driven trigger) to run the three manual maintenance functions and edit
+  every setting, including the JSON ones as structured rows instead of
+  hand-typed JSON, without opening the Apps Script editor. See
+  [Admin web app](#admin-web-app).
 - **Fail-closed parsing** — a malformed `.ics` is fully parsed before any
   calendar write; a parse error produces zero calendar writes.
 - **Owner failure notifications** — if an action fails, a plain-text email
@@ -484,6 +489,50 @@ exact key and problem for anything malformed. At runtime, a malformed value
 never crashes `processEmails()` — it's used as the trigger to catch a typo
 ahead of time, not a hard requirement; a bad value just falls back to the
 code default silently.
+
+## Admin web app
+
+A single owner-only page that covers the manual maintenance work the [Setup](#setup)
+and [Live settings override](#live-settings-override-script-properties)
+sections above otherwise require opening the Apps Script editor for: running
+`processEmails()` / `rebuildScriptProperties()` / `checkScriptPropertiesSyntax()`
+on demand with the result shown directly in the page, and viewing/editing
+every one of the 28 settings from [Configuration reference](#configuration-reference)
+in one place.
+
+**The three JSON-shaped settings** (`calendarIdBySender`, `ticketingPortals`,
+`transportSenders`) render as structured, add/remove-row tables with one
+input per field — not a free-text JSON box. This removes the JSON-vs-JS-object-
+literal pitfall called out in [Live settings override](#live-settings-override-script-properties)
+entirely: there's nothing to hand-type, so there's nothing to get wrong.
+
+**Deploying it:**
+
+1. `clasp push`, then Apps Script editor → **Deploy → New deployment**, type
+   **Web app**.
+2. Set **Execute as: Me** and **Who has access: Only myself** — this is not
+   optional. `appsscript.json` already declares this in its `webapp` block,
+   but a deployment carries its own access setting that can diverge from the
+   manifest, so confirm it explicitly in the Deploy dialog itself (and again
+   later in **Manage deployments** if you ever re-deploy).
+3. Open the deployment's `/exec` URL while signed into the same Google
+   account the script runs as. Every request — the page load and every
+   button/save action — is independently re-checked server-side
+   (`Session.getActiveUser()` vs `Session.getEffectiveUser()`); the access
+   setting above is necessary but the app does not rely on it alone.
+
+**On the page:** a **Run** tab with the three maintenance buttons (one shared
+result box, labeled by which action produced it) and a **Settings** tab, with
+five sub-tabs mirroring this codebase's own file layout (Setup, ICS Import,
+Booking.com, Ticketing Portals, Transport Tickets). Settings load showing
+their current *effective* value (a live Script Property override if one is
+set, otherwise the code default) and save with one **Save settings** button
+that writes every changed key in a single all-or-nothing call — if any value
+fails validation, nothing is written, not even the fields that were fine.
+
+No execution history or log viewer — this only shows the immediate result of
+whatever you just ran, not a persisted history. Use the Apps Script editor's
+own **Executions** view for that.
 
 ## Testing
 

@@ -787,6 +787,17 @@ function describeSettingSyntaxIssue(type, raw, jsonShapeValidator, jsonShapeDesc
  * this codebase has relied on repeatedly (BOOKING_LANGUAGE_PACKS/
  * getBookingLabels, every `action.config` getter).
  */
+// `jsonRowFields` (quick-260804-kmo) — the UI-side SIBLING of
+// `jsonShapeValidator`/`jsonShapeDescription` above: a repeating-row form
+// descriptor (`{name, label, kind}[]`, where `kind` is one of 'string' |
+// 'stringOrNull' | 'boolean' | 'enum') that src/00-webapp.js's
+// webappBuildSettingsFormModel walks to render THAT setting's own
+// purpose-built rows editor (D-05 — never a generic JSON textarea). Adding
+// a future json-typed entry WITHOUT a jsonRowFields descriptor is a HARD
+// ERROR (webappBuildSettingsFormModel throws, naming the key), not a soft
+// fallback to an uneditable or unsafe field — same silent-no-op aversion as
+// resolveTransportSenderMode's invalid-mode throw in the transport-tickets
+// action.
 const SETTINGS_REGISTRY = [
   { key: '01-setup-CALENDAR_ID', type: 'string', read: function () { return CONFIG.calendarId; } },
   { key: '01-setup-LABEL_NAME', type: 'string', read: function () { return CONFIG.labelName; } },
@@ -813,6 +824,13 @@ const SETTINGS_REGISTRY = [
     type: 'json',
     jsonShapeValidator: isValidCalendarIdBySenderShape,
     jsonShapeDescription: 'an array of {from, calendarId} string-pair objects',
+    // quick-260804-kmo: unlike the other two json-typed settings' calendarId
+    // (kind 'stringOrNull'), THIS entry's own isValidCalendarIdBySenderShape
+    // validator demands a real string here — it does not accept null.
+    jsonRowFields: [
+      { name: 'from', label: 'Sender email', kind: 'string' },
+      { name: 'calendarId', label: 'Calendar ID', kind: 'string' },
+    ],
     read: function () { return ICS_ACTION_CONFIG.calendarIdBySender; },
   },
 
@@ -838,6 +856,11 @@ const SETTINGS_REGISTRY = [
     type: 'json',
     jsonShapeValidator: isValidTicketingPortalsShape,
     jsonShapeDescription: 'an array of {identifyingEmail, calendarId, insertPdfIntoEvent} objects',
+    jsonRowFields: [
+      { name: 'identifyingEmail', label: 'Portal sender email', kind: 'string' },
+      { name: 'calendarId', label: 'Calendar ID', kind: 'stringOrNull' },
+      { name: 'insertPdfIntoEvent', label: 'Attach ticket PDF to event', kind: 'boolean' },
+    ],
     read: function () { return TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals; },
   },
 
@@ -856,6 +879,20 @@ const SETTINGS_REGISTRY = [
     // than cloning an equivalent validator.
     jsonShapeValidator: isValidTicketingPortalsShape,
     jsonShapeDescription: 'an array of {identifyingEmail, calendarId, insertPdfIntoEvent} objects',
+    jsonRowFields: [
+      { name: 'identifyingEmail', label: 'Portal sender email', kind: 'string' },
+      { name: 'calendarId', label: 'Calendar ID', kind: 'stringOrNull' },
+      { name: 'insertPdfIntoEvent', label: 'Attach ticket PDF to event', kind: 'boolean' },
+      // allowUnset (D-05 back-compat, quick-260804-bs7's mode field): an
+      // ABSENT mode key is the documented back-compat state
+      // resolveTransportSenderMode handles (falls back to 'ics' unless a
+      // body parser is registered for that sender), whereas a
+      // PRESENT-but-empty mode is exactly what it throws on. Leaving this
+      // row's dropdown at "(auto - detect)" must OMIT the key entirely,
+      // never submit an empty string -- see webappBuildJsonRowsValue's own
+      // doc comment in src/00-webapp.js.
+      { name: 'mode', label: 'Processing mode', kind: 'enum', options: ['ics', 'body'], allowUnset: true, unsetLabel: '(auto - detect)' },
+    ],
     read: function () { return TRANSPORT_TICKETS_ACTION_CONFIG.transportSenders; },
   },
 ];
