@@ -559,18 +559,42 @@ function buildTransportBodyEntry(parsedTicket, timeZone) {
 }
 
 /**
+ * stripTransportSummaryIdentifierPrefix — v0.8.1: RegioJet's real VEVENT
+ * SUMMARY leads with the same `#<digits>: ` ticket-number prefix
+ * extractTransportTicketIdentifier already extracts as the dedup key (D-02)
+ * — e.g. `'#4400574546: Z Vídeň, Hbf, do Brno, hl.n., ...'`. Showing it
+ * again in the CALENDAR EVENT'S TITLE is redundant (the identifier is
+ * already tracked via extendedProperties.private.ticketIdentifier), so this
+ * strips it from the display summary. Only strips the exact observed shape
+ * (`#`, one or more digits, `:`, optional whitespace) at the very start;
+ * anything else is left untouched, including a summary with no such prefix
+ * at all. Pure, no GAS globals.
+ */
+function stripTransportSummaryIdentifierPrefix(summary) {
+  return String(summary || '').replace(/^#\d+:\s*/, '');
+}
+
+/**
  * buildTransportIcsEntry — the `'ics'`-mode counterpart to
  * buildTransportBodyEntry, expressing RegioJet's EXISTING behavior through
  * the SAME shared entry shape (D-05) — no new parsing at all: `resource`
  * is the REUSED buildEventResource(event) (D-01), `uid`/`ticketIdentifier`/
- * `summary`/`filenameDate` are read straight off the already-parsed
- * `event` object (via the EXISTING extractTransportTicketIdentifier for
- * the identifier). Pure, no GAS globals.
+ * `filenameDate` are read straight off the already-parsed `event` object
+ * (via the EXISTING extractTransportTicketIdentifier for the identifier).
+ * `summary` (and `resource.summary`, which otherwise carries the raw VEVENT
+ * SUMMARY through unmodified) has RegioJet's redundant `#<digits>: ` prefix
+ * stripped via stripTransportSummaryIdentifierPrefix (v0.8.1) — this is the
+ * ONE deliberate deviation from "no new parsing"; every other field is
+ * still the reused ICS action's own value. Pure, no GAS globals.
  */
 function buildTransportIcsEntry(event) {
+  const summary = stripTransportSummaryIdentifierPrefix(event.summary);
+  const resource = buildEventResource(event);
+  resource.summary = summary;
+
   return {
-    resource: buildEventResource(event),
-    summary: event.summary,
+    resource: resource,
+    summary: summary,
     filenameDate: event.start,
     ticketIdentifier: extractTransportTicketIdentifier(event),
     uid: event.uid,
@@ -1008,6 +1032,7 @@ if (typeof module !== 'undefined' && module.exports) {
     resolveTransportSenderMode: resolveTransportSenderMode,
     buildTransportBodyEntry: buildTransportBodyEntry,
     buildTransportIcsEntry: buildTransportIcsEntry,
+    stripTransportSummaryIdentifierPrefix: stripTransportSummaryIdentifierPrefix,
     formatTransportWallClockIso: formatTransportWallClockIso,
     TRANSPORT_BODY_PARSERS_BY_IDENTIFYING_EMAIL: TRANSPORT_BODY_PARSERS_BY_IDENTIFYING_EMAIL,
     TRANSPORT_TICKETS_ACTION: TRANSPORT_TICKETS_ACTION,

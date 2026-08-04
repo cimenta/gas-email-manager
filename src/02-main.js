@@ -1,4 +1,4 @@
-// Version: 0.8.0
+// Version: 0.8.1
 /**
  * processEmails — the named target of the time-driven trigger installed by
  * setup() (see 01-setup.js). Searches Gmail for recent, unprocessed threads,

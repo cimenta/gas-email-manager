@@ -14,6 +14,7 @@ const {
   resolveTransportSenderMode,
   buildTransportBodyEntry,
   buildTransportIcsEntry,
+  stripTransportSummaryIdentifierPrefix,
   TRANSPORT_TICKETS_ACTION,
 } = require('../src/08-action-transport-tickets.js');
 const { parseIcs, buildEventResource } = require('../src/05-action-ics-import.js');
@@ -608,17 +609,44 @@ test('buildTransportBodyEntry: filenameDate is the calendar date only, and feedi
   );
 });
 
+// --- stripTransportSummaryIdentifierPrefix (v0.8.1) --------------------------
+
+test('stripTransportSummaryIdentifierPrefix: strips a leading "#<digits>: " prefix', () => {
+  assert.equal(stripTransportSummaryIdentifierPrefix(REAL_SUMMARY), 'Z Ostrava, hl.n., do Praha, hl.n., sedadla: [2/15,2/16]');
+});
+
+test('stripTransportSummaryIdentifierPrefix: a summary with no such prefix is returned unchanged', () => {
+  assert.equal(stripTransportSummaryIdentifierPrefix('No hash prefix here'), 'No hash prefix here');
+});
+
+test('stripTransportSummaryIdentifierPrefix: null/undefined returns an empty string without throwing', () => {
+  assert.doesNotThrow(() => {
+    assert.equal(stripTransportSummaryIdentifierPrefix(null), '');
+    assert.equal(stripTransportSummaryIdentifierPrefix(undefined), '');
+  });
+});
+
 // --- buildTransportIcsEntry (the 'ics'-mode counterpart, quick-260804-bs7) --
 
-test('buildTransportIcsEntry: given the real parsed RegioJet event, returns the shared entry shape through no new parsing', () => {
+test('buildTransportIcsEntry: given the real parsed RegioJet event, returns the shared entry shape through no new parsing (except the v0.8.1 summary-prefix strip)', () => {
+  const event = parseIcs(REAL_REGIOJET_ICS)[0];
+  const entry = buildTransportIcsEntry(event);
+  const expectedSummary = stripTransportSummaryIdentifierPrefix(event.summary);
+
+  assert.deepEqual(entry.resource, Object.assign({}, buildEventResource(event), { summary: expectedSummary }));
+  assert.equal(entry.uid, event.uid);
+  assert.equal(entry.ticketIdentifier, extractTransportTicketIdentifier(event));
+  assert.equal(entry.summary, expectedSummary);
+  assert.equal(entry.filenameDate, event.start);
+});
+
+test('buildTransportIcsEntry: the real RegioJet fixture\'s "#<digits>: " prefix is stripped from both entry.summary and entry.resource.summary, while ticketIdentifier still carries the number separately', () => {
   const event = parseIcs(REAL_REGIOJET_ICS)[0];
   const entry = buildTransportIcsEntry(event);
 
-  assert.deepEqual(entry.resource, buildEventResource(event));
-  assert.equal(entry.uid, event.uid);
-  assert.equal(entry.ticketIdentifier, extractTransportTicketIdentifier(event));
-  assert.equal(entry.summary, event.summary);
-  assert.equal(entry.filenameDate, event.start);
+  assert.equal(entry.summary.indexOf('#'), -1, 'entry.summary should not contain the "#" ticket-number prefix');
+  assert.equal(entry.resource.summary.indexOf('#'), -1, 'entry.resource.summary (the calendar event title) should not contain the "#" ticket-number prefix');
+  assert.equal(entry.ticketIdentifier, '7788123456');
 });
 
 // --- TRANSPORT_TICKETS_ACTION -------------------------------------------------
