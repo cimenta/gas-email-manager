@@ -9,7 +9,7 @@ Four actions ship today:
 - **ICS-to-Calendar import** — any sender, generic `.ics` calendar attachments
 - **Booking.com reservation management** — booking.com
 - **Ticketing-portal PDF import** — enigoo.cz, Kino Art (kinoart.cz)
-- **Transport ticket import** — RegioJet (regiojet.cz)
+- **Transport ticket import** — RegioJet (regiojet.cz), IDOS.cz (idos.svt.cz)
 
 Every matching email reliably gets its action(s) applied exactly once — no
 duplicate processing, no silent failures: if any action throws, the owner
@@ -39,10 +39,11 @@ in addition to processed, so nothing is lost silently.
   [Ticketing portals](#ticketing-portals).
 - **Transport ticket import (train/bus)** — for a configured carrier
   (identified by its confirmation email's sender address), builds the
-  calendar event directly from the `.ics` invite the confirmation email
-  already carries — no PDF text parsing needed for the event itself — and
-  optionally archives + attaches the accompanying ticket PDF to the created
-  event. See [Transport tickets](#transport-tickets).
+  calendar event either from the `.ics` invite the confirmation email
+  already carries (RegioJet) or, for a carrier with no `.ics` at all, by
+  parsing the plain-text email body directly (IDOS.cz) — and optionally
+  archives + attaches the accompanying ticket PDF to the created event
+  either way. See [Transport tickets](#transport-tickets).
 - **Sender allow-list (opt-in) and hand-off (exclude-list)** — restrict
   either action to specific sender addresses; unlisted senders are silently
   skipped (no error, thread still marked processed). Empty by default,
@@ -227,32 +228,60 @@ you run anything after adding this action.
 
 ## Transport tickets
 
-Unlike a ticketing-portal confirmation, a train/bus ticket confirmation email
-(RegioJet ships today) already carries a `.ics` invite with the trip's real,
-timezone-correct `VEVENT` data — so this action doesn't parse a PDF or the
-email body for event details at all. Instead it:
+A train/bus carrier's confirmation email either already carries a `.ics`
+invite with the trip's real data (RegioJet), or has no `.ics` at all and
+carries every detail only in the plain-text body (IDOS.cz). Each registered
+carrier declares which shape its email has via a `mode` field
+(`'ics'` or `'body'`) — both modes share the exact same dedup / PDF-archive /
+Calendar-write pipeline downstream; only how the event's data is extracted
+differs.
 
-1. Reuses the ICS action's own iCalendar parser to read the invite's
-   `.ics` attachment: departure/arrival stops and times (resolved through the
+**`mode: 'ics'`** (RegioJet):
+
+1. Reuses the ICS action's own iCalendar parser to read the invite's `.ics`
+   attachment: departure/arrival stops and times (resolved through the
    invite's own `VTIMEZONE` rules, same as the ICS action), route summary,
    and the invite's `UID`/`SEQUENCE`.
-2. If the carrier's `insertPdfIntoEvent` is on, copies the accompanying
-   ticket PDF into your permanent configured Drive folder (the same one the
-   ticketing-portals action uses) and attaches it to the event as a real
-   Calendar attachment.
-3. Tags the created event with a stable identifier extracted from the ticket
-   (its ticket/order number) via a private `extendedProperties` tag, checked
-   against existing calendar events before creating a new one — same
-   tag-before-create pattern the booking.com and ticketing-portals actions
-   already use.
 
-**Why a separate action instead of just using the ICS action?** The generic
-ICS action would already import this same `.ics` invite on its own — but
-without archiving or attaching the ticket PDF, and without the ticket's own
-identifier as the dedup key. Registering a carrier here is only useful
-alongside adding that carrier's sender address to the ICS action's
-`excludeFrom` list (see [Configuration reference](#configuration-reference)),
-so the two actions don't both create a competing event for the same email.
+**`mode: 'body'`** (IDOS.cz):
+
+1. Parses `message.getPlainBody()` directly with a carrier-specific text
+   parser (no `.ics`, no PDF text extraction) — station names, departure/
+   arrival date and time, seats, and the order code, all pattern-anchored
+   (never dependent on line position, since Gmail's rendering of a message
+   body isn't guaranteed to preserve line boundaries).
+
+**Both modes then:**
+
+2. If the carrier's `insertPdfIntoEvent` is on, copy the accompanying ticket
+   PDF into your permanent configured Drive folder (the same one the
+   ticketing-portals action uses) and attach it to the event as a real
+   Calendar attachment.
+3. Tag the created event with a stable identifier extracted from the ticket
+   (its ticket/order number — purchase-scoped when the carrier sells
+   multi-seat orders as one ticket, e.g. IDOS.cz's own order code, rather
+   than a narrower per-seat number) via a private `extendedProperties` tag,
+   checked against existing calendar events before creating a new one —
+   same tag-before-create pattern the booking.com and ticketing-portals
+   actions already use.
+
+**Adding a carrier with no `mode` field:** an entry with no `mode` set
+resolves to `'ics'` unless a body-mode parser has been registered for that
+carrier's sender address in the source code — this is a back-compat
+guarantee, not something to rely on for a new carrier. Always set `mode`
+explicitly when registering one.
+
+**Why a separate action instead of just using the ICS action for `'ics'`-mode
+carriers?** The generic ICS action would already import a `.ics`-carrying
+carrier's invite on its own — but without archiving or attaching the ticket
+PDF, and without the ticket's own identifier as the dedup key. Registering an
+`'ics'`-mode carrier here is only useful alongside adding that carrier's
+sender address to the ICS action's `excludeFrom` list (see
+[Configuration reference](#configuration-reference)), so the two actions
+don't both create a competing event for the same email. This doesn't apply
+to `'body'`-mode carriers like IDOS.cz — the generic ICS action has nothing
+to import for them in the first place, since there's no `.ics` attachment at
+all.
 
 ## Security notes
 
@@ -408,7 +437,7 @@ lives separately — see [Language packs](#language-packs)):
 |-------|---------|
 | `enabled` | Cross-cutting toggle — `false` skips this action entirely |
 | `notifyOnFailure` | Whether a failure notification email is sent when this action throws |
-| `transportSenders` | Array of `{ identifyingEmail, calendarId, insertPdfIntoEvent }` — one entry per supported carrier, matched by its confirmation email's sender address. `calendarId` falls back to `CONFIG.calendarId` when unset. Ships with a RegioJet entry by default. See [Transport tickets](#transport-tickets) — and remember to add the same sender address to `ICS_ACTION_CONFIG.excludeFrom` above |
+| `transportSenders` | Array of `{ identifyingEmail, calendarId, insertPdfIntoEvent, mode }` — one entry per supported carrier, matched by its confirmation email's sender address. `mode` is `'ics'` or `'body'` (see [Transport tickets](#transport-tickets)); always set it explicitly for a new carrier — an entry with no `mode` falls back to `'ics'` unless a body parser is registered for that address in the source code. `calendarId` falls back to `CONFIG.calendarId` when unset. Ships with a RegioJet (`mode: 'ics'`) and an IDOS.cz (`mode: 'body'`) entry by default. For an `'ics'`-mode carrier, remember to also add its sender address to `ICS_ACTION_CONFIG.excludeFrom` above |
 
 ## Live settings override (Script Properties)
 

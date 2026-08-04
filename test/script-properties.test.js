@@ -188,12 +188,12 @@ test('buildRebuiltPropertiesMap: the real SETTINGS_REGISTRY, with no live overri
     // default -> sentinel (same treatment as importOnlyFrom above).
     assert.equal(map['05-action-ics-EXCLUDE_FROM'], SETTING_DEFAULT_SENTINEL);
 
-    // quick-260803-us3: TRANSPORT_TICKETS_ACTION_CONFIG's own new json field
-    // (single seeded jizdenky@regiojet.cz entry, non-empty) -> its real
-    // formatted value, not the sentinel.
+    // quick-260804-bs7: TRANSPORT_TICKETS_ACTION_CONFIG's json field now
+    // seeds TWO entries (RegioJet, explicit mode "ics", plus IDOS.cz, mode
+    // "body") -> its real formatted value, not the sentinel.
     assert.equal(
       map['08-action-transport-tickets-TRANSPORT_SENDERS'],
-      '[{"identifyingEmail":"jizdenky@regiojet.cz","calendarId":null,"insertPdfIntoEvent":false}]'
+      '[{"identifyingEmail":"jizdenky@regiojet.cz","calendarId":null,"insertPdfIntoEvent":false,"mode":"ics"},{"identifyingEmail":"jizdenky@idos.svt.cz","calendarId":null,"insertPdfIntoEvent":false,"mode":"body"}]'
     );
   } finally {
     delete global.ICS_ACTION_CONFIG;
