@@ -4,47 +4,25 @@ A Google Apps Script application that periodically scans a Gmail account for
 unlabeled emails within a configurable time window, runs a pluggable set of
 "actions" against each match, and labels the email once processed.
 
-Four actions ship today: one detects `.ics` calendar attachments and imports
-the event(s) into a Google Calendar; one manages booking.com reservations,
-adding a safety-net calendar event on confirmation and removing it on
-cancellation; one detects ticket-purchase confirmation emails (concerts,
-theater, cinema) and creates a calendar event from the attached PDF ticket,
-even when the email body itself carries no usable data; and one detects
-train/bus ticket confirmation emails and creates a calendar event straight
-from the `.ics` invite those confirmations already carry, archiving and
-attaching the ticket PDF alongside it. Every matching email
-reliably gets its action(s) applied exactly once — no duplicate processing,
-no silent failures: if any action throws, the owner gets a plain-text failure
-notification and the thread is labeled as failed in addition to processed,
-so nothing is lost silently.
+Four actions ship today:
+
+- **ICS-to-Calendar import** — any sender, generic `.ics` calendar attachments
+- **Booking.com reservation management** — booking.com
+- **Ticketing-portal PDF import** — enigoo.cz, Kino Art (kinoart.cz)
+- **Transport ticket import** — RegioJet (regiojet.cz)
+
+Every matching email reliably gets its action(s) applied exactly once — no
+duplicate processing, no silent failures: if any action throws, the owner
+gets a plain-text failure notification and the thread is labeled as failed
+in addition to processed, so nothing is lost silently.
 
 ## Features
 
 - **ICS-to-Calendar import** — detects `.ics` attachments (by filename or
-  `text/calendar` content-type), parses every `VEVENT` in the attachment
-  (single, multiple, all-day, and recurring), and imports a matching event
-  for each into a configured Google Calendar.
-- **No duplicate events, even across systems** — events are imported via the
-  Advanced Calendar Service's `Events.import`, which is idempotent by the
-  `.ics` file's own `UID` (`iCalUID`). If you also accept the same invite
-  natively in Gmail (clicking "Yes"), Google Calendar resolves both paths to
-  the *same* event instead of creating two — correct regardless of which
-  happens first. The `.ics`'s own `SEQUENCE` revision number is also parsed
-  and carried through, so importing an invite Gmail's native detection has
-  already processed doesn't get rejected as a stale update; a genuine
-  conflict is recovered with one bounded re-fetch-and-retry, following the
-  Calendar API's own documented recovery instructions.
-- **Timezone-correct** — resolves `TZID`-based wall-clock times using the
-  `.ics` file's own embedded `VTIMEZONE` rules (standard RFC 5545 practice
-  for Outlook/Exchange, Apple Calendar, Google Calendar, etc.), rather than
-  assuming a fixed offset.
-- **Rich event details** — the organizer and attendee list (as plain
-  informational text, never as real Calendar guests — see Security below),
-  the meeting description, and an online-meeting URL (e.g. a Microsoft Teams
-  link) are all carried into the created event. Nested sub-components (like
-  a VALARM reminder) are correctly excluded from the event's own fields, and
-  excessive blank lines common in real Outlook/Exchange invites are
-  collapsed to a single blank-line separator.
+  `text/calendar` content-type) from any sender by default, parses every
+  `VEVENT` (single, multiple, all-day, and recurring), and imports each into
+  a configured Google Calendar with idempotent dedup and full timezone
+  resolution. See [ICS-to-Calendar import](#ics-to-calendar-import).
 - **Booking.com reservation management** — on a booking confirmation email,
   adds a safety-net calendar event with the check-in/check-out times, room
   type, guest count, address, and the full "Reservation details" section
@@ -96,6 +74,43 @@ so nothing is lost silently.
   its own config block kept at the top of the file (so settings are the
   first thing visible when opening it); adding an unrelated future action
   requires no changes to the dispatch/labeling core.
+
+## ICS-to-Calendar import
+
+Detects `.ics` calendar attachments (by filename or `text/calendar`
+content-type) from any sender by default — unlike the other actions, no
+specific sender needs to be registered ahead of time; any `.ics`-carrying
+email qualifies unless explicitly excluded (see
+[Configuration reference](#configuration-reference)). It:
+
+1. Parses every `VEVENT` in the attachment (single, multiple, all-day, and
+   recurring), resolving `TZID`-based wall-clock times through the `.ics`
+   file's own embedded `VTIMEZONE` rules (standard RFC 5545 practice for
+   Outlook/Exchange, Apple Calendar, Google Calendar, etc.) rather than
+   assuming a fixed offset.
+2. Imports via the Advanced Calendar Service's `Events.import`, which is
+   idempotent by the `.ics` file's own `UID` (`iCalUID`). If you also accept
+   the same invite natively in Gmail (clicking "Yes"), Google Calendar
+   resolves both paths to the *same* event instead of creating two — correct
+   regardless of which happens first. The `.ics`'s own `SEQUENCE` revision
+   number is also parsed and carried through, so importing an invite Gmail's
+   native detection has already processed doesn't get rejected as a stale
+   update; a genuine conflict is recovered with one bounded
+   re-fetch-and-retry, following the Calendar API's own documented recovery
+   instructions.
+3. Carries the organizer/attendee list into the event description as plain
+   informational text (never as real Calendar guests — see
+   [Security notes](#security-notes)), along with the meeting description
+   and an online-meeting URL (e.g. a Microsoft Teams link). Nested
+   sub-components (like a VALARM reminder) are correctly excluded from the
+   event's own fields, and excessive blank lines common in real
+   Outlook/Exchange invites are collapsed to a single blank-line separator.
+
+**Hand-off to a more specific action:** a sender with a more specialized
+action registered for it (e.g. the transport-tickets action) can be added to
+`ICS_ACTION_CONFIG.excludeFrom` so this generic action stands down for that
+sender instead of creating a second, competing event for the same `.ics`
+invite. See [Transport tickets](#transport-tickets).
 
 ## Booking.com matching
 
