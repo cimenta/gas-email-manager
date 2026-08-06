@@ -1031,6 +1031,23 @@ if (typeof module !== 'undefined' && module.exports) {
  * already contains an action's throw, routes the thread to the failed
  * label, and (config.notifyOnFailure) notifies the owner, so no separate
  * handling is needed here for the give-up path.
+ *
+ * RSVP PRESERVATION (live-reported bug ics-import-strips-rsvp): the iCalUID
+ * dedup behavior described above has one destructive edge. When Gmail's own
+ * native detection reaches the UID FIRST — the normal order for a real
+ * Exchange/Teams invite, since Gmail acts on delivery while this script runs
+ * on a periodic trigger minutes later — the event Gmail creates is a genuine
+ * ATTENDEE COPY: real organizer, the owner as a NEEDS-ACTION attendee,
+ * Accept/Decline UI, responses routed back to the organizer. Our subsequent
+ * Events.import is a full-resource replace carrying NEITHER organizer NOR
+ * attendees (buildEventResource's T-03-05 firewall), which silently demoted
+ * that attendee copy to a plain self-owned private copy: guest list cleared,
+ * organizer reset to the owner, RSVP gone, organizer never notified.
+ * importIcsEventWithSequenceRetry now guards this by looking the UID up
+ * BEFORE writing and skipping the write entirely when the event already
+ * there carries guests — see its own "PRESERVE-EXISTING-INVITE GUARD" doc
+ * paragraph for the full rationale, including why skipping is correct rather
+ * than trying to reconstruct the attendee copy.
  */
 const ICS_CALENDAR_ACTION = {
   name: 'ics-calendar-import',
@@ -1119,8 +1136,71 @@ const ICS_CALENDAR_ACTION = {
 };
 
 /**
- * importIcsEventWithSequenceRetry — calls `Calendar.Events.import(resource,
- * calendarId)`; on success, returns normally. On failure, inspects the
+ * hasGuestRelationship — true when `existingEvent` is a real Calendar API
+ * event resource that carries at least one entry in its `attendees` array,
+ * i.e. a genuine guest/RSVP relationship (an invite the owner was invited
+ * to, or a meeting the owner organized and invited others to). False for
+ * null/undefined (no such event), for an event with no `attendees` key at
+ * all, and for an event whose `attendees` array is empty.
+ *
+ * This is deliberately the SIMPLEST possible discriminator, and it is the
+ * exact discriminator the bug calls for: `attendees` is precisely the field
+ * whose loss destroys the Accept/Decline UI and the response path back to
+ * the organizer. Notably it is correct in BOTH directions of ownership —
+ * an event the owner organized has its invitees in the same array, and
+ * blowing THOSE away would be just as destructive, so it is guarded too.
+ *
+ * Events this script itself created (via buildEventResource, which never
+ * emits attendees — the T-03-05 firewall) always have an empty/absent
+ * attendees array, so they return false and remain freely re-importable.
+ * The same is true of METHOD:PUBLISH informational .ics events (booking
+ * confirmations, transport tickets), which carry no ATTENDEE properties.
+ * That is what keeps this guard inert for every pre-existing flow.
+ *
+ * Pure, no GAS globals — Node-testable.
+ */
+function hasGuestRelationship(existingEvent) {
+  return !!(existingEvent && existingEvent.attendees && existingEvent.attendees.length > 0);
+}
+
+/**
+ * findExistingEventByICalUid — looks up the event already stored on
+ * `calendarId` under the iCalendar UID `uid`, returning the first item or
+ * null when none exists. An iCalUID is expected to identify at most one
+ * event per calendar.
+ *
+ * `singleEvents: false` (the API default, stated explicitly here for the
+ * reader) so a RECURRING event resolves to its single master event rather
+ * than being expanded into one item per instance — the master is what
+ * carries the authoritative `attendees` array, and expanding a long series
+ * into instances just to answer a yes/no question would be wasteful. This
+ * differs deliberately from the `singleEvents: true` lookup inside
+ * importIcsEventWithSequenceRetry's sequence-conflict recovery below, which
+ * is live-proven in production for a different question (reading a
+ * conflicting `.sequence`) and is left exactly as it is.
+ *
+ * Cancelled/deleted events are excluded because `showDeleted` defaults to
+ * false — deliberate: an invite the owner already declined and deleted must
+ * NOT block a fresh import of the same UID.
+ *
+ * Never throws on a malformed/empty API response (defensive `&&` chain), so
+ * a surprising response shape degrades to "no existing event" — i.e. to the
+ * previous, pre-guard behavior — rather than breaking the import path.
+ *
+ * GAS-only (Calendar global), same category as the rest of this file's
+ * Calendar-API-touching code; exercised in tests via a faked Calendar
+ * global (the harness convention established in test/calendar-routing.test.js).
+ */
+function findExistingEventByICalUid(calendarId, uid) {
+  const response = Calendar.Events.list(calendarId, { iCalUID: uid, singleEvents: false });
+
+  return response && response.items && response.items.length > 0 ? response.items[0] : null;
+}
+
+/**
+ * importIcsEventWithSequenceRetry — FIRST applies the preserve-existing-invite
+ * guard (see below), and only if that does not fire calls
+ * `Calendar.Events.import(resource, calendarId)`. On failure, inspects the
  * thrown error's message: if it does NOT contain the substring "Invalid
  * sequence value" (Google's own fixed error text for this specific
  * failure — see ICS_CALENDAR_ACTION's class-level "SEQUENCE-CONFLICT
@@ -1146,9 +1226,54 @@ const ICS_CALENDAR_ACTION = {
  *      event found" case at all — both fall through to the caller
  *      unchanged). This is a single-shot recovery, never a retry loop.
  *
- * GAS-only (Calendar global) — not directly unit-tested, same category as
- * the rest of this file's Calendar-API-touching code (findIcsAttachments,
- * getIcsAttachmentTextsByMessage, run itself); the SEQUENCE parsing and
+ * PRESERVE-EXISTING-INVITE GUARD (live-reported bug ics-import-strips-rsvp):
+ * before ANY write, findExistingEventByICalUid looks the UID up on the target
+ * calendar; when hasGuestRelationship says the event already there carries
+ * guests, this function logs one line and returns WITHOUT writing.
+ *
+ * WHY: `Calendar.Events.import` is a full-resource, non-patch upsert keyed by
+ * iCalUID, and it is the one Calendar API operation where `organizer` is
+ * writable. buildEventResource deliberately emits NEITHER `organizer` NOR
+ * `attendees` (the T-03-05 firewall — untrusted .ics ATTENDEE values must
+ * never become real guests; parseVeventBlock does not even carry them that
+ * far, folding them into description text instead). So when Gmail's own
+ * native invite detection had ALREADY created the event for that UID — with
+ * the real organizer and the owner as a NEEDS-ACTION attendee — our import
+ * rewrote that attendee copy as a plain self-owned private copy: guest list
+ * cleared, organizer reset to the calendar owner, Accept/Decline gone, and
+ * the organizer never notified. Google's own guidance is explicit that an
+ * attendee's copy must "specify the organizer in the attendee's copy"; an
+ * organizer-less import therefore cannot BE an attendee copy.
+ *
+ * WHY SKIP RATHER THAN RECONSTRUCT: reconstructing the attendee copy would
+ * mean sending `organizer`/`attendees` on the import — reopening exactly the
+ * T-03-05 hole, and depending on unverified assumptions about whether a
+ * rebuilt private copy still round-trips RSVP to a foreign organizer. Gmail's
+ * native event is strictly higher fidelity than anything this script can
+ * build (it is a genuine attendee copy, and Gmail keeps it current as the
+ * organizer sends updates), so the correct action is to leave it alone. The
+ * action's goal — "the invite is on the calendar" — is already satisfied.
+ *
+ * SCOPE (why this is inert for every pre-existing flow): the guard fires ONLY
+ * when an event with that exact iCalUID already exists on that exact calendar
+ * AND carries at least one attendee. Events this script created itself never
+ * have attendees; METHOD:PUBLISH informational .ics events (booking
+ * confirmations, RegioJet/transport tickets) carry no ATTENDEE properties at
+ * all; and a non-default calendarId route finds no event to collide with. In
+ * every one of those cases the code below runs byte-for-byte as before, so
+ * the iCalUID dedup guarantee (quick-260723-gmk) and the sequence-conflict
+ * recovery (quick-260731-seq) are both fully preserved.
+ *
+ * RETURNS a small result object — `{ action: 'skipped-existing-invite' |
+ * 'imported', eventId }` — so callers and tests can observe which branch
+ * was taken. Both existing call sites (run below, and
+ * processTransportTicketJob in src/08-action-transport-tickets.js) ignore the
+ * return value, so this is backward compatible.
+ *
+ * GAS-only (Calendar global); the guard's two helpers are the exception —
+ * hasGuestRelationship is pure and directly unit-tested, and the guard's
+ * branching is unit-tested through a faked Calendar global (see
+ * test/existing-invite-guard.test.js). The SEQUENCE parsing and
  * resource-building this recovery depends on IS fully unit-tested (see
  * parseVeventBlock/buildEventResource).
  *
@@ -1165,8 +1290,23 @@ const ICS_CALENDAR_ACTION = {
 function importIcsEventWithSequenceRetry(resource, calendarId, uid, optionalArgs) {
   const args = optionalArgs || {};
 
+  // PRESERVE-EXISTING-INVITE GUARD (live-reported bug ics-import-strips-rsvp)
+  // — see hasGuestRelationship / findExistingEventByICalUid above and this
+  // function's own doc paragraph. Must run BEFORE the import call: the whole
+  // point is that the import is what destroys the guest list, so the only
+  // safe moment to check is while the existing event is still intact.
+  const preExisting = findExistingEventByICalUid(calendarId, uid);
+  if (hasGuestRelationship(preExisting)) {
+    console.log(
+      'ICS import: an event for iCalUID ' + uid + ' already exists on calendar ' + calendarId +
+        ' with ' + preExisting.attendees.length + ' guest(s) — leaving it untouched to preserve its RSVP state (skipping import).'
+    );
+    return { action: 'skipped-existing-invite', eventId: preExisting.id };
+  }
+
   try {
     Calendar.Events.import(resource, calendarId, args);
+    return { action: 'imported', eventId: null };
   } catch (e) {
     const message = (e && e.message) || String(e);
     if (message.indexOf('Invalid sequence value') === -1) {
@@ -1182,6 +1322,7 @@ function importIcsEventWithSequenceRetry(resource, calendarId, uid, optionalArgs
 
     resource.sequence = existingEvent.sequence;
     Calendar.Events.import(resource, calendarId, args);
+    return { action: 'imported', eventId: existingEvent.id || null };
   }
 }
 
@@ -1309,9 +1450,16 @@ function getIcsAttachmentTextsByMessage(thread) {
 // pure multi-calendar-routing resolver (resolveIcsCalendarId), the four
 // pure organizer/attendee/formatting enrichment helpers
 // (parseAddressProperty, formatAddress, buildOrganizerAttendeesText,
-// collapseBlankLines), and ICS_CALENDAR_ACTION (action registry).
+// collapseBlankLines), the preserve-existing-invite guard's two pieces
+// (hasGuestRelationship — pure; findExistingEventByICalUid and
+// importIcsEventWithSequenceRetry — GAS-only, exported so the guard's
+// branching can be exercised against a faked Calendar global), and
+// ICS_CALENDAR_ACTION (action registry).
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
+    hasGuestRelationship: hasGuestRelationship,
+    findExistingEventByICalUid: findExistingEventByICalUid,
+    importIcsEventWithSequenceRetry: importIcsEventWithSequenceRetry,
     parseIcs: parseIcs,
     buildRRuleString: buildRRuleString,
     buildEventResource: buildEventResource,

@@ -95,15 +95,22 @@ email qualifies unless explicitly excluded (see
    Outlook/Exchange, Apple Calendar, Google Calendar, etc.) rather than
    assuming a fixed offset.
 2. Imports via the Advanced Calendar Service's `Events.import`, which is
-   idempotent by the `.ics` file's own `UID` (`iCalUID`). If you also accept
-   the same invite natively in Gmail (clicking "Yes"), Google Calendar
-   resolves both paths to the *same* event instead of creating two — correct
-   regardless of which happens first. The `.ics`'s own `SEQUENCE` revision
-   number is also parsed and carried through, so importing an invite Gmail's
-   native detection has already processed doesn't get rejected as a stale
-   update; a genuine conflict is recovered with one bounded
-   re-fetch-and-retry, following the Calendar API's own documented recovery
-   instructions.
+   idempotent by the `.ics` file's own `UID` (`iCalUID`) — but only when
+   writing is safe. Gmail's own native invite detection often reaches the
+   same `.ics` first and adds a genuine attendee copy (real organizer, you as
+   a pending guest, Accept/Decline UI). Before importing, the script looks up
+   any existing event for that `iCalUID` and, if it already carries real
+   guests, leaves it untouched instead of writing over it — `Events.import`
+   is a full-resource replace, and since this action never sends
+   `organizer`/`attendees` (see [Security notes](#security-notes)), writing
+   over a live invite would silently strip its guest list and your ability to
+   respond. When no such guest-bearing event exists yet (a fresh invite, or
+   an event this script created itself), import proceeds exactly as before.
+   The `.ics`'s own `SEQUENCE` revision number is also parsed and carried
+   through for those imports, so reprocessing an invite Gmail's native
+   detection has already updated doesn't get rejected as a stale update; a
+   genuine conflict is recovered with one bounded re-fetch-and-retry,
+   following the Calendar API's own documented recovery instructions.
 3. Carries the organizer/attendee list into the event description as plain
    informational text (never as real Calendar guests — see
    [Security notes](#security-notes)), along with the meeting description
