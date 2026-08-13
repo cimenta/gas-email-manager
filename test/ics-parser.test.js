@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { parseIcs } = require('../src/05-action-ics-import.js');
+const { parseIcs, buildEventResource } = require('../src/05-action-ics-import.js');
 
 const SINGLE_VEVENT_ICS = [
   'BEGIN:VCALENDAR',
@@ -500,4 +500,120 @@ test('TZID with no matching VTIMEZONE block falls back to literal-as-UTC treatme
   const events = parseIcs(ics);
   assert.equal(events.length, 1);
   assert.equal(events[0].start.toISOString(), '2026-07-22T14:00:00.000Z');
+});
+
+// --- STATUS (RFC 5545 section 3.8.1.11, RegioJet cancellation detection, D-01/D-02) ----
+//
+// parseVeventBlock gains a `status` field: the VEVENT's own STATUS property
+// value, trimmed and uppercased, or null when the property is absent or
+// empty after trimming. This is the single normalization point every
+// downstream consumer (cancellation detection in TRANSPORT_TICKETS_ACTION)
+// compares against the uppercase token only. buildEventResource must NOT
+// copy this field onto the Calendar API resource (verified in the
+// event-resource suite, which stays untouched).
+
+function buildStatusIcs(statusLine) {
+  return [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'BEGIN:VEVENT',
+    'SUMMARY:Status test event',
+    'DTSTART:20260801T100000Z',
+    'DTEND:20260801T110000Z',
+    statusLine,
+    'END:VEVENT',
+    'END:VCALENDAR',
+  ]
+    .filter(function (line) {
+      return line !== null;
+    })
+    .join('\r\n');
+}
+
+test('a VEVENT carrying STATUS:CANCELLED parses to event.status === "CANCELLED"', () => {
+  const events = parseIcs(buildStatusIcs('STATUS:CANCELLED'));
+  assert.equal(events.length, 1);
+  assert.equal(events[0].status, 'CANCELLED');
+});
+
+test('a VEVENT with no STATUS line at all parses to event.status === null', () => {
+  const events = parseIcs(buildStatusIcs(null));
+  assert.equal(events.length, 1);
+  assert.equal(events[0].status, null);
+});
+
+test('a VEVENT carrying mixed-case STATUS:Cancelled parses to event.status === "CANCELLED" (parser is the single normalization point)', () => {
+  const events = parseIcs(buildStatusIcs('STATUS:Cancelled'));
+  assert.equal(events.length, 1);
+  assert.equal(events[0].status, 'CANCELLED');
+});
+
+test('a VEVENT carrying STATUS:CONFIRMED parses to event.status === "CONFIRMED" (general STATUS value, not a cancellation boolean)', () => {
+  const events = parseIcs(buildStatusIcs('STATUS:CONFIRMED'));
+  assert.equal(events.length, 1);
+  assert.equal(events[0].status, 'CONFIRMED');
+});
+
+test('a VEVENT whose STATUS value is whitespace-only parses to event.status === null', () => {
+  const events = parseIcs(buildStatusIcs('STATUS:   '));
+  assert.equal(events.length, 1);
+  assert.equal(events[0].status, null);
+});
+
+// --- DTSTAMP (RFC 5545 section 3.8.7.2, RegioJet cancel/rebook staleness ----
+// --- detection, D-09/D-10/D-11 of quick-260813-dq2 Task 3) -----------------
+//
+// parseVeventBlock gains a `dtstamp` field: the VEVENT's own DTSTAMP
+// property, parsed through the EXISTING parseIcsDate helper (RFC 5545
+// DTSTAMP is always UTC Z-suffixed, so no TZID is ever passed) into a real
+// Date when present, or null when the property is absent OR when
+// parseIcsDate throws on an unrecognized value -- a malformed DTSTAMP must
+// never crash an otherwise-valid import, same discipline as the SEQUENCE
+// fallback. buildEventResource must NOT copy this field onto the Calendar
+// API resource either (the D-01 firewall now covers both new parser
+// fields). Reuses buildStatusIcs' inline-fixture shape above (it emits NO
+// DTSTAMP line at all, so it is already the "absent" case).
+
+function buildDtstampIcs(dtstampLine) {
+  return [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'BEGIN:VEVENT',
+    'SUMMARY:Dtstamp test event',
+    'DTSTART:20260801T100000Z',
+    'DTEND:20260801T110000Z',
+    dtstampLine,
+    'END:VEVENT',
+    'END:VCALENDAR',
+  ]
+    .filter(function (line) {
+      return line !== null;
+    })
+    .join('\r\n');
+}
+
+test('a VEVENT carrying DTSTAMP:20260813T073445Z parses to event.dtstamp as a real Date matching that instant', () => {
+  const events = parseIcs(buildDtstampIcs('DTSTAMP:20260813T073445Z'));
+  assert.equal(events.length, 1);
+  assert.ok(events[0].dtstamp instanceof Date);
+  assert.equal(events[0].dtstamp.toISOString(), '2026-08-13T07:34:45.000Z');
+});
+
+test('a VEVENT with no DTSTAMP line at all parses to event.dtstamp === null', () => {
+  const events = parseIcs(buildDtstampIcs(null));
+  assert.equal(events.length, 1);
+  assert.equal(events[0].dtstamp, null);
+});
+
+test('a VEVENT carrying a malformed DTSTAMP parses to event.dtstamp === null and does NOT throw -- the rest of the event still parses correctly', () => {
+  const events = parseIcs(buildDtstampIcs('DTSTAMP:not-a-date'));
+  assert.equal(events.length, 1);
+  assert.equal(events[0].dtstamp, null);
+  assert.equal(events[0].summary, 'Dtstamp test event');
+});
+
+test('buildEventResource on a DTSTAMP-carrying parsed event produces a resource with no dtstamp key (D-01 firewall covers both new parser fields)', () => {
+  const events = parseIcs(buildDtstampIcs('DTSTAMP:20260813T073445Z'));
+  const resource = buildEventResource(events[0]);
+  assert.equal(Object.prototype.hasOwnProperty.call(resource, 'dtstamp'), false);
 });

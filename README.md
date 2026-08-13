@@ -277,6 +277,30 @@ differs.
    same tag-before-create pattern the booking.com and ticketing-portals
    actions already use.
 
+**Cancellations (`mode: 'ics'` carriers only, e.g. RegioJet):** a cancellation
+email carries its own `.ics` with the VEVENT's `STATUS` set to `CANCELLED` —
+detected purely from that RFC 5545 field, never from the email's subject or
+body text, so it works identically regardless of which language/locale the
+carrier sends the email in. A match deletes the calendar event the original
+confirmation created; a cancellation matching nothing (already removed, or
+its confirmation was never processed) is a silent no-op, never a failure.
+
+**Reissued tickets update in place, and out-of-order delivery can't undo
+that:** a rebooking after a cancellation (or any reissue) can arrive from the
+carrier with the SAME ticket number and the SAME iCalendar `UID` as the
+original, just with different seats. Since a `.ics`-carrying entry's Calendar
+write is already idempotent by that `UID`, the ticket-number dedup check
+(point 3 above) is applied only to carriers with no `.ics` at all — a
+UID-bearing reissue always reaches the write and updates the existing event
+rather than being silently skipped or duplicated. Because a cancellation and
+its superseding rebooking are independent emails that can be processed in
+either order, every write also records the invite's own `DTSTAMP` (the
+"generated at" timestamp, which — unlike `SEQUENCE` — some carriers do NOT
+keep increasing across a cancel-then-rebook sequence, so `SEQUENCE` alone
+isn't a safe staleness check): a cancellation is applied only if it isn't
+already older than what's currently on the calendar, so a cancellation
+processed after its own rebooking can't delete it.
+
 **Adding a carrier with no `mode` field:** an entry with no `mode` set
 resolves to `'ics'` unless a body-mode parser has been registered for that
 carrier's sender address in the source code — this is a back-compat

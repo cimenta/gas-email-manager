@@ -15,6 +15,11 @@ const {
   buildTransportBodyEntry,
   buildTransportIcsEntry,
   stripTransportSummaryIdentifierPrefix,
+  partitionTransportEntriesByCancellation,
+  cancelTransportTicketEvent,
+  buildTransportEventPrivateProperties,
+  isTransportCancellationStale,
+  filterTransportEntriesToCreate,
   TRANSPORT_TICKETS_ACTION,
 } = require('../src/08-action-transport-tickets.js');
 const { parseIcs, buildEventResource } = require('../src/05-action-ics-import.js');
@@ -91,6 +96,133 @@ const REAL_REGIOJET_ICS = [
 ].join('\r\n');
 
 const REAL_SUMMARY = '#7788123456: Z Ostrava, hl.n., do Praha, hl.n., sedadla: [2/15,2/16]';
+
+// --- REAL_REGIOJET_CANCEL_ICS (D-06, quick-260813-dq2) -----------------------
+//
+// The matching CANCEL VEVENT for REAL_REGIOJET_ICS above -- same fictional
+// ticket number (7788123456) and same fictional UID
+// (-9876543210@regiojet.cz), so the pair reads as a natural
+// confirm-then-cancel sequence for ONE ticket, exactly mirroring what a real
+// RegioJet cancellation email carries: METHOD:CANCEL at VCALENDAR level,
+// STATUS:CANCELLED on the VEVENT, a bumped SEQUENCE, and a later DTSTAMP
+// (the cancellation was generated after the confirmation). Everything else
+// (both VTIMEZONE blocks, DTSTART/DTEND, SUMMARY, DESCRIPTION, LOCATION,
+// ATTENDEE, CREATED) is identical to REAL_REGIOJET_ICS -- written out as a
+// full explicit array literal (not derived by string surgery) so the lines
+// under test stay visible, per this codebase's fixture convention.
+const REAL_REGIOJET_CANCEL_ICS = [
+  'BEGIN:VCALENDAR',
+  'VERSION:2.0',
+  'METHOD:CANCEL',
+  'BEGIN:VTIMEZONE',
+  'TZID:Europe/Vienna',
+  'BEGIN:STANDARD',
+  'DTSTART:19701025T030000',
+  'TZOFFSETFROM:+0200',
+  'TZOFFSETTO:+0100',
+  'RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU',
+  'END:STANDARD',
+  'BEGIN:DAYLIGHT',
+  'DTSTART:19700329T020000',
+  'TZOFFSETFROM:+0100',
+  'TZOFFSETTO:+0200',
+  'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU',
+  'END:DAYLIGHT',
+  'END:VTIMEZONE',
+  'BEGIN:VTIMEZONE',
+  'TZID:Europe/Prague',
+  'BEGIN:STANDARD',
+  'DTSTART:19701025T030000',
+  'TZOFFSETFROM:+0200',
+  'TZOFFSETTO:+0100',
+  'RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU',
+  'END:STANDARD',
+  'BEGIN:DAYLIGHT',
+  'DTSTART:19700329T020000',
+  'TZOFFSETFROM:+0100',
+  'TZOFFSETTO:+0200',
+  'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU',
+  'END:DAYLIGHT',
+  'END:VTIMEZONE',
+  'BEGIN:VEVENT',
+  'DTSTAMP:20260803T090000Z',
+  'DTSTART;TZID=Europe/Vienna:20260818T173600',
+  'DTEND;TZID=Europe/Prague:20260818T191200',
+  'CREATED:20260802T174558Z',
+  'ATTENDEE;CN=jan.novak:mailto:jan.novak@example.com',
+  'SUMMARY:#7788123456: Z Ostrava, hl.n., do Praha, hl.n., sedadla: [2/15,2/16]',
+  'DESCRIPTION:Příjezd/Odjezd|Zastávka/Přestup|Nást.|Spoj|Vůz/sedadla\\nOdj:17:36|Ostrava, hl.n.|Ostrava → Praha (RJ, RJ 1036)|2/15, 16\\nPří:19:12|Praha, hl.n.\\n',
+  'LOCATION:49.8400000, 18.2900000',
+  'UID:-9876543210@regiojet.cz',
+  'STATUS:CANCELLED',
+  'SEQUENCE:2',
+  'END:VEVENT',
+  'END:VCALENDAR',
+].join('\r\n');
+
+// --- REAL_REGIOJET_REBOOK_ICS (D-06, quick-260813-dq2 Task 3) ---------------
+//
+// The REBOOKING VEVENT for the SAME fictional ticket (7788123456) and SAME
+// fictional UID (-9876543210@regiojet.cz) as REAL_REGIOJET_ICS and
+// REAL_REGIOJET_CANCEL_ICS above -- the three fixtures read as one natural
+// confirm -> cancel -> rebook sequence for ONE ticket, mirroring the real
+// owner-reported emails (Problem A/B, D-08..D-12): DTSTAMP five minutes
+// AFTER the CANCEL fixture's own DTSTAMP (the real emails' 5-minute gap),
+// SEQUENCE RESET to 1 (RegioJet does not continue to 3 -- this is the whole
+// reason SEQUENCE cannot be used for staleness detection, D-11/D-12),
+// different fictional seats so "the rebooked event's details" is an
+// observable difference, and NO STATUS line at all (a rebooking is an
+// ordinary booking). Everything else (both VTIMEZONE blocks, DTSTART/DTEND,
+// LOCATION, ATTENDEE, CREATED) stays identical -- written as a full explicit
+// array literal, never derived from another fixture by string surgery.
+const REAL_REGIOJET_REBOOK_ICS = [
+  'BEGIN:VCALENDAR',
+  'VERSION:2.0',
+  'METHOD:REQUEST',
+  'BEGIN:VTIMEZONE',
+  'TZID:Europe/Vienna',
+  'BEGIN:STANDARD',
+  'DTSTART:19701025T030000',
+  'TZOFFSETFROM:+0200',
+  'TZOFFSETTO:+0100',
+  'RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU',
+  'END:STANDARD',
+  'BEGIN:DAYLIGHT',
+  'DTSTART:19700329T020000',
+  'TZOFFSETFROM:+0100',
+  'TZOFFSETTO:+0200',
+  'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU',
+  'END:DAYLIGHT',
+  'END:VTIMEZONE',
+  'BEGIN:VTIMEZONE',
+  'TZID:Europe/Prague',
+  'BEGIN:STANDARD',
+  'DTSTART:19701025T030000',
+  'TZOFFSETFROM:+0200',
+  'TZOFFSETTO:+0100',
+  'RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU',
+  'END:STANDARD',
+  'BEGIN:DAYLIGHT',
+  'DTSTART:19700329T020000',
+  'TZOFFSETFROM:+0100',
+  'TZOFFSETTO:+0200',
+  'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU',
+  'END:DAYLIGHT',
+  'END:VTIMEZONE',
+  'BEGIN:VEVENT',
+  'DTSTAMP:20260803T090500Z',
+  'DTSTART;TZID=Europe/Vienna:20260818T173600',
+  'DTEND;TZID=Europe/Prague:20260818T191200',
+  'CREATED:20260802T174558Z',
+  'ATTENDEE;CN=jan.novak:mailto:jan.novak@example.com',
+  'SUMMARY:#7788123456: Z Ostrava, hl.n., do Praha, hl.n., sedadla: [4/21,4/22]',
+  'DESCRIPTION:Příjezd/Odjezd|Zastávka/Přestup|Nást.|Spoj|Vůz/sedadla\\nOdj:17:36|Ostrava, hl.n.|Ostrava → Praha (RJ, RJ 1036)|4/21, 22\\nPří:19:12|Praha, hl.n.\\n',
+  'LOCATION:49.8400000, 18.2900000',
+  'UID:-9876543210@regiojet.cz',
+  'SEQUENCE:1',
+  'END:VEVENT',
+  'END:VCALENDAR',
+].join('\r\n');
 
 // --- duck-typed fake attachment/message factories ---------------------------
 // Same style as test/ticketing-portals.test.js's fakeAttachment/fakeMessage.
@@ -649,6 +781,91 @@ test('buildTransportIcsEntry: the real RegioJet fixture\'s "#<digits>: " prefix 
   assert.equal(entry.ticketIdentifier, '7788123456');
 });
 
+// --- RegioJet cancellation entry status (D-03, quick-260813-dq2) -------------
+
+test('buildTransportIcsEntry: on the CANCEL fixture\'s parsed event, entry.status is "CANCELLED"', () => {
+  const cancelEvent = parseIcs(REAL_REGIOJET_CANCEL_ICS)[0];
+  const entry = buildTransportIcsEntry(cancelEvent);
+
+  assert.equal(entry.status, 'CANCELLED');
+});
+
+test('buildTransportIcsEntry: on the existing confirmation fixture\'s parsed event (no STATUS line), entry.status is null', () => {
+  const confirmationEvent = parseIcs(REAL_REGIOJET_ICS)[0];
+  const entry = buildTransportIcsEntry(confirmationEvent);
+
+  assert.equal(entry.status, null);
+});
+
+test('buildTransportIcsEntry: THE IDENTITY PROOF -- the CANCEL entry\'s ticketIdentifier equals the confirmation entry\'s ticketIdentifier exactly (D-03, this identity IS the cancellation mechanism)', () => {
+  const confirmationEvent = parseIcs(REAL_REGIOJET_ICS)[0];
+  const cancelEvent = parseIcs(REAL_REGIOJET_CANCEL_ICS)[0];
+
+  const confirmationEntry = buildTransportIcsEntry(confirmationEvent);
+  const cancelEntry = buildTransportIcsEntry(cancelEvent);
+
+  assert.equal(cancelEntry.ticketIdentifier, confirmationEntry.ticketIdentifier);
+  assert.equal(cancelEntry.ticketIdentifier, '7788123456');
+});
+
+test('buildTransportIcsEntry: entry.resource carries no status field for either the confirmation or the cancel fixture (D-01 firewall holds through the entry builder)', () => {
+  const confirmationEvent = parseIcs(REAL_REGIOJET_ICS)[0];
+  const cancelEvent = parseIcs(REAL_REGIOJET_CANCEL_ICS)[0];
+
+  assert.equal(Object.prototype.hasOwnProperty.call(buildTransportIcsEntry(confirmationEvent).resource, 'status'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(buildTransportIcsEntry(cancelEvent).resource, 'status'), false);
+});
+
+test('buildTransportBodyEntry: returns status === null for the IDOS.cz fixture (no ICS STATUS concept, out of scope for cancellation via this mechanism)', () => {
+  const parsedTicket = parseIdosTicketText(REAL_IDOS_BODY_TEXT);
+  const entry = buildTransportBodyEntry(parsedTicket, 'Europe/Prague');
+
+  assert.equal(entry.status, null);
+});
+
+// --- RegioJet dtstamp threading (D-10, quick-260813-dq2 Task 3) -------------
+
+test('buildTransportIcsEntry: entry.dtstamp on each of the three fixtures strictly equals that event\'s own parsed dtstamp, ordering confirmation < cancellation < rebooking', () => {
+  const confirmationEvent = parseIcs(REAL_REGIOJET_ICS)[0];
+  const cancelEvent = parseIcs(REAL_REGIOJET_CANCEL_ICS)[0];
+  const rebookEvent = parseIcs(REAL_REGIOJET_REBOOK_ICS)[0];
+
+  const confirmationEntry = buildTransportIcsEntry(confirmationEvent);
+  const cancelEntry = buildTransportIcsEntry(cancelEvent);
+  const rebookEntry = buildTransportIcsEntry(rebookEvent);
+
+  assert.equal(confirmationEntry.dtstamp.getTime(), confirmationEvent.dtstamp.getTime());
+  assert.equal(cancelEntry.dtstamp.getTime(), cancelEvent.dtstamp.getTime());
+  assert.equal(rebookEntry.dtstamp.getTime(), rebookEvent.dtstamp.getTime());
+
+  assert.ok(confirmationEntry.dtstamp.getTime() < cancelEntry.dtstamp.getTime());
+  assert.ok(cancelEntry.dtstamp.getTime() < rebookEntry.dtstamp.getTime());
+});
+
+test('buildTransportBodyEntry: returns dtstamp === null for the IDOS.cz fixture (no DTSTAMP concept, same treatment as status)', () => {
+  const parsedTicket = parseIdosTicketText(REAL_IDOS_BODY_TEXT);
+  const entry = buildTransportBodyEntry(parsedTicket, 'Europe/Prague');
+
+  assert.equal(entry.dtstamp, null);
+});
+
+test('buildTransportIcsEntry: entry.resource carries no dtstamp key for either the confirmation or the cancel fixture', () => {
+  const confirmationEvent = parseIcs(REAL_REGIOJET_ICS)[0];
+  const cancelEvent = parseIcs(REAL_REGIOJET_CANCEL_ICS)[0];
+
+  assert.equal(Object.prototype.hasOwnProperty.call(buildTransportIcsEntry(confirmationEvent).resource, 'dtstamp'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(buildTransportIcsEntry(cancelEvent).resource, 'dtstamp'), false);
+});
+
+test('buildTransportIcsEntry: the rebooking entry\'s ticketIdentifier AND uid both equal the confirmation entry\'s, while its summary differs -- the real-world shape that makes Problem A reachable (fixture-fidelity proof)', () => {
+  const confirmationEntry = buildTransportIcsEntry(parseIcs(REAL_REGIOJET_ICS)[0]);
+  const rebookEntry = buildTransportIcsEntry(parseIcs(REAL_REGIOJET_REBOOK_ICS)[0]);
+
+  assert.equal(rebookEntry.ticketIdentifier, confirmationEntry.ticketIdentifier);
+  assert.equal(rebookEntry.uid, confirmationEntry.uid);
+  assert.notEqual(rebookEntry.summary, confirmationEntry.summary);
+});
+
 // --- TRANSPORT_TICKETS_ACTION -------------------------------------------------
 
 test('TRANSPORT_TICKETS_ACTION: name is "transport-tickets"', () => {
@@ -668,4 +885,547 @@ test('TRANSPORT_TICKETS_ACTION_CONFIG.transportSenders: code default is now TWO 
 
 test('TRANSPORT_TICKETS_ACTION_CONFIG.transportSenders: the new two-entry default still passes the shared isValidTicketingPortalsShape validator (the extra mode key is ignored by design)', () => {
   assert.equal(isValidTicketingPortalsShape(TRANSPORT_TICKETS_ACTION_CONFIG.transportSenders), true);
+});
+
+// --- partitionTransportEntriesByCancellation (D-03, quick-260813-dq2) -------
+//
+// Pure, unit-tested split on entry.status === 'CANCELLED' -- placed BETWEEN
+// entry construction and the existing seenInBatch/isDuplicateTransportTicket
+// filter in processTransportTicketJob, so a cancel entry never gets
+// dedup-dropped (its identifier deliberately matches the very event it is
+// meant to delete).
+
+test('partitionTransportEntriesByCancellation: splits a mixed array on status === "CANCELLED"', () => {
+  const toCancelEntry = { status: 'CANCELLED', ticketIdentifier: 'a' };
+  const toCreateEntry = { status: null, ticketIdentifier: 'b' };
+
+  const result = partitionTransportEntriesByCancellation([toCancelEntry, toCreateEntry]);
+
+  assert.deepEqual(result.toCancel, [toCancelEntry]);
+  assert.deepEqual(result.toCreate, [toCreateEntry]);
+});
+
+test('partitionTransportEntriesByCancellation: routes status null, an absent status key, and any other status value to toCreate', () => {
+  const nullStatusEntry = { status: null, ticketIdentifier: 'a' };
+  const absentStatusEntry = { ticketIdentifier: 'b' };
+  const otherStatusEntry = { status: 'CONFIRMED', ticketIdentifier: 'c' };
+
+  const result = partitionTransportEntriesByCancellation([nullStatusEntry, absentStatusEntry, otherStatusEntry]);
+
+  assert.deepEqual(result.toCancel, []);
+  assert.deepEqual(result.toCreate, [nullStatusEntry, absentStatusEntry, otherStatusEntry]);
+});
+
+test('partitionTransportEntriesByCancellation: preserves relative order within each bucket and does not mutate the input array or its entries', () => {
+  const entries = [
+    { status: 'CANCELLED', ticketIdentifier: '1' },
+    { status: null, ticketIdentifier: '2' },
+    { status: 'CANCELLED', ticketIdentifier: '3' },
+    { status: null, ticketIdentifier: '4' },
+  ];
+  const entriesCopy = entries.map(function (entry) {
+    return Object.assign({}, entry);
+  });
+
+  const result = partitionTransportEntriesByCancellation(entries);
+
+  assert.deepEqual(result.toCancel.map(function (e) { return e.ticketIdentifier; }), ['1', '3']);
+  assert.deepEqual(result.toCreate.map(function (e) { return e.ticketIdentifier; }), ['2', '4']);
+  assert.deepEqual(entries, entriesCopy, 'input array/entries must not be mutated');
+});
+
+test('partitionTransportEntriesByCancellation: returns two empty arrays for an empty input', () => {
+  const result = partitionTransportEntriesByCancellation([]);
+
+  assert.deepEqual(result.toCancel, []);
+  assert.deepEqual(result.toCreate, []);
+});
+
+// --- cancelTransportTicketEvent (D-04, D-05, quick-260813-dq2) --------------
+//
+// GAS-only (Calendar global) -- proven under Node via a fake global.Calendar,
+// same fake-global technique test/script-properties.test.js already uses for
+// PropertiesService. Saves/restores the previous global.Calendar value
+// around each test so no other test in the file is affected.
+
+function withFakeCalendar(events, fn) {
+  const listCalls = [];
+  const removeCalls = [];
+  const previousCalendar = global.Calendar;
+
+  global.Calendar = {
+    Events: {
+      list: function (calendarId, options) {
+        listCalls.push({ calendarId: calendarId, options: options });
+
+        // Real Calendar API filters server-side on privateExtendedProperty --
+        // the fake mirrors that so the race regression below is proven by
+        // the SAME query-scoping the real API performs, not by a hand-rolled
+        // find() the fake alone would need.
+        const match = /^ticketIdentifier=(.*)$/.exec(options.privateExtendedProperty || '');
+        const wantedIdentifier = match ? match[1] : null;
+        const items = events.filter(function (event) {
+          return (
+            event.extendedProperties &&
+            event.extendedProperties.private &&
+            event.extendedProperties.private.ticketIdentifier === wantedIdentifier
+          );
+        });
+
+        return { items: items };
+      },
+      remove: function (calendarId, eventId) {
+        removeCalls.push({ calendarId: calendarId, eventId: eventId });
+      },
+    },
+  };
+
+  try {
+    fn({ listCalls: listCalls, removeCalls: removeCalls });
+  } finally {
+    if (previousCalendar === undefined) {
+      delete global.Calendar;
+    } else {
+      global.Calendar = previousCalendar;
+    }
+  }
+}
+
+test('cancelTransportTicketEvent: a match found calls Calendar.Events.remove exactly once with (calendarId, event.id), and the lookup is scoped via privateExtendedProperty', () => {
+  const existingEvent = { id: 'event-1', extendedProperties: { private: { ticketIdentifier: '7788123456' } } };
+
+  withFakeCalendar([existingEvent], function (calls) {
+    cancelTransportTicketEvent('7788123456', 'calendar-a');
+
+    assert.equal(calls.listCalls.length, 1);
+    assert.equal(calls.listCalls[0].options.privateExtendedProperty, 'ticketIdentifier=7788123456');
+    assert.equal(calls.removeCalls.length, 1);
+    assert.deepEqual(calls.removeCalls[0], { calendarId: 'calendar-a', eventId: 'event-1' });
+  });
+});
+
+test('cancelTransportTicketEvent: no matching event -> no Calendar.Events.remove call at all, no throw (D-05, accepted limitation)', () => {
+  withFakeCalendar([], function (calls) {
+    assert.doesNotThrow(function () {
+      cancelTransportTicketEvent('does-not-exist', 'calendar-a');
+    });
+
+    assert.equal(calls.listCalls.length, 1);
+    assert.equal(calls.removeCalls.length, 0);
+  });
+});
+
+test('cancelTransportTicketEvent: a falsy ticketIdentifier (null) never reaches the Calendar API -- neither list nor remove is called, no throw', () => {
+  withFakeCalendar([], function (calls) {
+    assert.doesNotThrow(function () {
+      cancelTransportTicketEvent(null, 'calendar-a');
+    });
+
+    assert.equal(calls.listCalls.length, 0);
+    assert.equal(calls.removeCalls.length, 0);
+  });
+});
+
+test('cancelTransportTicketEvent: a falsy ticketIdentifier (empty string) never reaches the Calendar API -- neither list nor remove is called, no throw', () => {
+  withFakeCalendar([], function (calls) {
+    assert.doesNotThrow(function () {
+      cancelTransportTicketEvent('', 'calendar-a');
+    });
+
+    assert.equal(calls.listCalls.length, 0);
+    assert.equal(calls.removeCalls.length, 0);
+  });
+});
+
+// THE RACE REGRESSION (D-04): a cancelled ticket and a newly-purchased
+// ticket for the SAME date/time but DIFFERENT ticket numbers must never
+// cross-contaminate -- cancelling one issues a lookup scoped to that ticket
+// number only and removes only that event's id. Holds regardless of which
+// email is processed first (this test proves the STATIC guarantee: strict
+// ticket-number matching, no date/time fallback -- processing order is
+// irrelevant because the lookup never considers date/time at all).
+test('cancelTransportTicketEvent: strict ticket-number matching -- cancelling one ticket never affects a different ticket for the SAME date/time (D-04 race regression, order-independent)', () => {
+  const cancelledTicketEvent = {
+    id: 'event-cancelled-ticket',
+    start: { dateTime: '2026-08-18T17:36:00+02:00' },
+    extendedProperties: { private: { ticketIdentifier: '7788123456' } },
+  };
+  const newlyPurchasedTicketEvent = {
+    id: 'event-new-ticket',
+    start: { dateTime: '2026-08-18T17:36:00+02:00' },
+    extendedProperties: { private: { ticketIdentifier: '9900112233' } },
+  };
+
+  withFakeCalendar([cancelledTicketEvent, newlyPurchasedTicketEvent], function (calls) {
+    cancelTransportTicketEvent('7788123456', 'calendar-a');
+
+    assert.equal(calls.listCalls[0].options.privateExtendedProperty, 'ticketIdentifier=7788123456');
+    assert.equal(calls.removeCalls.length, 1);
+    assert.equal(calls.removeCalls[0].eventId, 'event-cancelled-ticket');
+    assert.notEqual(calls.removeCalls[0].eventId, 'event-new-ticket');
+  });
+});
+
+// --- buildTransportEventPrivateProperties (D-10, quick-260813-dq2 Task 3) ---
+//
+// New pure helper, the SINGLE writer of the extendedProperties.private tag
+// isTransportCancellationStale later reads. Placed next to the entry
+// builders in the production file.
+
+test('buildTransportEventPrivateProperties: identifier + a real dtstamp -> { ticketIdentifier, dtstamp: <that entry\'s ISO string> }', () => {
+  const dtstamp = new Date('2026-08-13T07:34:45.000Z');
+  const result = buildTransportEventPrivateProperties({ ticketIdentifier: '7788123456', dtstamp: dtstamp });
+
+  assert.deepEqual(result, { ticketIdentifier: '7788123456', dtstamp: '2026-08-13T07:34:45.000Z' });
+});
+
+test('buildTransportEventPrivateProperties: identifier + dtstamp: null -> { ticketIdentifier } with NO dtstamp key present at all', () => {
+  const result = buildTransportEventPrivateProperties({ ticketIdentifier: '7788123456', dtstamp: null });
+
+  assert.deepEqual(result, { ticketIdentifier: '7788123456' });
+  assert.equal(Object.prototype.hasOwnProperty.call(result, 'dtstamp'), false);
+  assert.equal(JSON.stringify(result).indexOf('null'), -1, 'serialized object must not contain the literal 4-character null token');
+});
+
+test('buildTransportEventPrivateProperties: falsy ticketIdentifier -> null, meaning the write loop sets no extendedProperties object at all (today\'s exact behavior, preserved)', () => {
+  assert.equal(buildTransportEventPrivateProperties({ ticketIdentifier: null, dtstamp: new Date() }), null);
+  assert.equal(buildTransportEventPrivateProperties({ ticketIdentifier: '', dtstamp: new Date() }), null);
+});
+
+test('buildTransportEventPrivateProperties: a non-Date / invalid-Date dtstamp -> the key is omitted rather than emitting an invalid string', () => {
+  const withNonDate = buildTransportEventPrivateProperties({ ticketIdentifier: 'x', dtstamp: 'not-a-date' });
+  assert.deepEqual(withNonDate, { ticketIdentifier: 'x' });
+
+  const withInvalidDate = buildTransportEventPrivateProperties({ ticketIdentifier: 'x', dtstamp: new Date('not-a-date') });
+  assert.deepEqual(withInvalidDate, { ticketIdentifier: 'x' });
+});
+
+// --- isTransportCancellationStale (D-11, quick-260813-dq2 Task 3) -----------
+//
+// True ONLY when the found event's stored dtstamp is present AND strictly
+// newer than the cancellation entry's own dtstamp. Every missing/
+// unparseable case returns false so the caller falls back to deleting -- an
+// absent optional signal must never block D-05.
+
+test('isTransportCancellationStale: stored dtstamp NEWER than the cancel dtstamp -> true', () => {
+  const existingEvent = { extendedProperties: { private: { dtstamp: '2026-08-13T07:39:19.000Z' } } };
+  assert.equal(isTransportCancellationStale(existingEvent, new Date('2026-08-13T07:34:45.000Z')), true);
+});
+
+test('isTransportCancellationStale: stored dtstamp OLDER than the cancel dtstamp -> false', () => {
+  const existingEvent = { extendedProperties: { private: { dtstamp: '2026-08-02T17:45:58.000Z' } } };
+  assert.equal(isTransportCancellationStale(existingEvent, new Date('2026-08-13T07:34:45.000Z')), false);
+});
+
+test('isTransportCancellationStale: stored dtstamp EQUAL to the cancel dtstamp -> false (strictly newer, not newer-or-equal)', () => {
+  const same = '2026-08-13T07:34:45.000Z';
+  const existingEvent = { extendedProperties: { private: { dtstamp: same } } };
+  assert.equal(isTransportCancellationStale(existingEvent, new Date(same)), false);
+});
+
+test('isTransportCancellationStale: event has no stored dtstamp key -> false', () => {
+  const existingEvent = { extendedProperties: { private: { ticketIdentifier: '7788123456' } } };
+  assert.equal(isTransportCancellationStale(existingEvent, new Date('2026-08-13T07:34:45.000Z')), false);
+});
+
+test('isTransportCancellationStale: event has no extendedProperties at all, or a null one -> false, no throw', () => {
+  assert.doesNotThrow(function () {
+    assert.equal(isTransportCancellationStale({}, new Date()), false);
+  });
+  assert.doesNotThrow(function () {
+    assert.equal(isTransportCancellationStale({ extendedProperties: null }, new Date()), false);
+  });
+  assert.doesNotThrow(function () {
+    assert.equal(isTransportCancellationStale({ extendedProperties: { private: null } }, new Date()), false);
+  });
+});
+
+test('isTransportCancellationStale: cancelDtstamp null/undefined -> false', () => {
+  const existingEvent = { extendedProperties: { private: { dtstamp: '2026-08-13T07:39:19.000Z' } } };
+  assert.equal(isTransportCancellationStale(existingEvent, null), false);
+  assert.equal(isTransportCancellationStale(existingEvent, undefined), false);
+});
+
+test('isTransportCancellationStale: stored value unparseable -> false', () => {
+  const existingEvent = { extendedProperties: { private: { dtstamp: 'not-a-date' } } };
+  assert.equal(isTransportCancellationStale(existingEvent, new Date('2026-08-13T07:34:45.000Z')), false);
+});
+
+// --- cancelTransportTicketEvent, stale-cancellation guard (D-11, quick-260813-dq2 Task 3) ---
+//
+// The optional THIRD parameter is the cancellation entry's OWN dtstamp. All
+// 5 pre-existing two-argument tests above still pass untouched -- the third
+// parameter's absence means today's behavior (unchanged fallback: delete).
+
+test('cancelTransportTicketEvent: found event tagged with a dtstamp NEWER than the cancel entry\'s -> Calendar.Events.remove is NEVER called, no throw (the stale cancellation is skipped)', () => {
+  const existingEvent = {
+    id: 'event-1',
+    extendedProperties: { private: { ticketIdentifier: '7788123456', dtstamp: '2026-08-13T07:39:19.000Z' } },
+  };
+
+  withFakeCalendar([existingEvent], function (calls) {
+    assert.doesNotThrow(function () {
+      cancelTransportTicketEvent('7788123456', 'calendar-a', new Date('2026-08-13T07:34:45.000Z'));
+    });
+
+    assert.equal(calls.removeCalls.length, 0);
+  });
+});
+
+test('cancelTransportTicketEvent: found event tagged with an OLDER dtstamp -> removed exactly as before (D-05\'s core case must not regress)', () => {
+  const existingEvent = {
+    id: 'event-1',
+    extendedProperties: { private: { ticketIdentifier: '7788123456', dtstamp: '2026-08-02T17:45:58.000Z' } },
+  };
+
+  withFakeCalendar([existingEvent], function (calls) {
+    cancelTransportTicketEvent('7788123456', 'calendar-a', new Date('2026-08-13T07:34:45.000Z'));
+
+    assert.equal(calls.removeCalls.length, 1);
+    assert.equal(calls.removeCalls[0].eventId, 'event-1');
+  });
+});
+
+test('cancelTransportTicketEvent: found event with NO stored dtstamp (pre-feature event, or one written by a uid-less entry) -> removed, unchanged fallback', () => {
+  const existingEvent = {
+    id: 'event-1',
+    extendedProperties: { private: { ticketIdentifier: '7788123456' } },
+  };
+
+  withFakeCalendar([existingEvent], function (calls) {
+    cancelTransportTicketEvent('7788123456', 'calendar-a', new Date('2026-08-13T07:34:45.000Z'));
+
+    assert.equal(calls.removeCalls.length, 1);
+  });
+});
+
+test('cancelTransportTicketEvent: cancel entry with no dtstamp of its own (third argument null) against a tagged event -> removed, unchanged fallback', () => {
+  const existingEvent = {
+    id: 'event-1',
+    extendedProperties: { private: { ticketIdentifier: '7788123456', dtstamp: '2026-08-13T07:39:19.000Z' } },
+  };
+
+  withFakeCalendar([existingEvent], function (calls) {
+    cancelTransportTicketEvent('7788123456', 'calendar-a', null);
+
+    assert.equal(calls.removeCalls.length, 1);
+  });
+});
+
+// --- filterTransportEntriesToCreate (D-08, quick-260813-dq2 Task 3) --------
+//
+// The EXISTING seenInBatch + isDuplicateTransportTicket filter, extracted
+// out of processTransportTicketJob so it is reachable under Node, with
+// exactly one behavior change: isDuplicateTransportTicket is now consulted
+// ONLY for an entry with no `uid` (D-08). seenInBatch still applies to
+// EVERY entry, uid-bearing or not (deliberate scope limit).
+
+test('filterTransportEntriesToCreate: THE PROBLEM A REGRESSION -- a uid-bearing entry whose ticketIdentifier MATCHES an existing event SURVIVES the filter, and Calendar.Events.list is never called for it', () => {
+  const existingEvent = { id: 'event-1', extendedProperties: { private: { ticketIdentifier: '7788123456' } } };
+  const reissueEntry = { ticketIdentifier: '7788123456', uid: '-9876543210@regiojet.cz' };
+
+  withFakeCalendar([existingEvent], function (calls) {
+    const result = filterTransportEntriesToCreate([reissueEntry], 'calendar-a');
+
+    assert.deepEqual(result, [reissueEntry]);
+    assert.equal(calls.listCalls.length, 0, 'isDuplicateTransportTicket must not be consulted at all for a uid-bearing entry');
+  });
+});
+
+test('filterTransportEntriesToCreate: THE IDOS.cz PROTECTION IS INTACT -- a uid-less entry whose ticketIdentifier matches an existing event is DROPPED, and the lookup WAS issued', () => {
+  const existingEvent = { id: 'event-1', extendedProperties: { private: { ticketIdentifier: 'PLTQ-DMVR-ZKBN' } } };
+  const duplicateBodyEntry = { ticketIdentifier: 'PLTQ-DMVR-ZKBN', uid: null };
+
+  withFakeCalendar([existingEvent], function (calls) {
+    const result = filterTransportEntriesToCreate([duplicateBodyEntry], 'calendar-a');
+
+    assert.deepEqual(result, []);
+    assert.equal(calls.listCalls.length, 1, 'isDuplicateTransportTicket must still be consulted for a uid-less entry -- the narrowing is scoped, not global');
+  });
+});
+
+test('filterTransportEntriesToCreate: WR-01 IS INTACT -- two uid-less same-batch entries sharing one ticketIdentifier collapse to the first only', () => {
+  const first = { ticketIdentifier: 'PLTQ-DMVR-ZKBN', uid: null };
+  const second = { ticketIdentifier: 'PLTQ-DMVR-ZKBN', uid: null };
+
+  withFakeCalendar([], function () {
+    const result = filterTransportEntriesToCreate([first, second], 'calendar-a');
+
+    assert.deepEqual(result, [first]);
+  });
+});
+
+test('filterTransportEntriesToCreate: seenInBatch still applies to uid-bearing entries too (D-08\'s deliberate scope limit) -- two same-batch uid-bearing entries sharing one ticketIdentifier still collapse to the first', () => {
+  const first = { ticketIdentifier: '7788123456', uid: '-9876543210@regiojet.cz' };
+  const second = { ticketIdentifier: '7788123456', uid: '-9876543210@regiojet.cz' };
+
+  withFakeCalendar([], function (calls) {
+    const result = filterTransportEntriesToCreate([first, second], 'calendar-a');
+
+    assert.deepEqual(result, [first]);
+    assert.equal(calls.listCalls.length, 0, 'uid-bearing entries never consult isDuplicateTransportTicket at all');
+  });
+});
+
+test('filterTransportEntriesToCreate: a uid-less entry with a falsy ticketIdentifier survives (unchanged: the falsy guard makes isDuplicateTransportTicket return false and nothing is tracked in seenInBatch)', () => {
+  const entry = { ticketIdentifier: null, uid: null };
+
+  withFakeCalendar([], function (calls) {
+    const result = filterTransportEntriesToCreate([entry], 'calendar-a');
+
+    assert.deepEqual(result, [entry]);
+    assert.equal(calls.listCalls.length, 0);
+  });
+});
+
+test('filterTransportEntriesToCreate: relative order is preserved and the input array/entries are not mutated', () => {
+  const entries = [
+    { ticketIdentifier: 'a', uid: 'uid-a' },
+    { ticketIdentifier: 'b', uid: null },
+    { ticketIdentifier: 'c', uid: 'uid-c' },
+  ];
+  const entriesCopy = entries.map(function (entry) {
+    return Object.assign({}, entry);
+  });
+
+  withFakeCalendar([], function () {
+    const result = filterTransportEntriesToCreate(entries, 'calendar-a');
+
+    assert.deepEqual(
+      result.map(function (e) {
+        return e.ticketIdentifier;
+      }),
+      ['a', 'b', 'c']
+    );
+    assert.deepEqual(entries, entriesCopy, 'input array/entries must not be mutated');
+  });
+});
+
+// --- THE TWO ORDERING SCENARIOS (D-12, quick-260813-dq2 Task 3) ------------
+//
+// A shared, MUTATING fake calendar store per scenario (extends the
+// withFakeCalendar shape above so remove actually deletes), plus a small
+// local simulateTransportWrite(store, entry) test helper that upserts by
+// entry.uid and tags the stored event via the EXPORTED
+// buildTransportEventPrivateProperties -- i.e. the write loop's tagging is
+// exercised through the real production helper, never a reimplementation of
+// it. Each scenario runs the exported decision helpers in the SAME sequence
+// processTransportTicketJob invokes them (partition -> cancel the toCancel
+// bucket -> filter the toCreate bucket -> write what survives), once per
+// message, in the stated order. These prove the COMPOSED DECISION LOGIC, NOT
+// processTransportTicketJob's own GAS-only wiring, which only the live
+// checkpoint can reach (D-12, Task 4's honest-scope note).
+
+function withMutatingFakeCalendar(initialEvents, fn) {
+  const store = initialEvents.slice();
+  const removeCalls = [];
+  const previousCalendar = global.Calendar;
+
+  global.Calendar = {
+    Events: {
+      list: function (calendarId, options) {
+        const match = /^ticketIdentifier=(.*)$/.exec(options.privateExtendedProperty || '');
+        const wantedIdentifier = match ? match[1] : null;
+        const items = store.filter(function (event) {
+          return (
+            event.extendedProperties &&
+            event.extendedProperties.private &&
+            event.extendedProperties.private.ticketIdentifier === wantedIdentifier
+          );
+        });
+
+        return { items: items };
+      },
+      remove: function (calendarId, eventId) {
+        removeCalls.push({ calendarId: calendarId, eventId: eventId });
+
+        const index = store.findIndex(function (event) {
+          return event.id === eventId;
+        });
+        if (index !== -1) {
+          store.splice(index, 1);
+        }
+      },
+    },
+  };
+
+  try {
+    fn(store, removeCalls);
+  } finally {
+    if (previousCalendar === undefined) {
+      delete global.Calendar;
+    } else {
+      global.Calendar = previousCalendar;
+    }
+  }
+}
+
+function simulateTransportWrite(store, entry) {
+  const privateProperties = buildTransportEventPrivateProperties(entry);
+  const existingIndex = store.findIndex(function (event) {
+    return event.iCalUID === entry.uid;
+  });
+
+  const eventData = {
+    id: existingIndex === -1 ? 'event-' + (store.length + 1) : store[existingIndex].id,
+    iCalUID: entry.uid,
+    summary: entry.summary,
+  };
+  if (privateProperties) {
+    eventData.extendedProperties = { private: privateProperties };
+  }
+
+  if (existingIndex === -1) {
+    store.push(eventData);
+  } else {
+    store[existingIndex] = eventData;
+  }
+}
+
+function processTransportEntryForTest(store, calendarId, entry) {
+  const partitioned = partitionTransportEntriesByCancellation([entry]);
+
+  partitioned.toCancel.forEach(function (cancelEntry) {
+    cancelTransportTicketEvent(cancelEntry.ticketIdentifier, calendarId, cancelEntry.dtstamp);
+  });
+
+  const toCreate = filterTransportEntriesToCreate(partitioned.toCreate, calendarId);
+  toCreate.forEach(function (createEntry) {
+    simulateTransportWrite(store, createEntry);
+  });
+}
+
+test('ORDER 1 (cancel first, then rebooking): the rebooking survives and the store ends with exactly ONE event carrying the rebooking\'s summary and dtstamp tag', () => {
+  const confirmationEntry = buildTransportIcsEntry(parseIcs(REAL_REGIOJET_ICS)[0]);
+  const cancelEntry = buildTransportIcsEntry(parseIcs(REAL_REGIOJET_CANCEL_ICS)[0]);
+  const rebookEntry = buildTransportIcsEntry(parseIcs(REAL_REGIOJET_REBOOK_ICS)[0]);
+
+  withMutatingFakeCalendar([], function (store) {
+    simulateTransportWrite(store, confirmationEntry);
+
+    processTransportEntryForTest(store, 'calendar-a', cancelEntry);
+    processTransportEntryForTest(store, 'calendar-a', rebookEntry);
+
+    assert.equal(store.length, 1);
+    assert.equal(store[0].summary, rebookEntry.summary);
+    assert.equal(store[0].extendedProperties.private.dtstamp, rebookEntry.dtstamp.toISOString());
+  });
+});
+
+test('ORDER 2 (rebooking first, then cancel -- THE EXACT SCENARIO THE OWNER ASKED ABOUT): the rebooked event survives untouched, and the stale cancellation records no remove call', () => {
+  const confirmationEntry = buildTransportIcsEntry(parseIcs(REAL_REGIOJET_ICS)[0]);
+  const cancelEntry = buildTransportIcsEntry(parseIcs(REAL_REGIOJET_CANCEL_ICS)[0]);
+  const rebookEntry = buildTransportIcsEntry(parseIcs(REAL_REGIOJET_REBOOK_ICS)[0]);
+
+  withMutatingFakeCalendar([], function (store, removeCalls) {
+    simulateTransportWrite(store, confirmationEntry);
+
+    processTransportEntryForTest(store, 'calendar-a', rebookEntry);
+    processTransportEntryForTest(store, 'calendar-a', cancelEntry);
+
+    assert.equal(store.length, 1);
+    assert.equal(store[0].summary, rebookEntry.summary);
+    assert.equal(store[0].extendedProperties.private.dtstamp, rebookEntry.dtstamp.toISOString());
+    assert.equal(removeCalls.length, 0, 'the stale cancellation must not call Calendar.Events.remove');
+  });
 });

@@ -505,9 +505,10 @@ function formatTransportWallClockIso(components) {
 }
 
 /**
- * buildTransportBodyEntry — builds the SHARED entry shape (D-05:
- * `{ resource, summary, filenameDate, ticketIdentifier, uid }`) for a
- * `'body'`-mode job from `parsedTicket` (parseIdosTicketText's return
+ * buildTransportBodyEntry — builds the SHARED entry shape (D-05, extended
+ * with `status` at D-03 and `dtstamp` at D-10 of quick-260813-dq2:
+ * `{ resource, summary, filenameDate, ticketIdentifier, uid, status, dtstamp }`)
+ * for a `'body'`-mode job from `parsedTicket` (parseIdosTicketText's return
  * shape) and an INJECTED `timeZone` (never read from a GAS global here —
  * its GAS-only caller, processTransportTicketJob, resolves it live via
  * `CalendarApp.getCalendarById(calendarId).getTimeZone()`, keeping this
@@ -525,7 +526,11 @@ function formatTransportWallClockIso(components) {
  * `entry.uid` is always `null` for this mode (IDOS.cz has no VEVENT UID at
  * all), which is what routes this entry through the shared write loop's
  * `Calendar.Events.insert` branch rather than the `.ics`-only idempotent
- * import path. Pure, no GAS globals.
+ * import path. `entry.status` is always `null` for this mode — IDOS.cz
+ * body-mode tickets have no ICS STATUS concept and are out of scope for
+ * cancellation via this mechanism (D-03). `entry.dtstamp` is likewise
+ * always `null` — IDOS.cz has no DTSTAMP concept either, same treatment as
+ * `status` (D-10). Pure, no GAS globals.
  */
 function buildTransportBodyEntry(parsedTicket, timeZone) {
   const summary = parsedTicket.from + ' » ' + parsedTicket.to;
@@ -555,6 +560,8 @@ function buildTransportBodyEntry(parsedTicket, timeZone) {
     filenameDate: new Date(Date.UTC(parsedTicket.start.year, parsedTicket.start.month, parsedTicket.start.day)),
     ticketIdentifier: parsedTicket.ticketIdentifier,
     uid: null,
+    status: null,
+    dtstamp: null,
   };
 }
 
@@ -577,15 +584,21 @@ function stripTransportSummaryIdentifierPrefix(summary) {
 /**
  * buildTransportIcsEntry — the `'ics'`-mode counterpart to
  * buildTransportBodyEntry, expressing RegioJet's EXISTING behavior through
- * the SAME shared entry shape (D-05) — no new parsing at all: `resource`
- * is the REUSED buildEventResource(event) (D-01), `uid`/`ticketIdentifier`/
- * `filenameDate` are read straight off the already-parsed `event` object
- * (via the EXISTING extractTransportTicketIdentifier for the identifier).
- * `summary` (and `resource.summary`, which otherwise carries the raw VEVENT
- * SUMMARY through unmodified) has RegioJet's redundant `#<digits>: ` prefix
- * stripped via stripTransportSummaryIdentifierPrefix (v0.8.1) — this is the
- * ONE deliberate deviation from "no new parsing"; every other field is
- * still the reused ICS action's own value. Pure, no GAS globals.
+ * the SAME shared entry shape (D-05, extended with `status` at D-03 and
+ * `dtstamp` at D-10 of quick-260813-dq2) — no new parsing at all: `resource`
+ * is the REUSED buildEventResource(event) (D-01),
+ * `uid`/`ticketIdentifier`/`filenameDate`/`status`/`dtstamp` are read
+ * straight off the already-parsed `event` object (via the EXISTING
+ * extractTransportTicketIdentifier for the identifier). `status` and
+ * `dtstamp` come STRAIGHT off `event.status`/`event.dtstamp` (Task 1's and
+ * Task 3's parser-level fields respectively) — no new parsing here either,
+ * and `buildEventResource` still does not copy either onto `resource` (D-01
+ * firewall). `summary` (and `resource.summary`, which otherwise carries the
+ * raw VEVENT SUMMARY through unmodified) has RegioJet's redundant
+ * `#<digits>: ` prefix stripped via stripTransportSummaryIdentifierPrefix
+ * (v0.8.1) — this is the ONE deliberate deviation from "no new parsing";
+ * every other field is still the reused ICS action's own value. Pure, no
+ * GAS globals.
  */
 function buildTransportIcsEntry(event) {
   const summary = stripTransportSummaryIdentifierPrefix(event.summary);
@@ -598,7 +611,42 @@ function buildTransportIcsEntry(event) {
     filenameDate: event.start,
     ticketIdentifier: extractTransportTicketIdentifier(event),
     uid: event.uid,
+    status: event.status,
+    dtstamp: event.dtstamp,
   };
+}
+
+/**
+ * partitionTransportEntriesByCancellation — pure, unit-tested split of a
+ * shared-shape entries array (see buildTransportIcsEntry/
+ * buildTransportBodyEntry) into `{ toCancel, toCreate }`, strictly on
+ * `entry.status === 'CANCELLED'` (D-03/D-04 of quick-260813-dq2). Compares
+ * against the uppercase token ONLY and does NOT re-normalize — Task 1's
+ * parser (`parseVeventBlock`) is the single normalization point for this
+ * value, established there specifically so this comparison never needs to
+ * trim/uppercase again. `status: null`, an absent `status` key, and any
+ * other status value all route to `toCreate`. Preserves relative order
+ * within each bucket and never mutates the input array or its entries —
+ * this must sit BETWEEN entry construction and the EXISTING
+ * seenInBatch/isDuplicateTransportTicket filter in
+ * processTransportTicketJob: placing it after that filter would let a
+ * cancel entry get dedup-dropped (its identifier deliberately matches the
+ * very event it is meant to delete) and the cancellation would silently
+ * vanish. Pure, no GAS globals.
+ */
+function partitionTransportEntriesByCancellation(entries) {
+  const toCancel = [];
+  const toCreate = [];
+
+  (entries || []).forEach(function (entry) {
+    if (entry.status === 'CANCELLED') {
+      toCancel.push(entry);
+    } else {
+      toCreate.push(entry);
+    }
+  });
+
+  return { toCancel: toCancel, toCreate: toCreate };
 }
 
 /**
@@ -760,6 +808,215 @@ function isDuplicateTransportTicket(ticketIdentifier, calendarId) {
 }
 
 /**
+ * buildTransportEventPrivateProperties — the SINGLE writer of the
+ * `extendedProperties.private` tag isTransportCancellationStale later reads
+ * (D-10 of quick-260813-dq2 Task 3). Returns `null` when
+ * `entry.ticketIdentifier` is falsy — meaning the write loop writes no
+ * `extendedProperties` object at all, today's exact existing behavior (a
+ * dtstamp with no ticketIdentifier is unreachable anyway, since every lookup
+ * is keyed on the identifier). Otherwise returns `{ ticketIdentifier }`,
+ * plus a `dtstamp` key set to `entry.dtstamp.toISOString()` ONLY when
+ * `entry.dtstamp` is a real, valid Date — omitted entirely otherwise (never
+ * string-coerced), so the tagged value is never the literal 4-character
+ * word "null" (the defensive convention buildTransportAttachmentFilename's
+ * own JSDoc records). Pure, no GAS globals.
+ */
+function buildTransportEventPrivateProperties(entry) {
+  if (!entry.ticketIdentifier) {
+    return null;
+  }
+
+  const properties = { ticketIdentifier: entry.ticketIdentifier };
+
+  if (entry.dtstamp instanceof Date && !Number.isNaN(entry.dtstamp.getTime())) {
+    properties.dtstamp = entry.dtstamp.toISOString();
+  }
+
+  return properties;
+}
+
+/**
+ * isTransportCancellationStale — D-11 of quick-260813-dq2 Task 3: true ONLY
+ * when the found event's stored `extendedProperties.private.dtstamp` (see
+ * buildTransportEventPrivateProperties, the single writer of this tag) is
+ * present AND strictly newer than the cancellation entry's OWN
+ * `cancelDtstamp` — meaning a rebooking has already overwritten this event
+ * since the cancellation was generated. EVERY missing/unparseable case
+ * returns `false` so the caller falls back to the current, unchanged
+ * behavior (delete): no stored dtstamp at all (a pre-feature event, or one
+ * written by a uid-less entry, which never gets the tag), no
+ * `extendedProperties`/`private` at any level (never throws), an
+ * unparseable stored value, a falsy `cancelDtstamp`, or an equal timestamp
+ * (strictly newer, not newer-or-equal). An absent optional signal must
+ * never block the D-05 cancellation guarantee. Pure, no GAS globals
+ * (operates only on the plain `existingEvent` object already returned by
+ * findTransportEventByIdentifier).
+ */
+function isTransportCancellationStale(existingEvent, cancelDtstamp) {
+  if (!cancelDtstamp) {
+    return false;
+  }
+
+  const cancelTime = new Date(cancelDtstamp).getTime();
+  if (Number.isNaN(cancelTime)) {
+    return false;
+  }
+
+  const storedValue =
+    existingEvent &&
+    existingEvent.extendedProperties &&
+    existingEvent.extendedProperties.private &&
+    existingEvent.extendedProperties.private.dtstamp;
+  if (!storedValue) {
+    return false;
+  }
+
+  const storedTime = new Date(storedValue).getTime();
+  if (Number.isNaN(storedTime)) {
+    return false;
+  }
+
+  return storedTime > cancelTime;
+}
+
+/**
+ * cancelTransportTicketEvent — deletes the calendar event a RegioJet
+ * cancellation entry refers to (D-03/D-04/D-05 of quick-260813-dq2), shaped
+ * and guarded like isDuplicateTransportTicket above. A falsy
+ * `ticketIdentifier` (null/empty string) is guarded FIRST — logs and
+ * returns WITHOUT ever reaching the Calendar API, same defensive shape as
+ * isDuplicateTransportTicket's own falsy guard. Otherwise looks up via the
+ * EXISTING findTransportEventByIdentifier (no second lookup mechanism is
+ * added — it would drift from the exact
+ * `extendedProperties.private.ticketIdentifier` tag processTransportTicketJob
+ * already writes). No match is a SILENT no-op (D-05): logs and returns,
+ * never throws — mirrors booking.com's handleCancellation (src/06-action-
+ * booking-com-management.js:1198), whose no-match branch is the precedent
+ * for treating an un-matchable cancellation as an accepted limitation, not
+ * a failure.
+ *
+ * STALE-CANCELLATION GUARD (D-11/D-12 of quick-260813-dq2 Task 3): once a
+ * match is found and BEFORE the delete, the OPTIONAL third parameter
+ * `cancelDtstamp` (the cancellation entry's OWN dtstamp) is compared against
+ * the found event's stored dtstamp tag via isTransportCancellationStale. The
+ * cancellation and a rebooking for the same ticket are two INDEPENDENT
+ * messages/threads, so nothing guarantees which is processed first — if the
+ * rebooking already ran and retagged the event with a NEWER dtstamp than
+ * this cancellation's own, that means a later booking has already
+ * superseded the ticket this cancellation refers to; deleting would destroy
+ * the live rebooking (Problem B, the exact bug this guard fixes). SEQUENCE
+ * cannot resolve this ordering (RegioJet RESETS it across a cancel+rebook
+ * pair, observed 1 -> 2 -> 1); DTSTAMP — real send time — is monotonic
+ * instead. Every missing-timestamp case (omitted third argument, no stored
+ * tag, unparseable value) falls back to the ORIGINAL unchanged behavior —
+ * delete — so an absent optional signal never blocks the D-05 guarantee.
+ *
+ * A match that is NOT stale calls `Calendar.Events.remove(calendarId,
+ * existingEvent.id)` — that EXACT argument order (calendar first, event id
+ * second) is the live-proven call already used at
+ * src/06-action-booking-com-management.js:1203 — then logs success naming
+ * the identifier and the calendar.
+ *
+ * D-04 GUARANTEE (the race the owner explicitly asked about, solved BY
+ * CONSTRUCTION): matching is STRICTLY on the exact `ticketIdentifier` —
+ * RegioJet's own unique per-ticket number — via
+ * findTransportEventByIdentifier's `privateExtendedProperty` equality
+ * query, NEVER on date, time or route. Deliberately NO fuzzy or
+ * date-time-overlap fallback (unlike booking.com's hotel-name+date-overlap
+ * fallback, T-dq2-02) — that would reintroduce exactly the cross-
+ * contamination race a strict identifier match rules out. This holds
+ * regardless of which email (the new confirmation or the old cancellation)
+ * is processed first, since the lookup never considers date/time at all.
+ * The dtstamp comparison above is a staleness guard on an ALREADY
+ * identifier-matched event, never a matching mechanism of its own.
+ *
+ * GAS-only (calls findTransportEventByIdentifier, which touches the
+ * Calendar global, and calls Calendar.Events.remove directly) — not
+ * unit-tested in the usual sense, but proven under Node with a fake
+ * global.Calendar (same technique test/script-properties.test.js uses for
+ * PropertiesService); the live Calendar.Events.remove call itself is
+ * confirmed only by the live checkpoint.
+ */
+function cancelTransportTicketEvent(ticketIdentifier, calendarId, cancelDtstamp) {
+  if (!ticketIdentifier) {
+    console.log('Transport tickets: cancellation entry has no ticketIdentifier, skipping (silent no-op, never reaches the Calendar API).');
+    return;
+  }
+
+  const existingEvent = findTransportEventByIdentifier(ticketIdentifier, calendarId);
+  if (!existingEvent) {
+    console.log(
+      'Transport tickets: cancellation for ticket identifier ' + ticketIdentifier + ' has no matching calendar event, skipping (silent no-op, D-05 accepted limitation).'
+    );
+    return;
+  }
+
+  if (isTransportCancellationStale(existingEvent, cancelDtstamp)) {
+    const storedDtstamp = existingEvent.extendedProperties.private.dtstamp;
+    console.log(
+      'Transport tickets: cancellation for ticket identifier ' + ticketIdentifier + ' is STALE (event dtstamp ' + storedDtstamp + ' is newer than the cancellation\'s own dtstamp ' + cancelDtstamp + ') -- a rebooking already superseded this event, skipping the deletion (D-11).'
+    );
+    return;
+  }
+
+  Calendar.Events.remove(calendarId, existingEvent.id);
+  console.log('Transport tickets: cancelled (deleted) calendar event for ticket identifier ' + ticketIdentifier + ' on calendar ' + calendarId + '.');
+}
+
+/**
+ * filterTransportEntriesToCreate — the EXISTING seenInBatch +
+ * isDuplicateTransportTicket dedup filter (WR-01 of the 260803-us3 review),
+ * extracted out of processTransportTicketJob (D-08 of quick-260813-dq2
+ * Task 3) so it is reachable — and its Problem A fix provable — under Node
+ * with a fake global.Calendar, mirroring the same reason
+ * cancelTransportTicketEvent is already exported.
+ *
+ * PROBLEM A (D-08): `isDuplicateTransportTicket` is now consulted ONLY for
+ * an entry with NO `uid` — the call-site condition `!entry.uid && ...`
+ * below is the entire fix. RegioJet reuses the SAME `ticketIdentifier` AND
+ * the SAME iCalUID across a cancel+rebook pair; for a `uid`-bearing entry
+ * this pre-check is not merely redundant on the happy path but ACTIVELY
+ * WRONG on a reissue, since `Calendar.Events.import` (reached via
+ * `importIcsEventWithSequenceRetry`, keyed on `entry.uid`, see
+ * processTransportTicketJob's write loop) is ALREADY idempotent by iCalUID
+ * and creates-or-updates the correct single event with no help from the
+ * ticketIdentifier pre-check. The pre-check remains the ONLY protection
+ * `uid`-less IDOS.cz entries have — `Calendar.Events.insert` has none of
+ * its own — so it stays fully in force for them.
+ *
+ * `seenInBatch` (the WR-01 same-batch guard) is DELIBERATELY NOT narrowed
+ * alongside it — it keeps applying to EVERY entry, `uid`-bearing or not,
+ * unchanged from before Task 3: `seenInBatch` is a WITHIN-ONE-PASS guard
+ * against two same-batch entries sharing an identifier, and cannot possibly
+ * cause Problem A (a confirmation and its later cancel/rebook are separate
+ * `processTransportTicketJob` calls, each with a fresh, empty
+ * `seenInBatch`) — widening the narrowing to it would change behavior no
+ * bug requires.
+ *
+ * Preserves relative order, never mutates the input array or its entries.
+ * GAS-only in the sense that it touches the Calendar global transitively
+ * (via isDuplicateTransportTicket, for uid-less entries only) — not
+ * unit-tested in the usual sense, but proven under Node with a fake
+ * global.Calendar exactly like cancelTransportTicketEvent above.
+ */
+function filterTransportEntriesToCreate(entries, calendarId) {
+  const seenInBatch = {};
+
+  return (entries || []).filter(function (entry) {
+    if (entry.ticketIdentifier && seenInBatch[entry.ticketIdentifier]) {
+      return false;
+    }
+    if (!entry.uid && isDuplicateTransportTicket(entry.ticketIdentifier, calendarId)) {
+      return false;
+    }
+    if (entry.ticketIdentifier) {
+      seenInBatch[entry.ticketIdentifier] = true;
+    }
+    return true;
+  });
+}
+
+/**
  * processTransportTicketJob — the pipeline for ONE job (see
  * resolveTransportProcessingJobs' own JSDoc for the `{ mode, message,
  * sender, icsAttachments? }` shape), in this exact order so nothing is EVER
@@ -771,8 +1028,8 @@ function isDuplicateTransportTicket(ticketIdentifier, calendarId) {
  *      resolveTransportCalendarId's own JSDoc for the real live-crash class
  *      this avoids).
  *   2. Build `entries` (D-05: the SHARED
- *      `{ resource, summary, filenameDate, ticketIdentifier, uid }` shape)
- *      — this is the ONLY step that differs per mode:
+ *      `{ resource, summary, filenameDate, ticketIdentifier, uid, status, dtstamp }`
+ *      shape) — this is the ONLY step that differs per mode:
  *        - `mode: 'body'`: look up the registered body parser
  *          (TRANSPORT_BODY_PARSERS_BY_IDENTIFYING_EMAIL); a body-mode
  *          sender with NO registered parser throws a controlled Error
@@ -794,11 +1051,39 @@ function isDuplicateTransportTicket(ticketIdentifier, calendarId) {
  *      now happening here (before the dedup filter below) are reads/pure
  *      calls, not writes — this file's "ORDERING GUARANTEE" doc concerns
  *      Drive/Calendar WRITES specifically, and remains unaffected.
- *   3. Compute each entry's dedup key (`entry.ticketIdentifier`, already
- *      set by whichever builder ran in step 2) and drop the ones
- *      isDuplicateTransportTicket reports as already present — the EXISTING
- *      seenInBatch + isDuplicateTransportTicket filter, kept verbatim. If
- *      nothing remains, return immediately — no Drive upload, no write.
+ *   2.5. CANCELLATION (D-03/D-04/D-05 of quick-260813-dq2, D-11 staleness
+ *      guard added at Task 3): partition `entries` via
+ *      partitionTransportEntriesByCancellation into `{ toCancel, toCreate }`,
+ *      run cancelTransportTicketEvent over EVERY `toCancel` entry — with the
+ *      already-resolved `calendarId` AND, since Task 3, `entry.dtstamp` as
+ *      the third argument so a cancellation that has already been
+ *      superseded by a newer rebooking is detected and skipped (D-11) —
+ *      then let every step below operate on `toCreate` instead of `entries`.
+ *      This MUST sit here — AFTER entries is built, BEFORE the dedup filter
+ *      in step 3 — because a cancel entry's ticketIdentifier deliberately
+ *      matches the very event it is meant to delete; running the dedup
+ *      filter on it first would drop it as an "already exists" duplicate
+ *      and the cancellation would silently vanish. ACCEPTED ORDERING
+ *      CONSEQUENCE (known, not a bug): resolveTransportProcessingJobs emits
+ *      one job per MESSAGE, so a confirmation and its later cancellation
+ *      are two independent processTransportTicketJob calls in thread
+ *      order — if a single `.ics` ever carried both a REQUEST VEVENT and a
+ *      CANCEL VEVENT for the same ticket in ONE job's `entries`, the cancel
+ *      would run first (no-op, nothing exists yet) and the create would
+ *      then win. RegioJet does not send such a message; no ordering
+ *      machinery is added for a shape that does not occur.
+ *   3. Drop already-present `toCreate` entries via
+ *      filterTransportEntriesToCreate(toCreate, calendarId) — the EXISTING
+ *      seenInBatch + isDuplicateTransportTicket filter, extracted verbatim
+ *      at Task 3 with exactly one behavior change: isDuplicateTransportTicket
+ *      is now consulted ONLY for a `uid`-less entry (D-08) — a `uid`-bearing
+ *      reissue (same ticketIdentifier, same iCalUID as an existing event)
+ *      now reaches the write path instead of being silently skipped, since
+ *      `importIcsEventWithSequenceRetry`'s iCalUID keying already carries
+ *      that guarantee on its own. `seenInBatch` still applies to every
+ *      entry unchanged (D-08's deliberate scope limit — see
+ *      filterTransportEntriesToCreate's own JSDoc for the full rationale).
+ *      If nothing remains, return immediately — no Drive upload, no write.
  *   4. If `job.sender.insertPdfIntoEvent` is true: find the ticket PDF
  *      (findTransportTicketPdfAttachment, which excludes invoice.pdf; also
  *      matches the IDOS.cz ticket PDF despite its application/octet-stream
@@ -815,9 +1100,12 @@ function isDuplicateTransportTicket(ticketIdentifier, calendarId) {
  *      attachment must never block the calendar event itself. This block
  *      is EXISTING, kept verbatim, now reading off the shared entry shape
  *      instead of the raw parsed `.ics` event.
- *   5. For each remaining entry: add `resource.extendedProperties = {
- *      private: { ticketIdentifier } }` when the identifier is truthy, and,
- *      when an attachment exists, `resource.attachments = [{ fileId,
+ *   5. For each remaining entry: set `resource.extendedProperties.private`
+ *      to buildTransportEventPrivateProperties(entry)'s return value when it
+ *      is truthy (D-10, Task 3 — `{ ticketIdentifier }`, plus a `dtstamp` ISO
+ *      string when the entry carries a real one; `null` means no
+ *      `extendedProperties` object is written at all, unchanged from
+ *      before), and, when an attachment exists, `resource.attachments = [{ fileId,
  *      fileUrl, title, mimeType: 'application/pdf' }]` plus
  *      `optionalArgs.supportsAttachments = true` (the exact live-proven
  *      shape from createTicketCalendarEvent, src/07-action-ticketing-
@@ -851,7 +1139,11 @@ function isDuplicateTransportTicket(ticketIdentifier, calendarId) {
  * resolveTransportSenderMode, buildTransportBodyEntry,
  * buildTransportIcsEntry, extractTransportTicketIdentifier,
  * findTransportTicketPdfAttachment, buildTransportAttachmentFilename,
- * parseIcs, buildEventResource) IS fully unit-tested.
+ * parseIcs, buildEventResource, partitionTransportEntriesByCancellation,
+ * buildTransportEventPrivateProperties) IS fully unit-tested;
+ * cancelTransportTicketEvent and filterTransportEntriesToCreate are GAS-only
+ * (Calendar global) but proven under Node with a fake global.Calendar
+ * (D-04/D-05/D-08/D-11/D-12).
  */
 function processTransportTicketJob(job) {
   const calendarId = resolveTransportCalendarId(job.sender, CONFIG.calendarId);
@@ -874,27 +1166,22 @@ function processTransportTicketJob(job) {
     entries = events.map(buildTransportIcsEntry);
   }
 
-  // WR-01 fix (260803-us3 review): a UID-less write goes through the
-  // non-idempotent Calendar.Events.insert fallback (see the write loop
-  // below), so two same-batch entries sharing a ticketIdentifier would BOTH
-  // pass isDuplicateTransportTicket (neither exists in Calendar yet at
-  // check time) and both get inserted — a real duplicate. seenInBatch
-  // tracks identifiers already claimed earlier in this same pass so a
-  // repeat is dropped before it ever reaches isDuplicateTransportTicket's
-  // live-state check, independent of whether the entry carries a UID.
-  const seenInBatch = {};
-  const entriesToCreate = entries.filter(function (entry) {
-    if (entry.ticketIdentifier && seenInBatch[entry.ticketIdentifier]) {
-      return false;
-    }
-    if (isDuplicateTransportTicket(entry.ticketIdentifier, calendarId)) {
-      return false;
-    }
-    if (entry.ticketIdentifier) {
-      seenInBatch[entry.ticketIdentifier] = true;
-    }
-    return true;
+  // D-03/D-04/D-05 of quick-260813-dq2 (D-11 staleness guard added at
+  // Task 3): partition BEFORE the dedup filter below — a cancel entry's
+  // ticketIdentifier deliberately matches the very event it is meant to
+  // delete, so running dedup on it first would drop it as an "already
+  // exists" duplicate and the cancellation would silently vanish (see this
+  // function's own JSDoc, step 2.5).
+  const partitioned = partitionTransportEntriesByCancellation(entries);
+  partitioned.toCancel.forEach(function (entry) {
+    cancelTransportTicketEvent(entry.ticketIdentifier, calendarId, entry.dtstamp);
   });
+
+  // D-08 of quick-260813-dq2 Task 3: filterTransportEntriesToCreate is the
+  // EXISTING seenInBatch + isDuplicateTransportTicket filter (WR-01 of the
+  // 260803-us3 review), extracted verbatim with exactly one behavior
+  // change — see its own JSDoc for the full Problem A rationale.
+  const entriesToCreate = filterTransportEntriesToCreate(partitioned.toCreate, calendarId);
 
   if (entriesToCreate.length === 0) {
     return;
@@ -929,8 +1216,12 @@ function processTransportTicketJob(job) {
   entriesToCreate.forEach(function (entry) {
     const resource = entry.resource;
 
-    if (entry.ticketIdentifier) {
-      resource.extendedProperties = { private: { ticketIdentifier: entry.ticketIdentifier } };
+    // D-10 of quick-260813-dq2 Task 3: buildTransportEventPrivateProperties
+    // is the SINGLE writer of this tag -- isTransportCancellationStale is
+    // its only reader.
+    const privateProperties = buildTransportEventPrivateProperties(entry);
+    if (privateProperties) {
+      resource.extendedProperties = { private: privateProperties };
     }
 
     const optionalArgs = {};
@@ -1011,8 +1302,17 @@ const TRANSPORT_TICKETS_ACTION = {
 // buildTransportAttachmentFilename, resolveTransportProcessingJobs,
 // parseIdosTicketText, resolveTransportSenderMode, buildTransportBodyEntry,
 // buildTransportIcsEntry, formatTransportWallClockIso,
-// TRANSPORT_BODY_PARSERS_BY_IDENTIFYING_EMAIL — quick-260804-bs7) and
-// TRANSPORT_TICKETS_ACTION (action registry). getOrCreateTransportDriveFolder/
+// TRANSPORT_BODY_PARSERS_BY_IDENTIFYING_EMAIL — quick-260804-bs7,
+// partitionTransportEntriesByCancellation — quick-260813-dq2,
+// buildTransportEventPrivateProperties — quick-260813-dq2 Task 3, pure) and
+// TRANSPORT_TICKETS_ACTION (action registry). cancelTransportTicketEvent
+// (quick-260813-dq2), isTransportCancellationStale and
+// filterTransportEntriesToCreate (both quick-260813-dq2 Task 3) touch the
+// Calendar global and are GAS-only in that sense, but ARE exported anyway
+// specifically so the D-04 race regression, the D-05 no-op, the D-08 Problem
+// A regression and the D-11/D-12 stale-cancellation/ordering scenarios can
+// all be proven under Node with a fake global.Calendar, rather than deferred
+// entirely to a live round. getOrCreateTransportDriveFolder/
 // findTransportEventByIdentifier/isDuplicateTransportTicket/
 // processTransportTicketJob remain genuinely GAS-only (reference
 // DriveApp/CalendarApp/Calendar globals directly) and are NOT exported —
@@ -1034,6 +1334,11 @@ if (typeof module !== 'undefined' && module.exports) {
     buildTransportIcsEntry: buildTransportIcsEntry,
     stripTransportSummaryIdentifierPrefix: stripTransportSummaryIdentifierPrefix,
     formatTransportWallClockIso: formatTransportWallClockIso,
+    partitionTransportEntriesByCancellation: partitionTransportEntriesByCancellation,
+    cancelTransportTicketEvent: cancelTransportTicketEvent,
+    buildTransportEventPrivateProperties: buildTransportEventPrivateProperties,
+    isTransportCancellationStale: isTransportCancellationStale,
+    filterTransportEntriesToCreate: filterTransportEntriesToCreate,
     TRANSPORT_BODY_PARSERS_BY_IDENTIFYING_EMAIL: TRANSPORT_BODY_PARSERS_BY_IDENTIFYING_EMAIL,
     TRANSPORT_TICKETS_ACTION: TRANSPORT_TICKETS_ACTION,
   };

@@ -584,7 +584,7 @@ function collapseBlankLines(text) {
 /**
  * Parses one VEVENT block's raw property lines into a normalized event
  * object: { summary, start, end, isAllDay, description, location,
- * recurrence, sequence, uid }. recurrence is null for non-recurring events,
+ * recurrence, sequence, uid, status, dtstamp }. recurrence is null for non-recurring events,
  * or a normalized descriptor (see parseRRule) when RRULE is present.
  * `vtimezones` (see extractVtimezoneBlocks) is threaded through to resolve
  * any TZID-qualified DTSTART/DTEND against the .ics's own embedded timezone
@@ -608,6 +608,34 @@ function collapseBlankLines(text) {
  * sequence value...`) — the exact same family of "our own import
  * collides with Google's native detection" issue as the original iCalUID
  * dedup fix, surfacing through a different field.
+ *
+ * STATUS (RFC 5545 section 3.8.1.11, RegioJet cancellation detection, D-01/
+ * D-02 of quick-260813-dq2): `status` is the VEVENT's own STATUS property
+ * value, trimmed and uppercased, or `null` when the property is absent OR
+ * when the trimmed value is empty (so no caller ever has to distinguish an
+ * empty value from an absent property). This exists so TRANSPORT_TICKETS_ACTION
+ * can detect a RegioJet cancellation purely from `event.status === 'CANCELLED'`
+ * — a fixed, language-independent RFC 5545 token, deliberately never from
+ * email subject/body text (which vary per RegioJet locale). This field is
+ * parser-level only and purely additive: `buildEventResource` deliberately
+ * does NOT copy it onto the Calendar API resource, so every other caller
+ * (ICS_CALENDAR_ACTION included) is bit-for-bit unchanged.
+ *
+ * DTSTAMP (RFC 5545 section 3.8.7.2, RegioJet cancel/rebook staleness
+ * detection, D-09/D-10/D-11 of quick-260813-dq2 Task 3): `dtstamp` is the
+ * VEVENT's own DTSTAMP property, parsed through the EXISTING parseIcsDate
+ * helper (RFC 5545 DTSTAMP is always UTC Z-suffixed, so no TZID is ever
+ * passed) into a real Date when present, or `null` when the property is
+ * absent OR when parseIcsDate throws on an unrecognized value. A malformed
+ * DTSTAMP must never propagate a throw out of this function — exactly the
+ * same "optional scheduling metadata must not crash an otherwise-valid
+ * import" discipline the SEQUENCE fallback above already documents. This
+ * field exists so TRANSPORT_TICKETS_ACTION can detect a stale cancellation
+ * (one superseded by a later rebooking): RegioJet RESETS SEQUENCE across a
+ * cancel+rebook pair, but DTSTAMP — real send time — stays monotonic.
+ * Parser-level only and purely additive, same D-01 firewall as `status`:
+ * `buildEventResource` deliberately does NOT copy this field onto the
+ * Calendar API resource either.
  *
  * ENRICHMENT (TR-2..TR-5): ORGANIZER (single-valued per RFC 5545) is read
  * via the last-wins `props` map; ATTENDEE (multi-valued) is collected in a
@@ -679,6 +707,25 @@ function parseVeventBlock(propertyLines, vtimezones) {
   const parsedSequence = props.SEQUENCE ? parseInt(props.SEQUENCE.value, 10) : 0;
   const sequence = Number.isNaN(parsedSequence) ? 0 : parsedSequence;
 
+  // STATUS: absent, or empty after trimming -> null; otherwise trimmed and
+  // uppercased so every downstream consumer compares against a single
+  // normalized token (see this function's class-level "STATUS" doc
+  // paragraph above).
+  const trimmedStatus = props.STATUS ? String(props.STATUS.value).trim() : '';
+  const status = trimmedStatus ? trimmedStatus.toUpperCase() : null;
+
+  // DTSTAMP: absent -> null; malformed/unrecognized -> also null, never
+  // throw — see this function's class-level "DTSTAMP" doc paragraph above.
+  // RFC 5545 DTSTAMP is always UTC Z-suffixed, so no TZID is passed.
+  let dtstamp = null;
+  if (props.DTSTAMP) {
+    try {
+      dtstamp = parseIcsDate(props.DTSTAMP.value, undefined, vtimezones).date;
+    } catch (e) {
+      dtstamp = null;
+    }
+  }
+
   return {
     summary: props.SUMMARY ? unescapeText(props.SUMMARY.value) : '',
     start: startInfo.date,
@@ -692,6 +739,8 @@ function parseVeventBlock(propertyLines, vtimezones) {
     // through unescapeText) — it becomes the Advanced Calendar API resource's
     // iCalUID, the key Google Calendar's own dedup logic matches against.
     uid: props.UID ? props.UID.value : null,
+    status: status,
+    dtstamp: dtstamp,
   };
 }
 
