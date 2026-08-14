@@ -4,8 +4,9 @@
  * ICS_CALENDAR_ACTION (src/05-action-ics-import.js),
  * BOOKING_MANAGEMENT_ACTION (src/06-action-booking-com-management.js),
  * TICKETING_PORTALS_ACTION (src/07-action-ticketing-portals.js, v0.6.0
- * quick-260731-tix), and TRANSPORT_TICKETS_ACTION
- * (src/08-action-transport-tickets.js, quick-260803-us3).
+ * quick-260731-tix), TRANSPORT_TICKETS_ACTION
+ * (src/08-action-transport-tickets.js, quick-260803-us3), and
+ * MOJEMENICKA_ACTION (src/09-action-mojemenicka.js, Phase 4 04-01).
  *
  * Built inside the function body (not as a top-level const) so cross-file
  * references resolve at call time, after every file's top-level code has
@@ -16,7 +17,7 @@
  * array returned here. No other change to the dispatch logic is needed.
  */
 function getRegisteredActions() {
-  return [ICS_CALENDAR_ACTION, BOOKING_MANAGEMENT_ACTION, TICKETING_PORTALS_ACTION, TRANSPORT_TICKETS_ACTION];
+  return [ICS_CALENDAR_ACTION, BOOKING_MANAGEMENT_ACTION, TICKETING_PORTALS_ACTION, TRANSPORT_TICKETS_ACTION, MOJEMENICKA_ACTION];
 }
 
 /**

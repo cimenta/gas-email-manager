@@ -138,28 +138,29 @@ test('buildRebuiltPropertiesMap: every registry entry ALWAYS gets a key in the b
   assert.ok(Object.prototype.hasOwnProperty.call(map, 'K_SET'));
 });
 
-test('buildRebuiltPropertiesMap: the real SETTINGS_REGISTRY, with no live overrides, always yields all 28 rows — empty-default fields get the sentinel, non-empty ones their real value', () => {
+test('buildRebuiltPropertiesMap: the real SETTINGS_REGISTRY, with no live overrides, always yields all 34 rows — empty-default fields get the sentinel, non-empty ones their real value', () => {
   // SETTINGS_REGISTRY's read() closures for the ICS/booking/ticketing/
-  // transport-tickets entries reference ICS_ACTION_CONFIG/
+  // transport-tickets/mojemenicka entries reference ICS_ACTION_CONFIG/
   // BOOKING_ACTION_CONFIG/TICKETING_PORTALS_ACTION_CONFIG/
-  // TRANSPORT_TICKETS_ACTION_CONFIG by bare name from within
-  // src/01-setup.js's own module scope. Under GAS's shared global scope
-  // this resolves for free (all four objects are genuinely global);
-  // under Node's per-file module isolation, this test supplies them
-  // itself via the exact same globalThis-bridge technique the sibling
-  // config files already use in the OTHER direction (pulling get*Setting
-  // FROM 01-setup.js) — see src/05-action-cfg-ics-import.js's own bridge
-  // for the precedent. This is a TEST-ONLY bridge (not added to
-  // src/01-setup.js itself, to avoid a circular require: 01-setup.js is
-  // what those files themselves require to reach get*Setting).
+  // TRANSPORT_TICKETS_ACTION_CONFIG/MOJEMENICKA_ACTION_CONFIG by bare name
+  // from within src/01-setup.js's own module scope. Under GAS's shared
+  // global scope this resolves for free (all five objects are genuinely
+  // global); under Node's per-file module isolation, this test supplies
+  // them itself via the exact same globalThis-bridge technique the
+  // sibling config files already use in the OTHER direction (pulling
+  // get*Setting FROM 01-setup.js) — see src/05-action-cfg-ics-import.js's
+  // own bridge for the precedent. This is a TEST-ONLY bridge (not added
+  // to src/01-setup.js itself, to avoid a circular require: 01-setup.js
+  // is what those files themselves require to reach get*Setting).
   global.ICS_ACTION_CONFIG = require('../src/05-action-cfg-ics-import.js').ICS_ACTION_CONFIG;
   global.BOOKING_ACTION_CONFIG = require('../src/06-action-cfg-booking-com-management.js').BOOKING_ACTION_CONFIG;
   global.TICKETING_PORTALS_ACTION_CONFIG = require('../src/07-action-cfg-ticketing-portals.js').TICKETING_PORTALS_ACTION_CONFIG;
   global.TRANSPORT_TICKETS_ACTION_CONFIG = require('../src/08-action-cfg-transport-tickets.js').TRANSPORT_TICKETS_ACTION_CONFIG;
+  global.MOJEMENICKA_ACTION_CONFIG = require('../src/09-action-cfg-mojemenicka.js').MOJEMENICKA_ACTION_CONFIG;
 
   try {
     const map = buildRebuiltPropertiesMap(SETTINGS_REGISTRY);
-    assert.equal(Object.keys(map).length, 28);
+    assert.equal(Object.keys(map).length, 34);
 
     // Optional-override fields whose code default is null/[] -> sentinel.
     assert.equal(map['05-action-ics-CALENDAR_ID'], SETTING_DEFAULT_SENTINEL);
@@ -195,16 +196,28 @@ test('buildRebuiltPropertiesMap: the real SETTINGS_REGISTRY, with no live overri
       map['08-action-transport-tickets-TRANSPORT_SENDERS'],
       '[{"identifyingEmail":"jizdenky@regiojet.cz","calendarId":null,"insertPdfIntoEvent":false,"mode":"ics"},{"identifyingEmail":"jizdenky@idos.svt.cz","calendarId":null,"insertPdfIntoEvent":false,"mode":"body"}]'
     );
+
+    // Phase 4 (04-02, amended 04-04): MOJEMENICKA_ACTION_CONFIG's 4
+    // optional fields (fail-closed code defaults null/[]/[]/[]) -> sentinel;
+    // its 2 boolean toggles (code default true/true) -> their real value.
+    assert.equal(map['09-action-mojemenicka-MENU_URL'], SETTING_DEFAULT_SENTINEL);
+    assert.equal(map['09-action-mojemenicka-ALLOWED_SENDERS'], SETTING_DEFAULT_SENTINEL);
+    assert.equal(map['09-action-mojemenicka-TRIGGER_STRINGS'], SETTING_DEFAULT_SENTINEL);
+    assert.equal(map['09-action-mojemenicka-WEEKLY_TRIGGER_STRINGS'], SETTING_DEFAULT_SENTINEL);
+    assert.equal(map['09-action-mojemenicka-ENABLED'], 'true');
+    assert.equal(map['09-action-mojemenicka-NOTIFY_ON_FAILURE'], 'true');
   } finally {
     delete global.ICS_ACTION_CONFIG;
     delete global.BOOKING_ACTION_CONFIG;
     delete global.TICKETING_PORTALS_ACTION_CONFIG;
     delete global.TRANSPORT_TICKETS_ACTION_CONFIG;
+    delete global.MOJEMENICKA_ACTION_CONFIG;
   }
 });
 const { ICS_ACTION_CONFIG } = require('../src/05-action-cfg-ics-import.js');
 const { BOOKING_ACTION_CONFIG } = require('../src/06-action-cfg-booking-com-management.js');
 const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
+const { MOJEMENICKA_ACTION_CONFIG } = require('../src/09-action-cfg-mojemenicka.js');
 
 // --- parseBooleanSettingValue ------------------------------------------------
 
@@ -517,6 +530,16 @@ test('CRITICAL: with PropertiesService absent (Node), every TICKETING_PORTALS_AC
   ]);
 });
 
+test('CRITICAL: with PropertiesService absent (Node), every MOJEMENICKA_ACTION_CONFIG field matches its exact fail-closed default (phase 4, 04-01, amended 04-04)', () => {
+  assert.equal(typeof PropertiesService, 'undefined');
+  assert.equal(MOJEMENICKA_ACTION_CONFIG.enabled, true);
+  assert.equal(MOJEMENICKA_ACTION_CONFIG.notifyOnFailure, true);
+  assert.equal(MOJEMENICKA_ACTION_CONFIG.menuUrl, null);
+  assert.deepEqual(MOJEMENICKA_ACTION_CONFIG.allowedSenders, []);
+  assert.deepEqual(MOJEMENICKA_ACTION_CONFIG.triggerStrings, []);
+  assert.deepEqual(MOJEMENICKA_ACTION_CONFIG.weeklyTriggerStrings, []);
+});
+
 // --- SETTINGS_REGISTRY completeness (a completeness guard, same spirit as ---
 // --- the language-pack completeness test) -----------------------------------
 
@@ -549,10 +572,16 @@ const EXPECTED_SETTINGS_REGISTRY = [
   { key: '08-action-transport-tickets-ENABLED', type: 'boolean' },
   { key: '08-action-transport-tickets-NOTIFY_ON_FAILURE', type: 'boolean' },
   { key: '08-action-transport-tickets-TRANSPORT_SENDERS', type: 'json' },
+  { key: '09-action-mojemenicka-ENABLED', type: 'boolean' },
+  { key: '09-action-mojemenicka-NOTIFY_ON_FAILURE', type: 'boolean' },
+  { key: '09-action-mojemenicka-MENU_URL', type: 'string' },
+  { key: '09-action-mojemenicka-ALLOWED_SENDERS', type: 'list' },
+  { key: '09-action-mojemenicka-TRIGGER_STRINGS', type: 'list' },
+  { key: '09-action-mojemenicka-WEEKLY_TRIGGER_STRINGS', type: 'list' },
 ];
 
-test('SETTINGS_REGISTRY: exactly the 28 approved keys (24 prior + 4 new for quick-260803-us3), in the exact approved names and types, no more no fewer', () => {
-  assert.equal(SETTINGS_REGISTRY.length, 28);
+test('SETTINGS_REGISTRY: exactly the 34 approved keys (33 prior + 1 new for phase 4 amendment weekly range setting), in the exact approved names and types, no more no fewer', () => {
+  assert.equal(SETTINGS_REGISTRY.length, 34);
   const actual = SETTINGS_REGISTRY.map(function (entry) {
     return { key: entry.key, type: entry.type };
   });
