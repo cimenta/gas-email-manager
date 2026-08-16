@@ -623,6 +623,300 @@ function parseKinoArtTicketText(text) {
   };
 }
 
+// TICKETMASTER_CZ_MONTH_NAMES (quick-260816-ocw, D-04/D-07): a local
+// month-name-to-number lookup table, keyed by lowercased full English month
+// name, mapping to the ZERO-INDEXED month number (matching every other
+// date-components object in this file). Ticketmaster CZ confirmation
+// emails render the date with the full English month NAME (e.g.
+// "Sunday 15 November 2026 at 20:00") rather than a numeric month like
+// enigoo.cz's `DD.MM.YYYY` or Kino Art's `D. M. YYYY` — a grep across this
+// codebase confirmed no month-name-to-number helper exists anywhere else,
+// so this portal is the first to need one. Namespaced to this portal
+// (never a bare `MONTH_NAMES`) per this file's globally-unique-naming
+// convention (see the class-level "GLOBALLY-UNIQUE NAMING WARNING" doc) —
+// Apps Script's shared global scope has already been bitten by a real
+// cross-file collision once (see the booking.com action's own JSDoc for
+// that incident).
+const TICKETMASTER_CZ_MONTH_NAMES = {
+  january: 0,
+  february: 1,
+  march: 2,
+  april: 3,
+  may: 4,
+  june: 5,
+  july: 6,
+  august: 7,
+  september: 8,
+  october: 9,
+  november: 10,
+  december: 11,
+};
+
+/**
+ * parseTicketmasterCzTicketText — the noreply@ticketmaster.cz-specific
+ * ticket-BODY parser (quick-260816-ocw). UNLIKE parseEnigooTicketText, and
+ * LIKE parseKinoArtTicketText, this parses the email BODY
+ * (`message.getPlainBody()`), never a PDF — no Drive upload, no OCR is
+ * performed here; the parsing itself never touches the real email's
+ * eTicket.pdf attachment (D-01).
+ *
+ * ROUND 2 AMENDMENT (D-01 revised): the owner asked for the real eTicket.pdf
+ * to be attached to the created calendar event. This portal IS now
+ * registered in TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL (via
+ * findTicketmasterCzTicketPdfAttachment, below) — the SAME optional
+ * find-the-PDF-and-attach-it-as-is mechanism Kino Art already proved, which
+ * is NOT the OCR/PDF-TEXT pipeline (TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL
+ * stays untouched — this portal still has no OCR path of any kind). With
+ * `insertPdfIntoEvent` true for this portal, processTicketFromMessageBody
+ * moves the real eTicket.pdf straight into the permanent
+ * CONFIG.ticketAttachmentDriveFolderName folder and attaches it — no temp
+ * folder, no Drive-to-Docs conversion, exactly Kino Art's own established
+ * flow.
+ *
+ * Example fixture (the real observed plain-text body shape, decoded from
+ * quoted-printable — identifying details replaced with fictional
+ * equivalents, per this file's established fixture convention; blank
+ * separator lines are NON-BREAKING-SPACE-ONLY in the real source, not
+ * truly empty):
+ *
+ *   YOUR ORDER DETAILS
+ *   <NBSP-only line>
+ *   Léto v podzámčí – Koncertní večer
+ *   <NBSP-only line>
+ *   Sál Radost
+ *   <NBSP-only line>
+ *   Sunday 15 November 2026 at 20:00
+ *   <NBSP-only line>
+ *   Ticket Quantity: 2
+ *
+ * DIFFERENT SEPARATOR MODEL FROM parseKinoArtTicketText (D-03): Kino Art's
+ * parser assumes a single contiguous flattened line (Gmail's plain-text
+ * rendering of an HTML table collapses everything to one line). This real
+ * source does NOT collapse that way — each field sits on its OWN
+ * paragraph, separated by blank-or-NBSP-only lines. Rather than depend on
+ * a fixed line index (fragile, and this file's established "pattern-
+ * anchored, not line-position" philosophy — see parseEnigooTicketText's
+ * own class-level doc for the incident that established this discipline),
+ * extraction anchors on two LITERAL markers actually present in the real
+ * body:
+ *   1. `YOUR ORDER DETAILS` — marks the start of the order-details
+ *      region. Missing -> controlled throw.
+ *   2. `Ticket Quantity:` — marks the end of the order-details region.
+ *      Missing, or found at/before the first marker -> controlled throw.
+ *   3. DATE/TIME (within the region only): day digits, whitespace, an
+ *      alphabetic month NAME, whitespace, 4-digit year, whitespace, the
+ *      literal word `at`, whitespace, `HH:MM` — anchored on the day
+ *      digits, which naturally skips the leading full weekday name
+ *      ("Sunday") with no need to parse it. No match -> controlled throw.
+ *      The matched month name is resolved through
+ *      TICKETMASTER_CZ_MONTH_NAMES case-insensitively; an unrecognized
+ *      name -> controlled throw naming the bad value (D-04). This format
+ *      is genuinely different from both enigoo.cz's and Kino Art's own
+ *      numeric-month formats, hence its own regex and lookup table.
+ *   4. EVENT NAME / VENUE: the region strictly BEFORE the date/time
+ *      match, split on line breaks, each piece trimmed, empty pieces
+ *      dropped. The FIRST surviving piece is the event name, the LAST is
+ *      the venue. Fewer than two surviving pieces (event name and venue
+ *      not separable) -> controlled throw.
+ *
+ * `Ticket Quantity: N` (D-06) is read as the region-terminating marker AND
+ * (ROUND 2 AMENDMENT) as a captured `ticketQuantity` number for the
+ * description below — but it is NEVER an event multiplier, this action's
+ * established ONE-EVENT-PER-PURCHASE design still holds unchanged (see this
+ * file's class-level JSDoc): quantities of 1, 2 or 5 all yield the exact
+ * same eventName/location/date-time/ticketIdentifier, only ticketQuantity
+ * and description differ. The digits immediately following the marker are
+ * captured via a small, non-throwing regex; a non-numeric or missing value
+ * (a variant never observed, but not something that should ever block
+ * calendar-event creation over a field this file already treats as
+ * boundary-marker-only) leaves `ticketQuantity` `null` and simply omits its
+ * line from `description` below.
+ *
+ * `description` (ROUND 2, NEW): every ticketing-portal parser in this file
+ * was previously silent on description — `createTicketCalendarEvent` never
+ * set one for ANY portal. This parser is the first to populate it,
+ * reproducing the real order-details block back to the owner as
+ * `eventName + '\n\n' + location + '\n\n' + <the real weekday-prefixed
+ * date/time line, e.g. "Sunday 15 November 2026 at 20:00"> [+ '\n\n' +
+ * 'Ticket Quantity: N' when ticketQuantity is not null]`. The date/time
+ * line reused here is the ACTUAL regionLines entry the date/time pattern
+ * matched against (captured further down as `dateTimeText`), not a
+ * reconstruction from the parsed numeric components — this deliberately
+ * keeps the owner-facing weekday name ("Sunday") intact, even though the
+ * parser itself never validates that weekday against the parsed calendar
+ * date.
+ *
+ * `ticketIdentifier` is ALWAYS `null` for this portal (D-05): no stable
+ * per-ticket or per-order confirmation number exists anywhere in the real
+ * observed body (checked directly, not assumed) — no substitute is
+ * invented (no hash of the event name/date, no synthesized key), on the
+ * same never-throwing terms this file's other two parsers already
+ * document for their own OPTIONAL ticketIdentifier anchor. Consequence,
+ * accepted and documented as a v1 limitation: the DEDUP SAFETY NET
+ * (isDuplicateTicketPurchase / findTicketEventByIdentifier) cannot protect
+ * this portal against reprocessing duplicates — a falsy ticketIdentifier
+ * already makes isDuplicateTicketPurchase return `false` unconditionally.
+ *
+ * No speculative leading-bullet strip is applied here, unlike
+ * parseKinoArtTicketText's own `* ` marker strip: that marker came from
+ * Gmail rendering an HTML LIST to plain text, a different rendering path
+ * than this email's real text/plain part (inspected directly, not
+ * guessed). Per this file's established "don't guess at an unobserved
+ * variant" discipline, any such marker for THIS portal would be handled
+ * THEN, with real data, not speculatively now.
+ *
+ * Returns the same `{ eventName, location, year, month, day, hour, minute,
+ * ticketIdentifier }` shape as the other two parsers (month zero-indexed)
+ * PLUS two fields unique to this parser so far: `ticketQuantity`
+ * (number|null) and `description` (string, see above). Adding these two
+ * fields is backward-compatible for enigoo.cz and Kino Art:
+ * createTicketCalendarEvent only reads `parsedTicket.description` when
+ * truthy, so their own parsed-ticket objects (which never set it) leave the
+ * created event's description untouched, exactly as before round 2.
+ * Every controlled throw ends with the FULL raw `text` argument
+ * (untruncated), same diagnostic-on-failure convention as
+ * parseEnigooTicketText and parseKinoArtTicketText — the owner's failure-
+ * notification email becomes the next diagnostic artifact. Pure, no GAS
+ * globals.
+ */
+function parseTicketmasterCzTicketText(text) {
+  const rawText = String(text || '');
+  // U+00A0 (non-breaking space) -> a regular space, since the real
+  // source's separator lines are NBSP-only -- only the NORMALIZED working
+  // copy is used for extraction; every thrown message below still reports
+  // the ORIGINAL rawText.
+  const normalizedText = rawText.replace(/\u00A0/g, ' ');
+
+  const orderDetailsMarker = 'YOUR ORDER DETAILS';
+  const orderDetailsIndex = normalizedText.indexOf(orderDetailsMarker);
+  if (orderDetailsIndex === -1) {
+    throw new Error(
+      'Unrecognized Ticketmaster CZ ticket text: "YOUR ORDER DETAILS" marker not found. Full extracted text:\n' + rawText
+    );
+  }
+
+  const ticketQuantityMarker = 'Ticket Quantity:';
+  const ticketQuantityIndex = normalizedText.indexOf(ticketQuantityMarker, orderDetailsIndex + orderDetailsMarker.length);
+  if (ticketQuantityIndex === -1) {
+    throw new Error(
+      'Unrecognized Ticketmaster CZ ticket text: "Ticket Quantity:" marker not found. Full extracted text:\n' + rawText
+    );
+  }
+
+  // ticketQuantity (ROUND 2, NEW): the digits immediately following the
+  // "Ticket Quantity:" marker -- OUTSIDE `region` (which stops right before
+  // this marker), so read directly from `normalizedText`. Never throws: a
+  // missing or non-numeric value (a variant never observed in the real
+  // email, but this marker's PRIMARY job is still just bounding `region`)
+  // leaves `ticketQuantity` `null` rather than blocking calendar-event
+  // creation over a field this file already treats as boundary-marker-only
+  // (D-06).
+  const ticketQuantityMatch = /^\s*(\d+)/.exec(normalizedText.slice(ticketQuantityIndex + ticketQuantityMarker.length));
+  const ticketQuantity = ticketQuantityMatch ? Number(ticketQuantityMatch[1]) : null;
+
+  const region = normalizedText.slice(orderDetailsIndex + orderDetailsMarker.length, ticketQuantityIndex);
+
+  // Each field sits on its OWN paragraph in the region, separated by
+  // blank/NBSP-only lines (already normalized to plain spaces above) --
+  // split into lines up front, trim each, and drop the empty ones. This
+  // is what both the date/time search below AND the event-name/venue
+  // extraction operate on, so the WEEKDAY-PREFIXED date/time line (e.g.
+  // "Sunday 15 November 2026 at 20:00") is always treated as ONE whole
+  // paragraph, never partially sliced mid-line.
+  const regionLines = region
+    .split(/\r\n|\r|\n/)
+    .map(function (line) {
+      return line.trim();
+    })
+    .filter(function (line) {
+      return line.length > 0;
+    });
+
+  // Date/time anchor: day digits, alphabetic month NAME, 4-digit year, the
+  // literal word "at", HH:MM -- anchored on the day digits, so the leading
+  // full weekday name ("Sunday") is naturally skipped without needing to
+  // be matched at all.
+  const dateTimePattern = /(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s+at\s+(\d{1,2}):(\d{2})/;
+  const dateTimeMatch = dateTimePattern.exec(region);
+  if (!dateTimeMatch) {
+    throw new Error('Unrecognized Ticketmaster CZ ticket text: no date/time pattern found. Full extracted text:\n' + rawText);
+  }
+
+  const day = Number(dateTimeMatch[1]);
+  const monthName = dateTimeMatch[2].toLowerCase();
+  const year = Number(dateTimeMatch[3]);
+  const hour = Number(dateTimeMatch[4]);
+  const minute = Number(dateTimeMatch[5]);
+
+  if (!Object.prototype.hasOwnProperty.call(TICKETMASTER_CZ_MONTH_NAMES, monthName)) {
+    throw new Error(
+      'Unrecognized Ticketmaster CZ ticket text: unrecognized month name "' + dateTimeMatch[2] + '". Full extracted text:\n' + rawText
+    );
+  }
+  const month = TICKETMASTER_CZ_MONTH_NAMES[monthName];
+
+  if (hour < 0 || hour > 23) {
+    throw new Error('Hour out of range (0-23) in Ticketmaster CZ ticket date/time match. Full extracted text:\n' + rawText);
+  }
+  if (minute < 0 || minute > 59) {
+    throw new Error('Minute out of range (0-59) in Ticketmaster CZ ticket date/time match. Full extracted text:\n' + rawText);
+  }
+
+  // The date/time-bearing PARAGRAPH (identified as the first regionLines
+  // entry containing the exact matched date/time substring) marks the end
+  // of the event-name/venue candidates -- everything from that paragraph
+  // onward (the weekday-prefixed date/time line itself, plus anything
+  // after it) is excluded, never treated as a partial trailing fragment.
+  const dateTimeLineIndex = regionLines.findIndex(function (line) {
+    return line.indexOf(dateTimeMatch[0]) !== -1;
+  });
+  const candidateLines = dateTimeLineIndex === -1 ? regionLines : regionLines.slice(0, dateTimeLineIndex);
+
+  if (candidateLines.length < 2) {
+    throw new Error(
+      'Unrecognized Ticketmaster CZ ticket text: could not separate the event name and venue in the order-details region. Full extracted text:\n' +
+        rawText
+    );
+  }
+
+  const eventName = candidateLines[0];
+  const location = candidateLines[candidateLines.length - 1];
+
+  // dateTimeText (ROUND 2, NEW): the ACTUAL regionLines entry the date/time
+  // pattern matched against -- preserves the real weekday-prefixed line
+  // (e.g. "Sunday 15 November 2026 at 20:00") for `description` below,
+  // rather than reconstructing it from the parsed numeric components (which
+  // would lose the weekday name entirely, since it is never itself parsed
+  // or validated). dateTimeLineIndex was already resolved above and is
+  // always found here -- dateTimeMatch already succeeded against `region`,
+  // and every regionLines entry is a trimmed line drawn from that same
+  // `region` string, so the matched substring always falls within exactly
+  // one of them.
+  const dateTimeText = dateTimeLineIndex === -1 ? dateTimeMatch[0] : regionLines[dateTimeLineIndex];
+
+  // description (ROUND 2, NEW — see this function's class-level JSDoc):
+  // reproduces the real order-details block back to the owner. The
+  // "Ticket Quantity: N" line is included only when ticketQuantity was
+  // actually captured above.
+  const descriptionLines = [eventName, location, dateTimeText];
+  if (ticketQuantity !== null) {
+    descriptionLines.push('Ticket Quantity: ' + ticketQuantity);
+  }
+
+  return {
+    eventName: eventName,
+    location: location,
+    year: year,
+    month: month,
+    day: day,
+    hour: hour,
+    minute: minute,
+    ticketIdentifier: null,
+    ticketQuantity: ticketQuantity,
+    description: descriptionLines.join('\n\n'),
+  };
+}
+
 /**
  * TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL — the local (single-file)
  * registry mapping a BODY-SOURCED ticketing portal's `identifyingEmail`
@@ -635,6 +929,7 @@ function parseKinoArtTicketText(text) {
  */
 const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
   'rezervace@kinoart.cz': parseKinoArtTicketText,
+  'noreply@ticketmaster.cz': parseTicketmasterCzTicketText,
 };
 
 /**
@@ -887,6 +1182,35 @@ function findKinoArtTicketPdfAttachment(message) {
 }
 
 /**
+ * findTicketmasterCzTicketPdfAttachment — Ticketmaster CZ's own
+ * ticket-PDF finder for the OPTIONAL `insertPdfIntoEvent` attachment path
+ * (round 2, quick-260816-ocw — see parseTicketmasterCzTicketText's own
+ * class-level "ROUND 2 AMENDMENT" doc). The real observed email carries
+ * exactly one PDF attachment, filename `eTicket.pdf`
+ * (Content-Disposition: attachment, application/pdf). Returns the FIRST
+ * qualifying PDF attachment (via findTicketPdfAttachments) whose name
+ * contains `"eTicket"`, or `null` if none match — same "match by the
+ * literal filename substring actually observed" discipline as
+ * findKinoArtTicketPdfAttachment above. SCOPE LIMITATION (deliberate, same
+ * "don't guess at an unobserved variant" discipline as that function): a
+ * hypothetical future Ticketmaster CZ confirmation with a differently-named
+ * attachment would need handling THEN, with real data, not guessed now.
+ * Pure, no GAS globals.
+ */
+function findTicketmasterCzTicketPdfAttachment(message) {
+  const pdfAttachments = findTicketPdfAttachments(message);
+
+  for (let i = 0; i < pdfAttachments.length; i++) {
+    const name = pdfAttachments[i].getName() || '';
+    if (name.indexOf('eTicket') !== -1) {
+      return pdfAttachments[i];
+    }
+  }
+
+  return null;
+}
+
+/**
  * TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL — the local
  * (single-file) registry mapping a BODY-SOURCED ticketing portal's
  * `identifyingEmail` to its own ticket-PDF-finder function
@@ -899,6 +1223,7 @@ function findKinoArtTicketPdfAttachment(message) {
  */
 const TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL = {
   'rezervace@kinoart.cz': findKinoArtTicketPdfAttachment,
+  'noreply@ticketmaster.cz': findTicketmasterCzTicketPdfAttachment,
 };
 
 /**
@@ -1078,6 +1403,16 @@ function createTicketCalendarEvent(parsedTicket, calendarId, attachmentInfo) {
     start: { dateTime: formatWallClockComponentsIso(startComponents), timeZone: timeZone },
     end: { dateTime: formatWallClockComponentsIso(endComponents), timeZone: timeZone },
   };
+
+  // description (ROUND 2, quick-260816-ocw): OPTIONAL, backward-compatible.
+  // Only Ticketmaster CZ's parser sets `parsedTicket.description` so far —
+  // enigoo.cz's and Kino Art's own parsed-ticket objects never carry this
+  // field, so `parsedTicket.description` is `undefined` (falsy) for them
+  // and this line is a no-op, leaving their created events' description
+  // exactly as before round 2.
+  if (parsedTicket.description) {
+    resource.description = parsedTicket.description;
+  }
 
   if (parsedTicket.ticketIdentifier) {
     resource.extendedProperties = { private: { ticketIdentifier: parsedTicket.ticketIdentifier } };
@@ -1465,7 +1800,15 @@ const TICKETING_PORTALS_ACTION = {
 // getOrCreateDriveFolderByName/processTicketPdfAttachment/
 // findTicketEventByIdentifier remain genuinely GAS-only (reference
 // DriveApp/Drive/DocumentApp/CalendarApp/Calendar globals directly) and
-// are NOT exported — they are never invoked under Node.
+// are NOT exported — they are never invoked under Node. Also exports
+// parseTicketmasterCzTicketText (quick-260816-ocw, the third supported
+// portal, pure, no GAS globals) and
+// TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL (quick-260816-ocw):
+// despite living alongside the GAS-only Drive pipeline, the registry object
+// itself references no GAS global -- it is exported so a test can prove the
+// ABSENCE of a noreply@ticketmaster.cz key in it (D-01), the same
+// absence-proving coverage pattern already used for
+// TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL above.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     ticketingExtractEmailAddress: ticketingExtractEmailAddress,
@@ -1473,8 +1816,10 @@ if (typeof module !== 'undefined' && module.exports) {
     resolveTicketingCalendarId: resolveTicketingCalendarId,
     parseEnigooTicketText: parseEnigooTicketText,
     parseKinoArtTicketText: parseKinoArtTicketText,
+    parseTicketmasterCzTicketText: parseTicketmasterCzTicketText,
     TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL: TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL,
     TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL: TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL,
+    TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL: TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL,
     DEFAULT_EVENT_DURATION_MINUTES: DEFAULT_EVENT_DURATION_MINUTES,
     addMinutesToWallClockComponents: addMinutesToWallClockComponents,
     formatWallClockComponentsIso: formatWallClockComponentsIso,
@@ -1483,6 +1828,7 @@ if (typeof module !== 'undefined' && module.exports) {
     isTicketPdfAttachment: isTicketPdfAttachment,
     findTicketPdfAttachments: findTicketPdfAttachments,
     findKinoArtTicketPdfAttachment: findKinoArtTicketPdfAttachment,
+    findTicketmasterCzTicketPdfAttachment: findTicketmasterCzTicketPdfAttachment,
     resolveTicketProcessingJobs: resolveTicketProcessingJobs,
     TICKETING_PORTALS_ACTION: TICKETING_PORTALS_ACTION,
   };

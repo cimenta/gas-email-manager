@@ -50,12 +50,14 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // whether it then survives in the permanent folder + becomes a real
   // Calendar attachment, or is deleted).
   //
-  // The shipped default seeds TWO entries: enigoo.cz (the original portal
+  // The shipped default seeds THREE entries: enigoo.cz (the original portal
   // this feature was built from, PDF/OCR-sourced — see the sibling action
-  // file's parseEnigooTicketText) and, added quick-260731-kar, Kino Art
-  // (kinoart.cz, a Czech cinema, BODY-SOURCED — see the sibling action
-  // file's parseKinoArtTicketText and its class-level "TWO PROCESSING
-  // MODES" doc for the full architecture). Both entries ship with
+  // file's parseEnigooTicketText), Kino Art (kinoart.cz, a Czech cinema,
+  // added quick-260731-kar, BODY-SOURCED — see the sibling action file's
+  // parseKinoArtTicketText and its class-level "TWO PROCESSING MODES" doc
+  // for the full architecture), and Ticketmaster CZ (ticketmaster.cz,
+  // added quick-260816-ocw, also BODY-SOURCED — see the sibling action
+  // file's parseTicketmasterCzTicketText). All three entries ship with
   // calendarId left null and insertPdfIntoEvent left false — the owner
   // fills in the real calendar ID and decides the attachment toggle live,
   // per entry, via rebuildScriptProperties() + Script Properties, matching
@@ -71,13 +73,14 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // src/05-action-cfg-ics-import.js for the exact same JSON-vs-JS-object-
   // literal pitfall a real owner mistake already hit once for that other
   // JSON-typed setting):
-  // [{"identifyingEmail":"no-reply@enigoo.cz","calendarId":"abc123@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":"def456@group.calendar.google.com","insertPdfIntoEvent":false}]
+  // [{"identifyingEmail":"no-reply@enigoo.cz","calendarId":"abc123@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":"def456@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"noreply@ticketmaster.cz","calendarId":"ghi789@group.calendar.google.com","insertPdfIntoEvent":false}]
   get ticketingPortals() {
     return getJsonSetting(
       '07-action-ticketing-portals-TICKETING_PORTALS',
       [
         { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false },
         { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false },
+        { identifyingEmail: 'noreply@ticketmaster.cz', calendarId: null, insertPdfIntoEvent: false },
       ],
       isValidTicketingPortalsShape
     );

@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const {
   parseEnigooTicketText,
   parseKinoArtTicketText,
+  parseTicketmasterCzTicketText,
   resolveTicketingPortal,
   resolveTicketingCalendarId,
   addMinutesToWallClockComponents,
@@ -13,7 +14,11 @@ const {
   isTicketPdfAttachment,
   findTicketPdfAttachments,
   findKinoArtTicketPdfAttachment,
+  findTicketmasterCzTicketPdfAttachment,
   resolveTicketProcessingJobs,
+  TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL,
+  TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL,
+  TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL,
 } = require('../src/07-action-ticketing-portals.js');
 
 // --- parseEnigooTicketText ---------------------------------------------------
@@ -803,4 +808,319 @@ test('resolveTicketProcessingJobs: both an enigoo.cz message and a Kino Art mess
   assert.equal(jobs.length, 2);
   assert.equal(jobs[0].mode, 'pdf');
   assert.equal(jobs[1].mode, 'body');
+});
+
+// --- parseTicketmasterCzTicketText (quick-260816-ocw: the THIRD supported
+// portal, BODY-SOURCED like Kino Art) -----------------------------------------
+//
+// Ticketmaster CZ (noreply@ticketmaster.cz) confirmation emails carry their
+// event data entirely in the plain-text body's "YOUR ORDER DETAILS" section
+// (message.getPlainBody() — the SAME body-sourced processing mode Kino Art
+// already proved), never a PDF, even though the real email DOES carry an
+// eTicket.pdf attachment (D-01: deliberately never touched, no PDF-finder,
+// no Drive/OCR pipeline of any kind for this portal). The date format
+// ("Sunday 15 November 2026 at 20:00" -- full weekday, no-leading-zero day,
+// full English month NAME, 4-digit year, the literal word "at", 24h HH:MM)
+// is genuinely different from both enigoo.cz's zero-padded no-space
+// "15.08.2026" and Kino Art's dot-space "7. 8. 2026", hence its own regex
+// plus a local month-name-to-number lookup table (D-04) -- confirmed by grep
+// that no such helper exists anywhere else in this codebase. No stable
+// per-ticket or per-order confirmation number exists anywhere in the real
+// body (checked directly against the real sample), so `ticketIdentifier` is
+// `null` by design, a documented v1 limitation, never a substitute/invented
+// value (D-05) -- the DEDUP SAFETY NET therefore cannot protect this portal
+// against reprocessing duplicates, an accepted trade-off same as this file's
+// other two parsers' own optional-anchor treatment.
+//
+// Fixture below reproduces the real sample's exact paragraph layout (one
+// field per paragraph, separated by non-breaking-space-ONLY lines, per the
+// PLAN's <real_sample_shape>) with a FICTIONAL event name/venue substituted
+// for the real purchase (this file's established fixture convention) while
+// preserving the real character classes that matter to the regex --
+// non-ASCII Czech letters and an en-dash in the event name. The real date
+// string ("Sunday 15 November 2026 at 20:00") and the real
+// "Ticket Quantity: 2" line are kept verbatim.
+
+const REAL_TICKETMASTER_CZ_BODY_TEXT = [
+  'YOUR ORDER DETAILS',
+  '\u00A0',
+  'Léto v podzámčí – Koncertní večer',
+  '\u00A0',
+  'Sál Radost',
+  '\u00A0',
+  'Sunday 15 November 2026 at 20:00',
+  '\u00A0',
+  'Ticket Quantity: 2',
+].join('\n');
+
+test('parseTicketmasterCzTicketText: parses the real fixture into the full expected shape in one assertion, November proving the zero-indexed month', () => {
+  assert.deepEqual(parseTicketmasterCzTicketText(REAL_TICKETMASTER_CZ_BODY_TEXT), {
+    eventName: 'Léto v podzámčí – Koncertní večer',
+    location: 'Sál Radost',
+    year: 2026,
+    month: 10,
+    day: 15,
+    hour: 20,
+    minute: 0,
+    ticketIdentifier: null,
+    ticketQuantity: 2,
+    description: 'Léto v podzámčí – Koncertní večer\n\nSál Radost\n\nSunday 15 November 2026 at 20:00\n\nTicket Quantity: 2',
+  });
+});
+
+test('parseTicketmasterCzTicketText: description reproduces the order-details block as eventName/location/date-time-line/quantity paragraphs, weekday name included (round 2)', () => {
+  const parsed = parseTicketmasterCzTicketText(REAL_TICKETMASTER_CZ_BODY_TEXT);
+  assert.equal(
+    parsed.description,
+    'Léto v podzámčí – Koncertní večer\n\nSál Radost\n\nSunday 15 November 2026 at 20:00\n\nTicket Quantity: 2'
+  );
+});
+
+test('parseTicketmasterCzTicketText: a non-numeric Ticket Quantity value does not throw -- ticketQuantity stays null and its line is omitted from description (round 2)', () => {
+  const rawText = REAL_TICKETMASTER_CZ_BODY_TEXT.replace('Ticket Quantity: 2', 'Ticket Quantity: many');
+  const parsed = parseTicketmasterCzTicketText(rawText);
+
+  assert.equal(parsed.ticketQuantity, null);
+  assert.equal(parsed.description, 'Léto v podzámčí – Koncertní večer\n\nSál Radost\n\nSunday 15 November 2026 at 20:00');
+});
+
+// TICKETMASTER_CZ_MONTH_TEST_NAMES -- all twelve full English month names in
+// calendar order, used below to prove TICKETMASTER_CZ_MONTH_NAMES resolves
+// every entry to the correct zero-indexed month number (D-04), not just
+// November.
+const TICKETMASTER_CZ_MONTH_TEST_NAMES = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+];
+
+function buildMinimalTicketmasterCzBody(monthName) {
+  return ['YOUR ORDER DETAILS', 'Some Event', 'Some Venue', 'Sunday 1 ' + monthName + ' 2026 at 12:00', 'Ticket Quantity: 1'].join('\n');
+}
+
+test('parseTicketmasterCzTicketText: every one of the twelve English month names resolves to the correct zero-indexed month number (D-04)', () => {
+  TICKETMASTER_CZ_MONTH_TEST_NAMES.forEach(function (monthName, index) {
+    const parsed = parseTicketmasterCzTicketText(buildMinimalTicketmasterCzBody(monthName));
+    assert.equal(parsed.month, index, monthName + ' should resolve to zero-indexed month ' + index);
+  });
+});
+
+test('parseTicketmasterCzTicketText: the non-breaking-space-only separator lines in the real fixture do not disrupt eventName/location extraction', () => {
+  const parsed = parseTicketmasterCzTicketText(REAL_TICKETMASTER_CZ_BODY_TEXT);
+  assert.equal(parsed.eventName, 'Léto v podzámčí – Koncertní večer');
+  assert.equal(parsed.location, 'Sál Radost');
+});
+
+test('parseTicketmasterCzTicketText: a CRLF-joined variant of the same fixture parses identically -- separator-agnostic, same convention as the other two parsers', () => {
+  const crlfText = REAL_TICKETMASTER_CZ_BODY_TEXT.replace(/\n/g, '\r\n');
+  assert.deepEqual(parseTicketmasterCzTicketText(crlfText), parseTicketmasterCzTicketText(REAL_TICKETMASTER_CZ_BODY_TEXT));
+});
+
+test('parseTicketmasterCzTicketText: ticketIdentifier is null and the parse still succeeds -- proves "documented limitation", not "parse failed" (D-05)', () => {
+  const parsed = parseTicketmasterCzTicketText(REAL_TICKETMASTER_CZ_BODY_TEXT);
+  assert.equal(parsed.ticketIdentifier, null);
+  assert.ok(parsed.eventName);
+});
+
+test('parseTicketmasterCzTicketText: Ticket Quantity 1, 2 and 5 all yield the SAME event identity (eventName/location/date-time/ticketIdentifier) -- quantity is never an event multiplier (D-06, amended round 2)', () => {
+  const quantity2Result = parseTicketmasterCzTicketText(REAL_TICKETMASTER_CZ_BODY_TEXT);
+  const quantity1Text = REAL_TICKETMASTER_CZ_BODY_TEXT.replace('Ticket Quantity: 2', 'Ticket Quantity: 1');
+  const quantity5Text = REAL_TICKETMASTER_CZ_BODY_TEXT.replace('Ticket Quantity: 2', 'Ticket Quantity: 5');
+  const quantity1Result = parseTicketmasterCzTicketText(quantity1Text);
+  const quantity5Result = parseTicketmasterCzTicketText(quantity5Text);
+
+  // The event ITSELF (what determines whether this is one calendar event or
+  // several) is identical across all three quantities -- D-06's core
+  // guarantee, unchanged: one purchase always yields one event, regardless
+  // of how many tickets it contains.
+  ['eventName', 'location', 'year', 'month', 'day', 'hour', 'minute', 'ticketIdentifier'].forEach(function (field) {
+    assert.equal(quantity1Result[field], quantity2Result[field], field + ' must not vary with quantity');
+    assert.equal(quantity5Result[field], quantity2Result[field], field + ' must not vary with quantity');
+  });
+
+  // ROUND 2 AMENDMENT: unlike round 1, ticketQuantity and description NOW
+  // deliberately vary with the input quantity, since description surfaces
+  // the real "Ticket Quantity: N" line back to the owner -- this is new,
+  // intentional data flow, not a regression of D-06's one-event guarantee.
+  assert.equal(quantity1Result.ticketQuantity, 1);
+  assert.equal(quantity2Result.ticketQuantity, 2);
+  assert.equal(quantity5Result.ticketQuantity, 5);
+  assert.ok(quantity1Result.description.includes('Ticket Quantity: 1'));
+  assert.ok(quantity5Result.description.includes('Ticket Quantity: 5'));
+});
+
+test('parseTicketmasterCzTicketText: a body missing the "YOUR ORDER DETAILS" marker throws a controlled error carrying the FULL raw text', () => {
+  const rawText = ['Léto v podzámčí – Koncertní večer', 'Sál Radost', 'Sunday 15 November 2026 at 20:00', 'Ticket Quantity: 2'].join('\n');
+  assert.throws(
+    () => parseTicketmasterCzTicketText(rawText),
+    (err) => {
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseTicketmasterCzTicketText: a body missing the "Ticket Quantity:" marker throws a controlled error carrying the FULL raw text', () => {
+  const rawText = ['YOUR ORDER DETAILS', 'Léto v podzámčí – Koncertní večer', 'Sál Radost', 'Sunday 15 November 2026 at 20:00'].join('\n');
+  assert.throws(
+    () => parseTicketmasterCzTicketText(rawText),
+    (err) => {
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseTicketmasterCzTicketText: an order-details region with no recognizable date/time throws a controlled error carrying the FULL raw text', () => {
+  const rawText = ['YOUR ORDER DETAILS', 'Léto v podzámčí – Koncertní večer', 'Sál Radost', 'no date here', 'Ticket Quantity: 2'].join('\n');
+  assert.throws(
+    () => parseTicketmasterCzTicketText(rawText),
+    (err) => {
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseTicketmasterCzTicketText: an unrecognized month name throws a controlled error carrying the FULL raw text', () => {
+  const rawText = ['YOUR ORDER DETAILS', 'Léto v podzámčí – Koncertní večer', 'Sál Radost', 'Sunday 15 Smarch 2026 at 20:00', 'Ticket Quantity: 2'].join(
+    '\n'
+  );
+  assert.throws(
+    () => parseTicketmasterCzTicketText(rawText),
+    (err) => {
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseTicketmasterCzTicketText: hour out of range throws with "Hour out of range" and the FULL raw text', () => {
+  const rawText = ['YOUR ORDER DETAILS', 'Léto v podzámčí – Koncertní večer', 'Sál Radost', 'Sunday 15 November 2026 at 25:00', 'Ticket Quantity: 2'].join(
+    '\n'
+  );
+  assert.throws(
+    () => parseTicketmasterCzTicketText(rawText),
+    (err) => {
+      assert.ok(err.message.includes('Hour out of range'), 'error message should mention "Hour out of range"');
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseTicketmasterCzTicketText: minute out of range throws with "Minute out of range" and the FULL raw text', () => {
+  const rawText = ['YOUR ORDER DETAILS', 'Léto v podzámčí – Koncertní večer', 'Sál Radost', 'Sunday 15 November 2026 at 20:75', 'Ticket Quantity: 2'].join(
+    '\n'
+  );
+  assert.throws(
+    () => parseTicketmasterCzTicketText(rawText),
+    (err) => {
+      assert.ok(err.message.includes('Minute out of range'), 'error message should mention "Minute out of range"');
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseTicketmasterCzTicketText: an order-details region carrying only ONE non-empty paragraph before the date/time throws a controlled error carrying the FULL raw text (event name and venue not separable)', () => {
+  const rawText = ['YOUR ORDER DETAILS', 'Léto v podzámčí – Koncertní večer', 'Sunday 15 November 2026 at 20:00', 'Ticket Quantity: 2'].join('\n');
+  assert.throws(
+    () => parseTicketmasterCzTicketText(rawText),
+    (err) => {
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseTicketmasterCzTicketText: TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL is wired to the exported parser (D-01)', () => {
+  assert.strictEqual(TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL['noreply@ticketmaster.cz'], parseTicketmasterCzTicketText);
+});
+
+test('Ticketmaster CZ has NO OCR/PDF-TEXT-parsing pipeline: TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL has no noreply@ticketmaster.cz key (D-01, still true after round 2)', () => {
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL, 'noreply@ticketmaster.cz'), false);
+});
+
+// ROUND 2 AMENDMENT to D-01: the owner asked the real eTicket.pdf to be
+// attached to the created calendar event, the same OPTIONAL
+// insertPdfIntoEvent attachment path Kino Art already proved -- this is
+// NOT the OCR/PDF-TEXT pipeline (that stays untouched, see the test above),
+// it is the separate find-the-PDF-and-attach-it-as-is mechanism the
+// body-sourced mode already supports via
+// TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL.
+test('Ticketmaster CZ IS registered in TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL, wired to findTicketmasterCzTicketPdfAttachment (round 2)', () => {
+  assert.strictEqual(TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL['noreply@ticketmaster.cz'], findTicketmasterCzTicketPdfAttachment);
+});
+
+// --- findTicketmasterCzTicketPdfAttachment (round 2) --------------------------
+//
+// The real Ticketmaster CZ email carries exactly one PDF attachment,
+// filename "eTicket.pdf" (Content-Disposition: attachment, application/pdf).
+
+test('findTicketmasterCzTicketPdfAttachment: selects the real eTicket.pdf attachment', () => {
+  const eTicket = fakeAttachment('eTicket.pdf', 'application/pdf');
+  const message = fakeMessage('noreply@ticketmaster.cz', [eTicket]);
+
+  assert.equal(findTicketmasterCzTicketPdfAttachment(message), eTicket);
+});
+
+test('findTicketmasterCzTicketPdfAttachment: returns null when no attachment name matches "eTicket"', () => {
+  const other = fakeAttachment('Invoice.pdf', 'application/pdf');
+  const message = fakeMessage('noreply@ticketmaster.cz', [other]);
+
+  assert.equal(findTicketmasterCzTicketPdfAttachment(message), null);
+});
+
+test('findTicketmasterCzTicketPdfAttachment: returns null when the message carries no PDF attachments at all', () => {
+  const message = fakeMessage('noreply@ticketmaster.cz', []);
+  assert.equal(findTicketmasterCzTicketPdfAttachment(message), null);
+});
+
+test('resolveTicketProcessingJobs: a noreply@ticketmaster.cz message with no attachments yields exactly one "body"-mode job (D-01)', () => {
+  const portals = [{ identifyingEmail: 'noreply@ticketmaster.cz', calendarId: 'CAL_A', insertPdfIntoEvent: false }];
+  const message = fakeMessage('noreply@ticketmaster.cz', []);
+
+  const jobs = resolveTicketProcessingJobs([message], portals);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'body');
+  assert.equal(jobs[0].message, message);
+  assert.equal(jobs[0].portal, portals[0]);
+});
+
+test('resolveTicketProcessingJobs: the SAME Ticketmaster CZ message carrying the real eTicket.pdf attachment STILL yields exactly one "body"-mode job -- never one job per attachment, never a "pdf"-mode job (D-01)', () => {
+  const portals = [{ identifyingEmail: 'noreply@ticketmaster.cz', calendarId: 'CAL_A', insertPdfIntoEvent: false }];
+  const message = fakeMessage('noreply@ticketmaster.cz', [fakeAttachment('eTicket.pdf', 'application/pdf')]);
+
+  const jobs = resolveTicketProcessingJobs([message], portals);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'body');
+});
+
+test('TICKETING_PORTALS_ACTION_CONFIG: the shipped default seeds a THIRD entry for noreply@ticketmaster.cz, and resolveTicketingCalendarId falls back to the passed global default for it (D-02)', () => {
+  const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
+  const thirdPortal = TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals[2];
+
+  assert.deepEqual(thirdPortal, { identifyingEmail: 'noreply@ticketmaster.cz', calendarId: null, insertPdfIntoEvent: false });
+  assert.equal(resolveTicketingCalendarId(thirdPortal, 'DEFAULT_CAL'), 'DEFAULT_CAL');
+});
+
+test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are still the unchanged enigoo.cz and Kino Art entries, array length is 3', () => {
+  const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
+  const portals = TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals;
+
+  assert.equal(portals.length, 3);
+  assert.deepEqual(portals[0], { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false });
+  assert.deepEqual(portals[1], { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false });
 });
