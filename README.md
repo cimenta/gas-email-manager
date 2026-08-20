@@ -4,12 +4,13 @@ A Google Apps Script application that periodically scans a Gmail account for
 unlabeled emails within a configurable time window, runs a pluggable set of
 "actions" against each match, and labels the email once processed.
 
-Four actions ship today:
+Five actions ship today:
 
 - **ICS-to-Calendar import** — any sender, generic `.ics` calendar attachments
 - **Booking.com reservation management** — booking.com
-- **Ticketing-portal PDF import** — enigoo.cz, Kino Art (kinoart.cz)
+- **Ticketing-portal PDF import** — enigoo.cz, Kino Art (kinoart.cz), Ticketmaster CZ (ticketmaster.cz)
 - **Transport ticket import** — RegioJet (regiojet.cz), IDOS.cz (idos.svt.cz)
+- **Meetings** — body-sourced meeting invites with no `.ics` attachment, matched by sender domain; Teamio (teamio.com) ships first
 
 Every matching email reliably gets its action(s) applied exactly once — no
 duplicate processing, no silent failures: if any action throws, the owner
@@ -44,6 +45,14 @@ in addition to processed, so nothing is lost silently.
   parsing the plain-text email body directly (IDOS.cz) — and optionally
   archives + attaches the accompanying ticket PDF to the created event
   either way. See [Transport tickets](#transport-tickets).
+- **Meetings** — for a general meeting-invitation email with NO `.ics`
+  attachment (the ICS action already owns any thread that has one), matched
+  to a configured "system" by the sender's domain (subdomain wildcards
+  supported, e.g. `*.teamio.com`), parses the event's date/time/location
+  straight out of the email body (Czech and English label text both
+  recognized) and creates a calendar event, deduped by a tag so reprocessing
+  the same email never creates a second one. Teamio ships as the first
+  system. See [Meetings](#meetings).
 - **Sender allow-list (opt-in) and hand-off (exclude-list)** — restrict
   either action to specific sender addresses; unlisted senders are silently
   skipped (no error, thread still marked processed). Empty by default,
@@ -326,6 +335,53 @@ to `'body'`-mode carriers like IDOS.cz — the generic ICS action has nothing
 to import for them in the first place, since there's no `.ics` attachment at
 all.
 
+## Meetings
+
+For a general meeting-invitation email — an interview invite, a Teams/Zoom/
+Google Meet link, anything that isn't a structured `.ics` — the event data
+lives only in the email BODY, not an attachment. This action owns exactly
+that case: it only ever claims a message that has NO `.ics` attachment at
+all (the ICS action already imports those correctly on its own), matched to
+a configured "system" by the sender's email domain.
+
+**Detection — sender domain, not a fixed template:** each configured system
+is a `{ domainPattern, calendarId }` entry. `domainPattern` supports a
+`*.`-prefixed subdomain wildcard (`*.teamio.com` matches
+`recruit.teamio.com`, `notify.teamio.com`, and bare `teamio.com` itself) or
+an exact domain with no wildcard. Adding a new system needs one new config
+entry plus one new parser function registered by that same domain-pattern
+string — the matching logic itself never changes.
+
+**Teamio** (`*.teamio.com`) is the first system:
+
+1. Reads the matched label lines from the email body — Czech (`Kdy:`,
+   `Čas:`, `Kde:`) or English (`When:`, `Time:`, `Where:`) — for the date,
+   time (+ duration, when stated), and location.
+2. **Location is read from the HTML body, not the plain-text body.** Teamio's
+   mailer rewrites every plain-text URL into a `track.teamio.com`
+   click-tracking redirect, so the real, human-recognizable meeting URL
+   (e.g. a `teams.microsoft.com` link) exists only in the email's HTML part.
+   The action reads it from there; if no HTML body is available it falls
+   back to the plain-text value.
+3. The description echoes the same resolved location back on its own `Kde:`/
+   `Where:` line (never a second, independently-sourced copy), followed by
+   every other distinct link found in the body — e.g. a "confirm your
+   attendance" link — under a `Links:` heading, one blank line between each
+   entry.
+4. When the body states no explicit duration, falls back to
+   `defaultDurationMinutes` (see [Configuration reference](#configuration-reference)).
+5. Tags the created event with a stable identifier via a private
+   `extendedProperties` tag, checked against existing calendar events before
+   creating a new one — same tag-before-create dedup pattern the
+   booking.com/ticketing-portals/transport-tickets actions already use, since
+   a body-sourced invite has no `.ics` `UID` to key off of.
+
+**Why a separate action instead of extending the ICS action?** The ICS
+action's entire design is built around parsing a structured `.ics`
+attachment — a general meeting invite with no attachment has nothing for it
+to parse. This action is scoped to exactly the complementary case (no `.ics`
+present) so the two never compete for the same email.
+
 ## MojeMenicka menu replies
 
 Unlike every other action in this project, this one replies to the
@@ -426,6 +482,8 @@ so files are numbered to keep related code grouped:
 | `src/08-action-transport-tickets.js` | The transport-tickets action (.ics-VEVENT-sourced, reuses the ICS action's parser, action descriptor) |
 | `src/09-action-cfg-mojemenicka.js` | `MOJEMENICKA_ACTION_CONFIG` — the MojeMenicka action's settings |
 | `src/09-action-mojemenicka.js` | The MojeMenicka menu-request action: sender/subject matching, menu fetch, in-thread reply |
+| `src/10-action-cfg-meetings.js` | `MEETINGS_ACTION_CONFIG` — the meetings action's settings |
+| `src/10-action-meetings.js` | The meetings action (domain-matched systems, Teamio's body/HTML parser, action descriptor) |
 | `src/appsscript.json` | Apps Script manifest (timezone, OAuth scopes, Advanced Calendar/Drive/Documents Services) |
 
 Each action's own settings live in a `const *_CONFIG` object in its own
@@ -552,6 +610,16 @@ string `09-action-mojemenicka-MENU_URL`, list `09-action-mojemenicka-ALLOWED_SEN
 | `triggerStrings` (`09-action-mojemenicka-TRIGGER_STRINGS`) | list | empty | Substrings looked for in the message SUBJECT only, never the body (e.g. `menu, jidelnicek`) — matches on ANY ONE entry, FAIL-CLOSED, same rationale as `allowedSenders` |
 | `weeklyTriggerStrings` (`09-action-mojemenicka-WEEKLY_TRIGGER_STRINGS`) | list | empty | Substrings that select the week range instead of today (e.g. `tyden, na tyden, weekly`) — SUBORDINATE to `triggerStrings`: only consulted on a subject that already matched one of those, so a weekly indicator alone never triggers a reply; empty means every matched request uses the today range |
 
+**Meetings action** — `MEETINGS_ACTION_CONFIG` in
+`src/10-action-cfg-meetings.js`:
+
+| Field | Meaning |
+|-------|---------|
+| `enabled` | Cross-cutting toggle — `false` skips this action entirely |
+| `notifyOnFailure` | Whether a failure notification email is sent when this action throws |
+| `defaultDurationMinutes` | Fallback event duration (minutes) used only when a matched invitation's own body states no explicit duration |
+| `meetingSystems` | Array of `{ domainPattern, calendarId }` — one entry per supported meeting system, matched by the sender's email domain (`*.`-prefixed subdomain wildcard supported). `calendarId` falls back to `CONFIG.calendarId` when unset. Ships with one Teamio (`*.teamio.com`) entry. See [Meetings](#meetings) |
+
 ## Live settings override (Script Properties)
 
 `clasp push` always overwrites `src/*.js` with your local copy — so any
@@ -563,7 +631,7 @@ fallback default and living documentation (comments, examples) — the
 *actual* live value, once set, survives every future push.
 
 **Setup:** run `rebuildScriptProperties()` once from the function picker.
-It writes all 34 settings as visible rows — anything you've already
+It writes all 38 settings as visible rows — anything you've already
 customized in code is preserved as-is, and everything else appears with the
 literal placeholder text `DefaultValue` (Script Properties can't store an
 empty value, so this stands in for "not overridden — use the code

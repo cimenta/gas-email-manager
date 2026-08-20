@@ -606,6 +606,33 @@ function isValidTicketingPortalsShape(value) {
 }
 
 /**
+ * isValidMeetingSystemsShape — pure shape validator for the meetings
+ * action's JSON-typed setting (`10-action-meetings-MEETING_SYSTEMS` /
+ * MEETINGS_ACTION_CONFIG.meetingSystems, quick-260820-g4r): an array where
+ * every entry is a plain object with a string `domainPattern` (see
+ * src/10-action-meetings.js's meetingsDomainMatchesPattern for the
+ * `*.`-wildcard matching semantics this string is interpreted with) and a
+ * `calendarId` that is either a string or `null` (the shipped default
+ * entry's code-default value, before the owner fills in a real calendar).
+ * Not a general-purpose JSON-schema validator, same scope caveat as
+ * isValidTicketingPortalsShape. No GAS globals.
+ */
+function isValidMeetingSystemsShape(value) {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+
+  return value.every(function (entry) {
+    return (
+      entry !== null &&
+      typeof entry === 'object' &&
+      typeof entry.domainPattern === 'string' &&
+      (entry.calendarId === null || typeof entry.calendarId === 'string')
+    );
+  });
+}
+
+/**
  * parseJsonSettingValue — pure. Unset (`null`/`undefined`) -> `codeDefault`.
  * Set: parsed via `JSON.parse`; a syntax error (invalid JSON) is caught and
  * falls back to `codeDefault`, never throws. A syntactically VALID JSON
@@ -908,6 +935,25 @@ const SETTINGS_REGISTRY = [
   { key: '09-action-mojemenicka-ALLOWED_SENDERS', type: 'list', read: function () { return MOJEMENICKA_ACTION_CONFIG.allowedSenders; } },
   { key: '09-action-mojemenicka-TRIGGER_STRINGS', type: 'list', read: function () { return MOJEMENICKA_ACTION_CONFIG.triggerStrings; } },
   { key: '09-action-mojemenicka-WEEKLY_TRIGGER_STRINGS', type: 'list', read: function () { return MOJEMENICKA_ACTION_CONFIG.weeklyTriggerStrings; } },
+
+  // quick-260820-g4r: MEETINGS_ACTION_CONFIG's own fields — registered here
+  // for the exact same reason every other action's config fields are:
+  // rebuildScriptProperties/checkScriptPropertiesSyntax manage them through
+  // the ONE established mechanism, not a parallel one.
+  { key: '10-action-meetings-ENABLED', type: 'boolean', read: function () { return MEETINGS_ACTION_CONFIG.enabled; } },
+  { key: '10-action-meetings-NOTIFY_ON_FAILURE', type: 'boolean', read: function () { return MEETINGS_ACTION_CONFIG.notifyOnFailure; } },
+  { key: '10-action-meetings-DEFAULT_DURATION_MINUTES', type: 'number', read: function () { return MEETINGS_ACTION_CONFIG.defaultDurationMinutes; } },
+  {
+    key: '10-action-meetings-MEETING_SYSTEMS',
+    type: 'json',
+    jsonShapeValidator: isValidMeetingSystemsShape,
+    jsonShapeDescription: 'an array of {domainPattern, calendarId} objects',
+    jsonRowFields: [
+      { name: 'domainPattern', label: 'Sender domain pattern', kind: 'string' },
+      { name: 'calendarId', label: 'Calendar ID', kind: 'stringOrNull' },
+    ],
+    read: function () { return MEETINGS_ACTION_CONFIG.meetingSystems; },
+  },
 ];
 
 /**
@@ -983,6 +1029,7 @@ if (typeof module !== 'undefined' && module.exports) {
     buildRebuiltPropertiesMap: buildRebuiltPropertiesMap,
     isValidCalendarIdBySenderShape: isValidCalendarIdBySenderShape,
     isValidTicketingPortalsShape: isValidTicketingPortalsShape,
+    isValidMeetingSystemsShape: isValidMeetingSystemsShape,
     SETTINGS_REGISTRY: SETTINGS_REGISTRY,
   };
 }

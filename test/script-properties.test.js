@@ -138,29 +138,31 @@ test('buildRebuiltPropertiesMap: every registry entry ALWAYS gets a key in the b
   assert.ok(Object.prototype.hasOwnProperty.call(map, 'K_SET'));
 });
 
-test('buildRebuiltPropertiesMap: the real SETTINGS_REGISTRY, with no live overrides, always yields all 34 rows — empty-default fields get the sentinel, non-empty ones their real value', () => {
+test('buildRebuiltPropertiesMap: the real SETTINGS_REGISTRY, with no live overrides, always yields all 38 rows — empty-default fields get the sentinel, non-empty ones their real value', () => {
   // SETTINGS_REGISTRY's read() closures for the ICS/booking/ticketing/
-  // transport-tickets/mojemenicka entries reference ICS_ACTION_CONFIG/
-  // BOOKING_ACTION_CONFIG/TICKETING_PORTALS_ACTION_CONFIG/
-  // TRANSPORT_TICKETS_ACTION_CONFIG/MOJEMENICKA_ACTION_CONFIG by bare name
-  // from within src/01-setup.js's own module scope. Under GAS's shared
-  // global scope this resolves for free (all five objects are genuinely
-  // global); under Node's per-file module isolation, this test supplies
-  // them itself via the exact same globalThis-bridge technique the
-  // sibling config files already use in the OTHER direction (pulling
-  // get*Setting FROM 01-setup.js) — see src/05-action-cfg-ics-import.js's
-  // own bridge for the precedent. This is a TEST-ONLY bridge (not added
-  // to src/01-setup.js itself, to avoid a circular require: 01-setup.js
-  // is what those files themselves require to reach get*Setting).
+  // transport-tickets/mojemenicka/meetings entries reference
+  // ICS_ACTION_CONFIG/BOOKING_ACTION_CONFIG/TICKETING_PORTALS_ACTION_CONFIG/
+  // TRANSPORT_TICKETS_ACTION_CONFIG/MOJEMENICKA_ACTION_CONFIG/
+  // MEETINGS_ACTION_CONFIG by bare name from within src/01-setup.js's own
+  // module scope. Under GAS's shared global scope this resolves for free
+  // (all six objects are genuinely global); under Node's per-file module
+  // isolation, this test supplies them itself via the exact same
+  // globalThis-bridge technique the sibling config files already use in
+  // the OTHER direction (pulling get*Setting FROM 01-setup.js) — see
+  // src/05-action-cfg-ics-import.js's own bridge for the precedent. This
+  // is a TEST-ONLY bridge (not added to src/01-setup.js itself, to avoid a
+  // circular require: 01-setup.js is what those files themselves require
+  // to reach get*Setting).
   global.ICS_ACTION_CONFIG = require('../src/05-action-cfg-ics-import.js').ICS_ACTION_CONFIG;
   global.BOOKING_ACTION_CONFIG = require('../src/06-action-cfg-booking-com-management.js').BOOKING_ACTION_CONFIG;
   global.TICKETING_PORTALS_ACTION_CONFIG = require('../src/07-action-cfg-ticketing-portals.js').TICKETING_PORTALS_ACTION_CONFIG;
   global.TRANSPORT_TICKETS_ACTION_CONFIG = require('../src/08-action-cfg-transport-tickets.js').TRANSPORT_TICKETS_ACTION_CONFIG;
   global.MOJEMENICKA_ACTION_CONFIG = require('../src/09-action-cfg-mojemenicka.js').MOJEMENICKA_ACTION_CONFIG;
+  global.MEETINGS_ACTION_CONFIG = require('../src/10-action-cfg-meetings.js').MEETINGS_ACTION_CONFIG;
 
   try {
     const map = buildRebuiltPropertiesMap(SETTINGS_REGISTRY);
-    assert.equal(Object.keys(map).length, 34);
+    assert.equal(Object.keys(map).length, 38);
 
     // Optional-override fields whose code default is null/[] -> sentinel.
     assert.equal(map['05-action-ics-CALENDAR_ID'], SETTING_DEFAULT_SENTINEL);
@@ -206,18 +208,29 @@ test('buildRebuiltPropertiesMap: the real SETTINGS_REGISTRY, with no live overri
     assert.equal(map['09-action-mojemenicka-WEEKLY_TRIGGER_STRINGS'], SETTING_DEFAULT_SENTINEL);
     assert.equal(map['09-action-mojemenicka-ENABLED'], 'true');
     assert.equal(map['09-action-mojemenicka-NOTIFY_ON_FAILURE'], 'true');
+
+    // quick-260820-g4r: MEETINGS_ACTION_CONFIG's 4 fields -- ENABLED and
+    // NOTIFY_ON_FAILURE code default true, DEFAULT_DURATION_MINUTES code
+    // default 60, MEETING_SYSTEMS ships the single default Teamio entry
+    // (never sentineled, since the code default is non-empty).
+    assert.equal(map['10-action-meetings-ENABLED'], 'true');
+    assert.equal(map['10-action-meetings-NOTIFY_ON_FAILURE'], 'true');
+    assert.equal(map['10-action-meetings-DEFAULT_DURATION_MINUTES'], '60');
+    assert.equal(map['10-action-meetings-MEETING_SYSTEMS'], '[{"domainPattern":"*.teamio.com","calendarId":null}]');
   } finally {
     delete global.ICS_ACTION_CONFIG;
     delete global.BOOKING_ACTION_CONFIG;
     delete global.TICKETING_PORTALS_ACTION_CONFIG;
     delete global.TRANSPORT_TICKETS_ACTION_CONFIG;
     delete global.MOJEMENICKA_ACTION_CONFIG;
+    delete global.MEETINGS_ACTION_CONFIG;
   }
 });
 const { ICS_ACTION_CONFIG } = require('../src/05-action-cfg-ics-import.js');
 const { BOOKING_ACTION_CONFIG } = require('../src/06-action-cfg-booking-com-management.js');
 const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
 const { MOJEMENICKA_ACTION_CONFIG } = require('../src/09-action-cfg-mojemenicka.js');
+const { MEETINGS_ACTION_CONFIG } = require('../src/10-action-cfg-meetings.js');
 
 // --- parseBooleanSettingValue ------------------------------------------------
 
@@ -541,6 +554,14 @@ test('CRITICAL: with PropertiesService absent (Node), every MOJEMENICKA_ACTION_C
   assert.deepEqual(MOJEMENICKA_ACTION_CONFIG.weeklyTriggerStrings, []);
 });
 
+test('CRITICAL: with PropertiesService absent (Node), every MEETINGS_ACTION_CONFIG field matches its exact code default (quick-260820-g4r)', () => {
+  assert.equal(typeof PropertiesService, 'undefined');
+  assert.equal(MEETINGS_ACTION_CONFIG.enabled, true);
+  assert.equal(MEETINGS_ACTION_CONFIG.notifyOnFailure, true);
+  assert.equal(MEETINGS_ACTION_CONFIG.defaultDurationMinutes, 60);
+  assert.deepEqual(MEETINGS_ACTION_CONFIG.meetingSystems, [{ domainPattern: '*.teamio.com', calendarId: null }]);
+});
+
 // --- SETTINGS_REGISTRY completeness (a completeness guard, same spirit as ---
 // --- the language-pack completeness test) -----------------------------------
 
@@ -579,10 +600,14 @@ const EXPECTED_SETTINGS_REGISTRY = [
   { key: '09-action-mojemenicka-ALLOWED_SENDERS', type: 'list' },
   { key: '09-action-mojemenicka-TRIGGER_STRINGS', type: 'list' },
   { key: '09-action-mojemenicka-WEEKLY_TRIGGER_STRINGS', type: 'list' },
+  { key: '10-action-meetings-ENABLED', type: 'boolean' },
+  { key: '10-action-meetings-NOTIFY_ON_FAILURE', type: 'boolean' },
+  { key: '10-action-meetings-DEFAULT_DURATION_MINUTES', type: 'number' },
+  { key: '10-action-meetings-MEETING_SYSTEMS', type: 'json' },
 ];
 
-test('SETTINGS_REGISTRY: exactly the 34 approved keys (33 prior + 1 new for phase 4 amendment weekly range setting), in the exact approved names and types, no more no fewer', () => {
-  assert.equal(SETTINGS_REGISTRY.length, 34);
+test('SETTINGS_REGISTRY: exactly the 38 approved keys (34 prior + 4 new for the quick-260820-g4r meetings action), in the exact approved names and types, no more no fewer', () => {
+  assert.equal(SETTINGS_REGISTRY.length, 38);
   const actual = SETTINGS_REGISTRY.map(function (entry) {
     return { key: entry.key, type: entry.type };
   });
@@ -593,7 +618,7 @@ test('SETTINGS_REGISTRY: every json-typed entry carries its own jsonShapeValidat
   const jsonEntries = SETTINGS_REGISTRY.filter(function (entry) {
     return entry.type === 'json';
   });
-  assert.equal(jsonEntries.length, 3);
+  assert.equal(jsonEntries.length, 4);
   jsonEntries.forEach(function (entry) {
     assert.equal(typeof entry.jsonShapeValidator, 'function');
     assert.equal(typeof entry.jsonShapeDescription, 'string');

@@ -22,9 +22,9 @@ const {
 
 // --- webappBuildSettingsFormModel -------------------------------------------
 
-test('webappBuildSettingsFormModel: over the real 34-entry registry, returns 34 models with {key, type, fieldKind, rowFields}', () => {
+test('webappBuildSettingsFormModel: over the real 38-entry registry, returns 38 models with {key, type, fieldKind, rowFields}', () => {
   const models = webappBuildSettingsFormModel(SETTINGS_REGISTRY);
-  assert.equal(models.length, 34);
+  assert.equal(models.length, 38);
   models.forEach(function (model) {
     assert.equal(typeof model.key, 'string');
     assert.equal(typeof model.type, 'string');
@@ -52,9 +52,15 @@ test('webappBuildSettingsFormModel: fieldKind mapping is exactly string->text, n
   assert.equal(byKey['09-action-mojemenicka-WEEKLY_TRIGGER_STRINGS'].fieldKind, 'csv');
   assert.equal(byKey['09-action-mojemenicka-ALLOWED_SENDERS'].fieldKind, 'csv');
   assert.equal(byKey['09-action-mojemenicka-ENABLED'].fieldKind, 'checkbox');
+
+  // quick-260820-g4r: Meetings' 4 keys.
+  assert.equal(byKey['10-action-meetings-ENABLED'].fieldKind, 'checkbox');
+  assert.equal(byKey['10-action-meetings-NOTIFY_ON_FAILURE'].fieldKind, 'checkbox');
+  assert.equal(byKey['10-action-meetings-DEFAULT_DURATION_MINUTES'].fieldKind, 'number');
+  assert.equal(byKey['10-action-meetings-MEETING_SYSTEMS'].fieldKind, 'rows');
 });
 
-test('webappBuildSettingsFormModel: the 3 json keys get fieldKind "rows" and rowFields with the exact expected field names', () => {
+test('webappBuildSettingsFormModel: the 4 json keys get fieldKind "rows" and rowFields with the exact expected field names', () => {
   const models = webappBuildSettingsFormModel(SETTINGS_REGISTRY);
   const byKey = {};
   models.forEach(function (model) {
@@ -75,13 +81,18 @@ test('webappBuildSettingsFormModel: the 3 json keys get fieldKind "rows" and row
     return f.name;
   });
   assert.deepEqual(transportNames, ['identifyingEmail', 'calendarId', 'insertPdfIntoEvent', 'mode']);
+
+  const meetingNames = byKey['10-action-meetings-MEETING_SYSTEMS'].rowFields.map(function (f) {
+    return f.name;
+  });
+  assert.deepEqual(meetingNames, ['domainPattern', 'calendarId']);
 });
 
 test('webappBuildSettingsFormModel: completeness guard -- every json-typed entry in the real registry carries a non-empty jsonRowFields array', () => {
   const jsonEntries = SETTINGS_REGISTRY.filter(function (entry) {
     return entry.type === 'json';
   });
-  assert.equal(jsonEntries.length, 3);
+  assert.equal(jsonEntries.length, 4);
   jsonEntries.forEach(function (entry) {
     assert.ok(Array.isArray(entry.jsonRowFields));
     assert.ok(entry.jsonRowFields.length > 0);
@@ -314,7 +325,7 @@ test('webappCoerceSubmittedSettingValue: empty-string constraint -- empty string
   assert.equal(webappCoerceSubmittedSettingValue(icsEntry, []), '[]');
 });
 
-test('webappCoerceSubmittedSettingValue: THE round-trip proof -- for each of the 3 json entries, the produced storage string is always readable by the live runtime getter (never falls back to a sentinel default)', () => {
+test('webappCoerceSubmittedSettingValue: THE round-trip proof -- for each of the 4 json entries, the produced storage string is always readable by the live runtime getter (never falls back to a sentinel default)', () => {
   const UNIQUE_SENTINEL = { uniqueRoundTripSentinel: true };
 
   const cases = [
@@ -335,6 +346,12 @@ test('webappCoerceSubmittedSettingValue: THE round-trip proof -- for each of the
         return e.key === '08-action-transport-tickets-TRANSPORT_SENDERS';
       }),
       rows: [{ identifyingEmail: 'jizdenky@regiojet.cz', calendarId: 'cal-2@group.calendar.google.com', insertPdfIntoEvent: false, mode: '' }],
+    },
+    {
+      entry: SETTINGS_REGISTRY.find(function (e) {
+        return e.key === '10-action-meetings-MEETING_SYSTEMS';
+      }),
+      rows: [{ domainPattern: '*.teamio.com', calendarId: '' }],
     },
   ];
 
