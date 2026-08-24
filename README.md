@@ -374,9 +374,17 @@ string — the matching logic itself never changes.
    every other distinct link found in the body — e.g. a "confirm your
    attendance" link — under a `Links:` heading, one blank line between each
    entry.
-4. When the body states no explicit duration, falls back to
+4. **Every event's description always opens with the sender's identity** —
+   `From: <display name> <email address>` as its first line, followed by a
+   blank line, then the rest of the description. This is applied once, at
+   the pipeline level shared by every configured system, not inside Teamio's
+   own parser — so it holds for Teamio today and for any future system with
+   no extra work. The display name is sanitized (line breaks collapsed,
+   angle brackets stripped) since it comes from an unauthenticated email
+   header.
+5. When the body states no explicit duration, falls back to
    `defaultDurationMinutes` (see [Configuration reference](#configuration-reference)).
-5. Tags the created event with a stable identifier via a private
+6. Tags the created event with a stable identifier via a private
    `extendedProperties` tag, checked against existing calendar events before
    creating a new one — same tag-before-create dedup pattern the
    booking.com/ticketing-portals/transport-tickets actions already use, since

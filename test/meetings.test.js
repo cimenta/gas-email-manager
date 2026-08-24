@@ -56,6 +56,9 @@ const {
   meetingsSelectLanguagePack,
   teamioTextLooksLikeMeetingInvitation,
   MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN,
+  meetingsExtractSenderDisplayName,
+  meetingsFormatSenderAttribution,
+  meetingsApplySenderAttribution,
 } = require('../src/10-action-meetings.js');
 const { MEETINGS_ACTION_CONFIG } = require('../src/10-action-cfg-meetings.js');
 const ticketingModule = require('../src/07-action-ticketing-portals.js');
@@ -169,6 +172,19 @@ const REAL_TEAMIO_CS_REJECTION_BODY_TEXT =
 // local parts. Only body content can distinguish them.
 const REAL_TEAMIO_REJECTION_FROM =
   'Simona Pažinková <simona.pazinkova.prochazkapartnerssro.uaktdd3ygto@recruit.teamio.com>';
+
+// REAL_TEAMIO_CS_INVITATION_FROM (quick-260824-hva, NEW): the reported
+// invitation's own From header -- display name `Denisa Čerevková`, address
+// on `recruit.teamio.com`, matching REAL_TEAMIO_REJECTION_FROM's exact shape
+// (display name, space, angle-bracketed address) and the SAME
+// opaque-local-part fictionalization convention that constant already
+// documents (a real per-recipient Teamio tracking token, fictionalized here).
+const REAL_TEAMIO_CS_INVITATION_FROM =
+  'Denisa Čerevková <denisa.cerevkova.somecompanysro.xk29fjq8a1@recruit.teamio.com>';
+
+// The reported Czech subject line for the invitation this quick task fixes
+// (quick-260824-hva) -- used only by the regression-proof test below.
+const REAL_TEAMIO_CS_INVITATION_SUBJECT = 'Pozvánka na pohovor – AI Implementation Specialist';
 
 function fakeMeetingAttachment(name, contentType) {
   return {
@@ -882,4 +898,163 @@ test('PARSER CONTRACT UNCHANGED: a structure-PRESENT but value-unparseable body 
       return /Unrecognized meeting invitation date/.test(err.message);
     }
   );
+});
+
+// --- sender attribution (quick-260824-hva) ------------------------------------
+//
+// THE BUG THIS SECTION LOCKS OUT: every calendar event MEETINGS_ACTION creates
+// carried NOTHING identifying who sent it -- parseTeamioMeetingText assembles
+// `description` from the matched Kdy:/Čas:/Kde: label lines plus a harvested
+// Links: block and NOTHING else, and it is never even passed the From header.
+// processMeetingFromMessageBody DOES read message.getFrom(), but only feeds it
+// to buildMeetingIdentifier for the invisible dedup tag. Real incident: the
+// owner forwarded a real Teamio interview invitation (v0.15.1) whose generated
+// event carried no sender info at all.
+//
+// THE FIX IS PIPELINE-LEVEL, NOT A TEAMIO PATCH (D-01): three pure helpers
+// applied at processMeetingFromMessageBody's single choke point, between the
+// parser call and createMeetingCalendarEvent -- so the guarantee holds for
+// every registered meeting system, present and future, with zero per-parser
+// change. parseTeamioMeetingText's own signature and body are untouched.
+
+test('meetingsExtractSenderDisplayName: a quoted display name returns the name with the surrounding double quotes stripped and trimmed', () => {
+  assert.equal(meetingsExtractSenderDisplayName('"Denisa Čerevková" <denisa@recruit.teamio.com>'), 'Denisa Čerevková');
+});
+
+test('meetingsExtractSenderDisplayName: an unquoted display name returns the trimmed name', () => {
+  assert.equal(meetingsExtractSenderDisplayName('Denisa Čerevková <denisa@recruit.teamio.com>'), 'Denisa Čerevková');
+});
+
+test('meetingsExtractSenderDisplayName: a bare address with no display name, and an angle-bracket-only header, both return the empty string', () => {
+  assert.equal(meetingsExtractSenderDisplayName('denisa@recruit.teamio.com'), '');
+  assert.equal(meetingsExtractSenderDisplayName('<denisa@recruit.teamio.com>'), '');
+});
+
+test('meetingsExtractSenderDisplayName: null, undefined and the empty string all return the empty string and never throw', () => {
+  assert.equal(meetingsExtractSenderDisplayName(null), '');
+  assert.equal(meetingsExtractSenderDisplayName(undefined), '');
+  assert.equal(meetingsExtractSenderDisplayName(''), '');
+});
+
+test('meetingsExtractSenderDisplayName SANITIZATION (T-hva-02): CR/LF/tab collapse to a single space and every "<"/">" is removed from a hostile display name attempting to forge a second label line and smuggle an angle-bracket tag', () => {
+  const hostileFrom = '"Evil\r\nKde:\thttp://fake.test>Attacker" <real@recruit.teamio.com>';
+  const result = meetingsExtractSenderDisplayName(hostileFrom);
+
+  assert.equal(result.indexOf('\n'), -1);
+  assert.equal(result.indexOf('\r'), -1);
+  assert.equal(result.indexOf('<'), -1);
+  assert.equal(result.indexOf('>'), -1);
+  assert.equal(result, 'Evil Kde: http://fake.testAttacker');
+});
+
+test('meetingsFormatSenderAttribution: the real invitation header renders as one line, starting with "From:", containing BOTH the display name and the lowercased address in angle brackets', () => {
+  const result = meetingsFormatSenderAttribution(REAL_TEAMIO_CS_INVITATION_FROM);
+
+  assert.equal(result, 'From: Denisa Čerevková <denisa.cerevkova.somecompanysro.xk29fjq8a1@recruit.teamio.com>');
+  assert.equal(result.indexOf('\n'), -1);
+});
+
+test('meetingsFormatSenderAttribution: a bare-address header (no display name) renders the heading plus the address with NO angle brackets', () => {
+  assert.equal(meetingsFormatSenderAttribution('denisa@recruit.teamio.com'), 'From: denisa@recruit.teamio.com');
+});
+
+test('meetingsFormatSenderAttribution: a header carrying a display name but no parseable address renders the heading plus the name only', () => {
+  assert.equal(meetingsFormatSenderAttribution('Denisa Čerevková <>'), 'From: Denisa Čerevková');
+});
+
+test('meetingsFormatSenderAttribution: null/undefined/empty input returns the empty string', () => {
+  assert.equal(meetingsFormatSenderAttribution(null), '');
+  assert.equal(meetingsFormatSenderAttribution(undefined), '');
+  assert.equal(meetingsFormatSenderAttribution(''), '');
+});
+
+test('meetingsApplySenderAttribution: given a parser-shaped object and the real invitation header, the description\'s FIRST line is the attribution, SECOND line is empty, original description follows verbatim from line 3', () => {
+  const parsedMeeting = {
+    summary: 'Interview with Denisa',
+    description: 'Kdy: Pondělí, 24. srpna 2026\nČas: 13:30, délka 30 minut',
+    location: 'https://teams.example-meet.test/meet/324015781582590',
+    year: 2026,
+    month: 7,
+    day: 24,
+    hour: 13,
+    minute: 30,
+    durationMinutes: 30,
+  };
+
+  const result = meetingsApplySenderAttribution(parsedMeeting, REAL_TEAMIO_CS_INVITATION_FROM);
+  const lines = result.description.split('\n');
+
+  assert.equal(lines[0], 'From: Denisa Čerevková <denisa.cerevkova.somecompanysro.xk29fjq8a1@recruit.teamio.com>');
+  assert.equal(lines[1], '');
+  assert.equal(lines.slice(2).join('\n'), parsedMeeting.description);
+});
+
+test('meetingsApplySenderAttribution: returns a NEW object -- input is unmutated, and every other field survives the copy untouched', () => {
+  const originalDescription = 'Kdy: Pondělí, 24. srpna 2026\nČas: 13:30, délka 30 minut';
+  const parsedMeeting = {
+    summary: 'Interview with Denisa',
+    description: originalDescription,
+    location: 'https://teams.example-meet.test/meet/324015781582590',
+    year: 2026,
+    month: 7,
+    day: 24,
+    hour: 13,
+    minute: 30,
+    durationMinutes: 30,
+  };
+
+  const result = meetingsApplySenderAttribution(parsedMeeting, REAL_TEAMIO_CS_INVITATION_FROM);
+
+  assert.notEqual(result, parsedMeeting);
+  assert.equal(parsedMeeting.description, originalDescription);
+  assert.equal(result.summary, parsedMeeting.summary);
+  assert.equal(result.location, parsedMeeting.location);
+  assert.equal(result.year, parsedMeeting.year);
+  assert.equal(result.month, parsedMeeting.month);
+  assert.equal(result.day, parsedMeeting.day);
+  assert.equal(result.hour, parsedMeeting.hour);
+  assert.equal(result.minute, parsedMeeting.minute);
+  assert.equal(result.durationMinutes, parsedMeeting.durationMinutes);
+});
+
+test('meetingsApplySenderAttribution: an empty/missing From header leaves the description byte-for-byte identical and still returns a usable object', () => {
+  const originalDescription = 'Kdy: Pondělí, 24. srpna 2026\nČas: 13:30, délka 30 minut';
+  const parsedMeeting = { summary: 'Interview with Denisa', description: originalDescription, location: '', year: 2026, month: 7, day: 24, hour: 13, minute: 30, durationMinutes: 30 };
+
+  [null, undefined, ''].forEach(function (emptyFrom) {
+    const result = meetingsApplySenderAttribution(parsedMeeting, emptyFrom);
+    assert.equal(result.description, originalDescription);
+    assert.ok(result);
+    assert.equal(result.summary, parsedMeeting.summary);
+  });
+});
+
+test('THE REGRESSION PROOF (quick-260824-hva): the real Teamio interview invitation\'s description contains BOTH the display name and the address, and the pre-existing Kdy:/Čas:/Kde: lines and Links: block all survive intact', () => {
+  const parsed = parseTeamioMeetingText(REAL_TEAMIO_CS_BODY_TEXT, REAL_TEAMIO_CS_INVITATION_SUBJECT, REAL_TEAMIO_CS_HTML_TEXT);
+  const result = meetingsApplySenderAttribution(parsed, REAL_TEAMIO_CS_INVITATION_FROM);
+
+  assert.ok(result.description.indexOf('Denisa Čerevková') !== -1);
+  assert.ok(result.description.indexOf('denisa.cerevkova.somecompanysro.xk29fjq8a1@recruit.teamio.com') !== -1);
+
+  // pre-existing content survives intact, verbatim
+  assert.ok(result.description.indexOf('Kdy: Pondělí, 24. srpna 2026') !== -1);
+  assert.ok(result.description.indexOf('Čas: 13:30, délka 30 minut') !== -1);
+  assert.ok(result.description.indexOf('Kde: https://teams.example-meet.test/meet/324015781582590?p=mGynz87a3H6pQs6ySL') !== -1);
+  assert.ok(result.description.indexOf('Links:') !== -1);
+
+  // the attribution leads, per D-03 placement
+  const lines = result.description.split('\n');
+  assert.ok(lines[0].indexOf('From:') === 0);
+  assert.equal(lines[1], '');
+});
+
+test('THE GENERALITY PROOF (D-01): a synthetic parsed-meeting object with nothing to do with Teamio gets the attribution applied identically -- the guarantee lives above the parser layer', () => {
+  const futureSystemParsedMeeting = { summary: 'Some other system meeting', description: 'Body line' };
+
+  const result = meetingsApplySenderAttribution(futureSystemParsedMeeting, REAL_TEAMIO_CS_INVITATION_FROM);
+  const lines = result.description.split('\n');
+
+  assert.equal(lines[0], 'From: Denisa Čerevková <denisa.cerevkova.somecompanysro.xk29fjq8a1@recruit.teamio.com>');
+  assert.equal(lines[1], '');
+  assert.equal(lines.slice(2).join('\n'), 'Body line');
 });

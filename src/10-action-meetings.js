@@ -154,6 +154,127 @@ function meetingsDomainMatchesPattern(domain, domainPattern) {
   return normalizedDomain === normalizedPattern;
 }
 
+// MEETINGS_SENDER_ATTRIBUTION_HEADING (quick-260824-hva, D-04) — the
+// language-neutral literal heading meetingsFormatSenderAttribution renders.
+// Precedent: this exact description already emits the English `Links:`
+// heading (see parseTeamioMeetingText's own description-assembly doc) into
+// an otherwise-Czech body, so a second English literal here is consistent
+// rather than novel.
+const MEETINGS_SENDER_ATTRIBUTION_HEADING = 'From:';
+
+/**
+ * meetingsExtractSenderDisplayName — (quick-260824-hva, D-06) returns the
+ * SANITIZED display-name portion of a Gmail `From` header, or the empty
+ * string. The text preceding the first `<` is the display name; a header
+ * with no `<` at all has no display name, so this returns '' rather than
+ * treating the whole header as a name. A single leading and trailing
+ * double-quote is stripped when both are present (the common
+ * `"Display Name" <addr>` shape). SANITIZATION IS A SECURITY CONTROL, NOT
+ * COSMETICS (T-hva-02): the From header's display name is
+ * attacker-controllable and unauthenticated (see this file's own threat
+ * register), so every run of CR/LF/tab collapses to a single space and
+ * every `<`/`>` character is removed before the result is used anywhere —
+ * without this, a hostile display name could forge an extra label line
+ * inside a Calendar event description (CR/LF injection) or smuggle
+ * angle-bracket markup into it. Pure, no GAS globals. Never throws: a
+ * null/undefined/empty input returns ''.
+ */
+function meetingsExtractSenderDisplayName(fromHeader) {
+  if (!fromHeader) {
+    return '';
+  }
+
+  const str = String(fromHeader);
+  const angleIndex = str.indexOf('<');
+  if (angleIndex === -1) {
+    return '';
+  }
+
+  let namePart = str.slice(0, angleIndex).trim();
+  if (namePart.length >= 2 && namePart.charAt(0) === '"' && namePart.charAt(namePart.length - 1) === '"') {
+    namePart = namePart.slice(1, -1);
+  }
+
+  return namePart
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/[<>]/g, '')
+    .trim();
+}
+
+/**
+ * meetingsFormatSenderAttribution — (quick-260824-hva, D-01, D-03, D-04,
+ * D-05) builds the ONE-LINE sender attribution rendered as the description's
+ * first line. Resolves the address via the EXISTING
+ * meetingsExtractEmailAddress (D-05 — deliberately NOT a second extractor,
+ * so the description's address and buildMeetingIdentifier's dedup address
+ * can never disagree) and the sanitized name via
+ * meetingsExtractSenderDisplayName. With both present: heading, space, name,
+ * space, address wrapped in angle brackets. With an address only: heading,
+ * space, bare address (no angle brackets — there is no name to disambiguate
+ * from). With a name only: heading, space, name. With neither: the empty
+ * string (the caller treats this as "nothing to attribute", D-07). Heading
+ * is the language-neutral literal `From:` (D-04) — see
+ * MEETINGS_SENDER_ATTRIBUTION_HEADING's own doc for the `Links:` precedent.
+ * Pure, no GAS globals. Never throws.
+ */
+function meetingsFormatSenderAttribution(fromHeader) {
+  const name = meetingsExtractSenderDisplayName(fromHeader);
+  const address = meetingsExtractEmailAddress(fromHeader);
+
+  if (name && address) {
+    return MEETINGS_SENDER_ATTRIBUTION_HEADING + ' ' + name + ' <' + address + '>';
+  }
+  if (address) {
+    return MEETINGS_SENDER_ATTRIBUTION_HEADING + ' ' + address;
+  }
+  if (name) {
+    return MEETINGS_SENDER_ATTRIBUTION_HEADING + ' ' + name;
+  }
+  return '';
+}
+
+/**
+ * meetingsApplySenderAttribution — (quick-260824-hva, D-01, D-02, D-03) THE
+ * GENERAL GUARANTEE: every calendar event MEETINGS_ACTION creates identifies
+ * its sender, unconditionally, for every registered parser present and
+ * future — this is what makes the fix general rather than a Teamio patch.
+ * Returns a NEW shallow copy of `parsedMeeting` (`Object.assign({},
+ * parsedMeeting, { description: ... })` — the Apps Script V8 runtime
+ * supports it and this codebase already uses it elsewhere) whose
+ * `description` is the attribution, ONE blank line, then the original
+ * description verbatim (D-03 placement — identifying info leads, so the
+ * variable-length `Links:` block at the bottom can never push it out of
+ * view). When the attribution is empty (D-07, e.g. a falsy/unparseable
+ * `fromHeader`) returns a copy whose description is left byte-for-byte
+ * untouched — there is nothing to state, so no bare `From:` with no value is
+ * ever rendered. When the original description is empty, the attribution
+ * alone is the description (no trailing blank line). A falsy `parsedMeeting`
+ * is returned as-is rather than throwing.
+ *
+ * DELIBERATELY PARSER-AGNOSTIC: this function only ever reads/writes
+ * `description` on whatever shape `parsedMeeting` happens to be — it does
+ * not know or care whether that shape came from parseTeamioMeetingText or
+ * any future meeting system's own parser (D-01). That is precisely what
+ * lets processMeetingFromMessageBody apply this ONE function to every
+ * registered parser's output at its single choke point, with zero
+ * per-parser change. Pure, no GAS globals. Never throws.
+ */
+function meetingsApplySenderAttribution(parsedMeeting, fromHeader) {
+  if (!parsedMeeting) {
+    return parsedMeeting;
+  }
+
+  const attribution = meetingsFormatSenderAttribution(fromHeader);
+  if (!attribution) {
+    return Object.assign({}, parsedMeeting);
+  }
+
+  const originalDescription = parsedMeeting.description || '';
+  const description = originalDescription ? attribution + '\n\n' + originalDescription : attribution;
+
+  return Object.assign({}, parsedMeeting, { description: description });
+}
+
 /**
  * resolveMeetingSystem — finds the FIRST entry in `meetingSystems` (list
  * order) whose `domainPattern` matches `fromHeader`'s sender domain (via
@@ -1205,12 +1326,22 @@ function createMeetingCalendarEvent(parsedMeeting, calendarId, durationMinutes, 
  * identifier. GAS-only (GmailMessage/CalendarApp/Calendar globals) — not
  * unit-tested, proven only by the live checkpoint; the pure logic it
  * depends on (the parser, buildMeetingIdentifier) IS fully unit-tested.
+ *
+ * SENDER ATTRIBUTION (quick-260824-hva, D-01): immediately after the parser
+ * call, the parsed meeting is passed through meetingsApplySenderAttribution
+ * before anything downstream ever sees it. This is THE single choke point
+ * every meeting event travels — present and future — regardless of which
+ * parser produced it, which is what makes the "every event identifies its
+ * sender" guarantee hold unconditionally rather than per-parser. See
+ * meetingsApplySenderAttribution's own class-level doc for the full
+ * rationale; parseTeamioMeetingText's signature and body are untouched by
+ * this wiring.
  */
 function processMeetingFromMessageBody(message, system, parser) {
   const bodyText = message.getPlainBody();
   const subject = message.getSubject();
   const htmlBodyText = message.getBody();
-  const parsedMeeting = parser(bodyText, subject, htmlBodyText);
+  const parsedMeeting = meetingsApplySenderAttribution(parser(bodyText, subject, htmlBodyText), message.getFrom());
 
   const calendarId = resolveMeetingsCalendarId(system, CONFIG.calendarId);
   const senderEmail = meetingsExtractEmailAddress(message.getFrom());
@@ -1298,7 +1429,10 @@ const MEETINGS_ACTION = {
 // parseTeamioMeetingText, MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN,
 // meetingsIsIcsAttachment, meetingsMessageHasIcsAttachment,
 // findMeetingProcessingJobs, MEETINGS_FALLBACK_SUMMARY,
-// MEETINGS_MAX_DESCRIPTION_LINKS) and MEETINGS_ACTION (action registry).
+// MEETINGS_MAX_DESCRIPTION_LINKS, meetingsExtractSenderDisplayName,
+// meetingsFormatSenderAttribution, meetingsApplySenderAttribution
+// (quick-260824-hva NEW — the pipeline-level sender-attribution guarantee))
+// and MEETINGS_ACTION (action registry).
 // Deliberately exports NO bare `addMinutesToWallClockComponents` or
 // `formatWallClockComponentsIso` key (D-10 collision guard — see this
 // file's class-level "GLOBALLY-UNIQUE NAMING WARNING"; only the namespaced
@@ -1336,6 +1470,9 @@ if (typeof module !== 'undefined' && module.exports) {
     meetingsIsIcsAttachment: meetingsIsIcsAttachment,
     meetingsMessageHasIcsAttachment: meetingsMessageHasIcsAttachment,
     findMeetingProcessingJobs: findMeetingProcessingJobs,
+    meetingsExtractSenderDisplayName: meetingsExtractSenderDisplayName,
+    meetingsFormatSenderAttribution: meetingsFormatSenderAttribution,
+    meetingsApplySenderAttribution: meetingsApplySenderAttribution,
     MEETINGS_ACTION: MEETINGS_ACTION,
   };
 }
