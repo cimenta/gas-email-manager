@@ -53,6 +53,9 @@ const {
   findMeetingProcessingJobs,
   MEETINGS_ACTION,
   MEETINGS_FALLBACK_SUMMARY,
+  meetingsSelectLanguagePack,
+  teamioTextLooksLikeMeetingInvitation,
+  MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN,
 } = require('../src/10-action-meetings.js');
 const { MEETINGS_ACTION_CONFIG } = require('../src/10-action-cfg-meetings.js');
 const ticketingModule = require('../src/07-action-ticketing-portals.js');
@@ -122,6 +125,50 @@ const EQUIVALENT_EN_BODY_TEXT =
   'Where: https://teams.example-meet.test/324015781582590?p=mGynz87a3H6pQs6ySL\n' +
   '\n' +
   'Go to interview confirmation: https://recruit.example-teamio.test/confirm/abc123\n';
+
+// REAL_TEAMIO_CS_REJECTION_BODY_TEXT (debug teamio-non-invite-error, NEW):
+// the text/plain part of a REAL owner-supplied Teamio email that is NOT an
+// invitation -- a candidate-rejection notice sent from the very same
+// `*.teamio.com` domain the shipped default config matches. Verbatim from
+// the real .eml (`Výběrové řízení na pozici AI Implementation Specialist –
+// LLM, RAG & Agents.eml`, 2026-08-24) except the recruiter's direct phone
+// and email, which are fictionalized per this file's fixture convention.
+//
+// THE LOAD-BEARING PROPERTY of this fixture: it contains NONE of the six
+// label words (`Kdy:`/`Čas:`/`Kde:`/`When:`/`Time:`/`Where:`) in either MIME
+// part -- verified against the real .eml. It is a plain prose letter. This
+// is what makes it a true member of the "matched sender, no invitation
+// structure" class, which had ZERO coverage before this session: every prior
+// findMeetingProcessingJobs test below holds an INVITATION body constant
+// while varying only the sender and the attachments, so the gate's total
+// blindness to body content was structurally invisible to the suite.
+const REAL_TEAMIO_CS_REJECTION_BODY_TEXT =
+  'Vážený pane Šimčíku,\n' +
+  '\n' +
+  'děkujeme Vám za zájem pracovat v naší společnosti na pozici AI Implementation Specialist – LLM, RAG & Agents.\n' +
+  'Velmi si toho vážíme.\n' +
+  '\n' +
+  'Vaše zkušenosti a přístup nás zaujaly, nicméně jsme se rozhodli dát přednost kandidátovi, který lépe odpovídá specifickému profilu, který pro tuto roli aktuálně hledáme.\n' +
+  '\n' +
+  'Pevně věříme, že najdete příležitost, která bude odpovídat Vašim kvalitám a profesnímu zaměření, a přejeme Vám hodně úspěchů v dalším kariérním směřování.\n' +
+  '\n' +
+  'S pozdravem,\n' +
+  '\n' +
+  'JUDr. Simona Pažinková\n' +
+  'HR Manager\n' +
+  '+420 000 000 000\n' +
+  'simona.pazinkova@example-prochazkapartners.test\n' +
+  '\n' +
+  'Prochazka & Partners\n' +
+  'Václavské náměstí 841/3, 110 00 Praha 1\n';
+
+// The real rejection .eml's From header shape: Teamio randomizes the LOCAL
+// PART per recipient (the opaque `uaktdd3ygto` token), which is exactly why
+// no narrower exact-address config could ever separate this email from a
+// genuine invitation -- both arrive from the same domain with unpredictable
+// local parts. Only body content can distinguish them.
+const REAL_TEAMIO_REJECTION_FROM =
+  'Simona Pažinková <simona.pazinkova.prochazkapartnerssro.uaktdd3ygto@recruit.teamio.com>';
 
 function fakeMeetingAttachment(name, contentType) {
   return {
@@ -643,4 +690,196 @@ test('meetingsExtractEmailAddress: never throws on null/undefined/empty input, r
   assert.equal(meetingsExtractEmailAddress(null), '');
   assert.equal(meetingsExtractEmailAddress(undefined), '');
   assert.equal(meetingsExtractEmailAddress(''), '');
+});
+
+// --- INVITATION-STRUCTURE GATE (debug teamio-non-invite-error) ---------------
+//
+// THE BUG THIS SECTION LOCKS OUT: findMeetingProcessingJobs used to admit a
+// message as a meeting-processing job on ENVELOPE EVIDENCE ALONE -- sender
+// domain matches a configured system, a parser is registered for that
+// domainPattern, and no `.ics` attachment is present. It never read the body.
+// The system's ONLY invitation-shaped-content check lived DOWNSTREAM inside
+// parseTeamioMeetingText's language-pack selection, whose sole way of saying
+// "this is not an invitation" was to THROW. Because `*.teamio.com` is a
+// multi-purpose ATS domain that also sends rejections and status updates, any
+// such email was admitted past the gate and then necessarily threw, reaching
+// the owner as an action-failure notification (real incident, 2026-08-24).
+//
+// The fix adds the missing predicate to the SAME resolver appliesTo and run
+// both use, so a body with no invitation structure means the action does not
+// apply AT ALL -- no job, no thread claimed, no throw.
+//
+// ORACLE TYPE: specified (an explicit job-count/appliesTo contract), not
+// implicit crash-freedom -- asserting merely "run does not throw" would be
+// satisfied by an action that still wrongly claims and labels the thread.
+
+test('findMeetingProcessingJobs: THE REGRESSION -- the real Teamio REJECTION email (matching domain, no .ics, NO invitation structure) yields ZERO jobs', () => {
+  const systems = [{ domainPattern: '*.teamio.com', calendarId: null }];
+  const message = fakeMeetingMessage(
+    REAL_TEAMIO_REJECTION_FROM,
+    REAL_TEAMIO_CS_REJECTION_BODY_TEXT,
+    'Výběrové řízení na pozici AI Implementation Specialist – LLM, RAG & Agents',
+    []
+  );
+
+  assert.equal(findMeetingProcessingJobs([message], systems).length, 0);
+});
+
+test('MEETINGS_ACTION.appliesTo: returns LITERAL false for the real Teamio rejection thread -- the action must not claim a thread it cannot process', () => {
+  const rejectionThread = {
+    getMessages: function () {
+      return [
+        fakeMeetingMessage(REAL_TEAMIO_REJECTION_FROM, REAL_TEAMIO_CS_REJECTION_BODY_TEXT, 'Výběrové řízení', []),
+      ];
+    },
+  };
+
+  assert.equal(MEETINGS_ACTION.appliesTo(rejectionThread), false);
+});
+
+test('MEETINGS_ACTION.run: the real Teamio rejection thread is a silent no-op -- never throws (this exact throw was the reported failure notification)', () => {
+  const rejectionThread = {
+    getMessages: function () {
+      return [
+        fakeMeetingMessage(REAL_TEAMIO_REJECTION_FROM, REAL_TEAMIO_CS_REJECTION_BODY_TEXT, 'Výběrové řízení', []),
+      ];
+    },
+  };
+
+  assert.doesNotThrow(function () {
+    MEETINGS_ACTION.run(rejectionThread);
+  });
+});
+
+test('findMeetingProcessingJobs: a genuine INVITATION from the same domain still yields exactly one job -- the new gate must not break the happy path', () => {
+  const systems = [{ domainPattern: '*.teamio.com', calendarId: null }];
+  const invitation = fakeMeetingMessage(REAL_TEAMIO_REJECTION_FROM, REAL_TEAMIO_CS_BODY_TEXT, 'Interview', []);
+
+  assert.equal(findMeetingProcessingJobs([invitation], systems).length, 1);
+});
+
+test('findMeetingProcessingJobs: mixed thread -- one invitation plus one rejection from the same sender yields exactly ONE job, for the invitation only', () => {
+  const systems = [{ domainPattern: '*.teamio.com', calendarId: null }];
+  const invitation = fakeMeetingMessage(REAL_TEAMIO_REJECTION_FROM, REAL_TEAMIO_CS_BODY_TEXT, 'Interview', []);
+  const rejection = fakeMeetingMessage(REAL_TEAMIO_REJECTION_FROM, REAL_TEAMIO_CS_REJECTION_BODY_TEXT, 'Rejection', []);
+
+  const jobs = findMeetingProcessingJobs([invitation, rejection], systems);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].message, invitation);
+});
+
+test('findMeetingProcessingJobs: FAIL-CLOSED -- a system whose domainPattern has a parser but NO registered detector yields zero jobs', () => {
+  const patternWithParserButNoDetector = '*.detectorless-fixture.test';
+  MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN[patternWithParserButNoDetector] = parseTeamioMeetingText;
+
+  try {
+    const systems = [{ domainPattern: patternWithParserButNoDetector, calendarId: null }];
+    const message = fakeMeetingMessage('a@sub.detectorless-fixture.test', REAL_TEAMIO_CS_BODY_TEXT, 'Interview', []);
+
+    assert.equal(findMeetingProcessingJobs([message], systems).length, 0);
+  } finally {
+    delete MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN[patternWithParserButNoDetector];
+  }
+});
+
+// --- the detector predicate itself -------------------------------------------
+
+test('teamioTextLooksLikeMeetingInvitation: true for the real Czech invitation body and for the English equivalent', () => {
+  assert.equal(teamioTextLooksLikeMeetingInvitation(REAL_TEAMIO_CS_BODY_TEXT), true);
+  assert.equal(teamioTextLooksLikeMeetingInvitation(EQUIVALENT_EN_BODY_TEXT), true);
+});
+
+test('teamioTextLooksLikeMeetingInvitation: false for the real Teamio rejection body', () => {
+  assert.equal(teamioTextLooksLikeMeetingInvitation(REAL_TEAMIO_CS_REJECTION_BODY_TEXT), false);
+});
+
+test('teamioTextLooksLikeMeetingInvitation: BOUNDARY -- requires BOTH a when-label and a time-label, exactly mirroring the parser pack-selection rule', () => {
+  // when only
+  assert.equal(teamioTextLooksLikeMeetingInvitation('Kdy: Pondělí, 24. srpna 2026\n'), false);
+  // time only
+  assert.equal(teamioTextLooksLikeMeetingInvitation('Čas: 13:30, délka 30 minut\n'), false);
+  // where only -- a where-label alone is never sufficient
+  assert.equal(teamioTextLooksLikeMeetingInvitation('Kde: https://example.test/meet\n'), false);
+  // both -> true, with no where-label at all (a meeting with no stated place is still a meeting)
+  assert.equal(teamioTextLooksLikeMeetingInvitation('Kdy: Pondělí, 24. srpna 2026\nČas: 13:30\n'), true);
+  // cross-language pairing must NOT satisfy a single pack
+  assert.equal(teamioTextLooksLikeMeetingInvitation('Kdy: Monday\nTime: 13:30\n'), false);
+});
+
+test('teamioTextLooksLikeMeetingInvitation: never throws on empty/null/undefined/non-string input, returns false', () => {
+  assert.equal(teamioTextLooksLikeMeetingInvitation(''), false);
+  assert.equal(teamioTextLooksLikeMeetingInvitation(null), false);
+  assert.equal(teamioTextLooksLikeMeetingInvitation(undefined), false);
+  assert.equal(teamioTextLooksLikeMeetingInvitation(12345), false);
+});
+
+test('MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN: keyed by the SAME domainPattern string as the parser registry, so every shipped parser has a detector', () => {
+  const parserPatterns = Object.keys(MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN);
+  const detectorPatterns = Object.keys(MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN);
+
+  assert.deepEqual(parserPatterns.sort(), detectorPatterns.sort());
+});
+
+// --- detector/parser fidelity: the property that makes the gate safe ---------
+
+test('FIDELITY PROPERTY: the detector returns false for exactly the bodies on which the parser throws its no-pack-match error, and true otherwise', () => {
+  const bodies = [
+    REAL_TEAMIO_CS_BODY_TEXT,
+    EQUIVALENT_EN_BODY_TEXT,
+    REAL_TEAMIO_CS_REJECTION_BODY_TEXT,
+    '',
+    'Kdy: Pondělí, 24. srpna 2026\n',
+    'Čas: 13:30\n',
+    'nothing structured here at all',
+    'Kdy: Pondělí, 24. srpna 2026\nČas: 13:30\n',
+  ];
+
+  bodies.forEach(function (body) {
+    const detected = teamioTextLooksLikeMeetingInvitation(body);
+
+    let threwNoPackMatch = false;
+    try {
+      parseTeamioMeetingText(body, 'Subject');
+    } catch (err) {
+      threwNoPackMatch = /no registered language pack matched/.test(err.message);
+    }
+
+    // detector false  <=>  parser raises the no-pack-match error
+    assert.equal(
+      detected,
+      !threwNoPackMatch,
+      'detector/parser disagreed on body: ' + JSON.stringify(body.slice(0, 60))
+    );
+  });
+});
+
+test('meetingsSelectLanguagePack: returns the matched pack plus its label lines, or null -- the single shared source of truth both the detector and the parser consult', () => {
+  const cs = meetingsSelectLanguagePack(REAL_TEAMIO_CS_BODY_TEXT);
+  assert.ok(cs);
+  assert.equal(cs.whenMatch.value, 'Pondělí, 24. srpna 2026');
+  assert.equal(cs.timeMatch.value, '13:30, délka 30 minut');
+  assert.ok(cs.whereMatch);
+
+  const en = meetingsSelectLanguagePack(EQUIVALENT_EN_BODY_TEXT);
+  assert.ok(en);
+  assert.equal(en.whenMatch.value, 'Monday, 24 August 2026');
+
+  assert.equal(meetingsSelectLanguagePack(REAL_TEAMIO_CS_REJECTION_BODY_TEXT), null);
+  assert.equal(meetingsSelectLanguagePack(''), null);
+});
+
+test('PARSER CONTRACT UNCHANGED: a structure-PRESENT but value-unparseable body still THROWS -- the gate must not silence genuine parse bugs', () => {
+  // Labels present (so the detector admits it), month name is nonsense.
+  const structuredButBroken = 'Kdy: Pondělí, 24. nonexistentmonth 2026\nČas: 13:30\n';
+
+  assert.equal(teamioTextLooksLikeMeetingInvitation(structuredButBroken), true);
+  assert.throws(
+    function () {
+      parseTeamioMeetingText(structuredButBroken, 'Subject');
+    },
+    function (err) {
+      return /Unrecognized meeting invitation date/.test(err.message);
+    }
+  );
 });

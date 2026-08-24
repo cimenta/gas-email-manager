@@ -344,12 +344,18 @@ that case: it only ever claims a message that has NO `.ics` attachment at
 all (the ICS action already imports those correctly on its own), matched to
 a configured "system" by the sender's email domain.
 
-**Detection — sender domain, not a fixed template:** each configured system
-is a `{ domainPattern, calendarId }` entry. `domainPattern` supports a
-`*.`-prefixed subdomain wildcard (`*.teamio.com` matches
-`recruit.teamio.com`, `notify.teamio.com`, and bare `teamio.com` itself) or
-an exact domain with no wildcard. Adding a new system needs one new config
-entry plus one new parser function registered by that same domain-pattern
+**Detection — sender domain AND invitation-shaped body, not sender alone:**
+each configured system is a `{ domainPattern, calendarId }` entry.
+`domainPattern` supports a `*.`-prefixed subdomain wildcard (`*.teamio.com`
+matches `recruit.teamio.com`, `notify.teamio.com`, and bare `teamio.com`
+itself) or an exact domain with no wildcard. A domain match alone is not
+enough to claim a message: the body must also carry that system's
+invitation label pairs (e.g. Teamio's `Kdy:`/`Čas:` or `When:`/`Time:`).
+Sender-matched mail without that structure — a rejection notice, a status
+update, anything that isn't actually an invitation — is left alone
+entirely, not claimed and not labeled as failed. Adding a new system needs
+one new config entry plus one new parser function *and* a matching
+invitation-detector function, both registered by that same domain-pattern
 string — the matching logic itself never changes.
 
 **Teamio** (`*.teamio.com`) is the first system:

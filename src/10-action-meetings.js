@@ -19,8 +19,12 @@
  * a registry object keyed by the SAME `domainPattern` string used in the
  * config entry — the identical pattern-is-the-registry-key convention
  * TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL already establishes. Adding a
- * further system needs ONE new config entry plus ONE new parser function
- * registered here — no change to the matching logic itself. Both language
+ * further system needs ONE new config entry, ONE new parser function
+ * registered in MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN, and ONE new detector
+ * registered in MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN (debug
+ * teamio-non-invite-error — a sender match alone is NOT evidence that an email
+ * is an invitation; see that registry's own class-level doc) — no change to the
+ * matching logic itself. Both language
  * packs (Czech and English) also live in this one file (D-11) — no
  * `10-lang-*.js` files: src/06-lang-*.js are documented as deliberately
  * booking-action-only, and this action's pluggable-systems architecture
@@ -624,6 +628,123 @@ const MEETINGS_LANGUAGE_PACKS = {
 const MEETINGS_FALLBACK_SUMMARY = 'Meeting invitation';
 
 /**
+ * meetingsDescribeSearchedLabelPairs — the `when:time` label-pair descriptor
+ * for every registered language pack, in registration order (e.g.
+ * `['Kdy:Čas', 'When:Time']`). Extracted so parseTeamioMeetingText's
+ * no-pack-match error message can still name exactly what was searched, now
+ * that the search itself lives in meetingsSelectLanguagePack below. Pure.
+ */
+function meetingsDescribeSearchedLabelPairs() {
+  const packKeys = Object.keys(MEETINGS_LANGUAGE_PACKS);
+  const pairs = [];
+
+  for (let i = 0; i < packKeys.length; i++) {
+    const pack = MEETINGS_LANGUAGE_PACKS[packKeys[i]];
+    pairs.push(pack.whenLabels.join('/') + ':' + pack.timeLabels.join('/'));
+  }
+
+  return pairs;
+}
+
+/**
+ * meetingsSelectLanguagePack — (debug teamio-non-invite-error, NEW) the
+ * SINGLE SHARED SOURCE OF TRUTH for "does this body carry meeting-invitation
+ * structure, and if so under which language pack?". Extracted verbatim from
+ * what used to be parseTeamioMeetingText's own inline pack-selection loop, so
+ * that the same decision can now ALSO be asked BEFORE committing to a parse
+ * (see teamioTextLooksLikeMeetingInvitation and findMeetingProcessingJobs).
+ *
+ * WHY THIS EXISTS — the bug it fixes: before this, the only invitation-shaped-
+ * content check in the whole action lived DOWNSTREAM, inside the parser, and
+ * its only way of saying "this is not an invitation" was to THROW. Meanwhile
+ * findMeetingProcessingJobs admitted messages on ENVELOPE EVIDENCE ALONE
+ * (sender domain + registered parser + no `.ics`), never reading the body.
+ * Since `*.teamio.com` is a multi-purpose ATS domain that also sends
+ * rejections and status updates, every such email was admitted past the gate
+ * and then necessarily threw, surfacing to the owner as an action-failure
+ * notification (real incident, 2026-08-24: a candidate-rejection notice).
+ *
+ * THE FIDELITY PROPERTY that makes the new gate safe: because the detector and
+ * the parser now consult THIS ONE function, `meetingsSelectLanguagePack(text)
+ * === null` holds for EXACTLY the bodies on which the parser would have raised
+ * its no-pack-match error — never a wider or narrower set. The two can never
+ * drift apart, which a second, independently-written "looks like an invitation"
+ * heuristic would eventually have done. Locked by the FIDELITY PROPERTY test in
+ * test/meetings.test.js.
+ *
+ * Selection rule (unchanged): the FIRST pack in MEETINGS_LANGUAGE_PACKS order
+ * (cs, then en) for which BOTH a when-label line AND a time-label line are
+ * found. A where-label line is looked up for the winning pack only, and is
+ * OPTIONAL — a meeting with no stated place is a real meeting. Labels from two
+ * different packs never combine to satisfy one pack.
+ *
+ * Input handling mirrors the parser's: `String(bodyText || '')`, U+00A0
+ * normalized to a regular space, split on `\r\n` / bare `\r` / bare `\n`, each
+ * line trimmed. Returns `{ pack, whenMatch, timeMatch, whereMatch }` (the
+ * matches being meetingsFindLabelLine's own `{ label, value, lineText }`
+ * shape; `whereMatch` may be `null`), or `null` when no pack matched. Pure, no
+ * GAS globals. NEVER THROWS — a null/undefined/empty/non-string input simply
+ * yields `null`, which is what lets it be called from the job-resolution gate.
+ */
+function meetingsSelectLanguagePack(bodyText) {
+  const normalizedText = String(bodyText || '').replace(/\u00A0/g, ' ');
+  const lines = normalizedText.split(/\r\n|\r|\n/).map(function (line) {
+    return line.trim();
+  });
+
+  const packKeys = Object.keys(MEETINGS_LANGUAGE_PACKS);
+  for (let i = 0; i < packKeys.length; i++) {
+    const pack = MEETINGS_LANGUAGE_PACKS[packKeys[i]];
+
+    const foundWhen = meetingsFindLabelLine(lines, pack.whenLabels);
+    const foundTime = meetingsFindLabelLine(lines, pack.timeLabels);
+
+    if (foundWhen && foundTime) {
+      return {
+        pack: pack,
+        whenMatch: foundWhen,
+        timeMatch: foundTime,
+        whereMatch: meetingsFindLabelLine(lines, pack.whereLabels),
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * teamioTextLooksLikeMeetingInvitation — (debug teamio-non-invite-error, NEW)
+ * Teamio's INVITATION DETECTOR: the cheap, never-throwing predicate
+ * findMeetingProcessingJobs consults to decide whether a `*.teamio.com`
+ * message is a meeting invitation at all, BEFORE any job is created for it.
+ *
+ * Deliberately delegates the entire decision to meetingsSelectLanguagePack —
+ * see that function's own FIDELITY PROPERTY paragraph for why this must not be
+ * re-implemented as an independent heuristic.
+ *
+ * DETECTS ON THE PLAIN-TEXT BODY ONLY, which is sound rather than a shortcut:
+ * parseTeamioMeetingText REQUIRES the when/time pair in the plain-text body
+ * (the HTML body is consulted only for the where VALUE, via
+ * meetingsExtractHtmlLabelValue), so a message whose plain text lacks the pair
+ * could not be parsed even if its HTML carried it.
+ *
+ * ACCEPTED LIMITATION, recorded deliberately: a GENUINE invitation written in
+ * an unsupported language is indistinguishable from a non-invitation by this
+ * predicate, and is now silently skipped rather than reported. The cost
+ * asymmetry decides it — skipping costs one missed automation while the owner
+ * still receives the email and can act manually, whereas throwing on routine
+ * ATS mail floods the owner with failure notifications and thereby trains them
+ * to ignore the very channel that reports real failures. Adding a language pack
+ * to MEETINGS_LANGUAGE_PACKS extends detection and parsing together, since both
+ * read the same registry.
+ *
+ * Pure, no GAS globals. Never throws.
+ */
+function teamioTextLooksLikeMeetingInvitation(bodyText) {
+  return meetingsSelectLanguagePack(bodyText) !== null;
+}
+
+/**
  * parseTeamioMeetingText — the Teamio-specific (`*.teamio.com`) meeting-body
  * parser (D-05, D-08, D-09). Real reference body this parser was built
  * from (Czech, opaque tracking tokens and the real Teams meeting ID
@@ -723,42 +844,32 @@ const MEETINGS_FALLBACK_SUMMARY = 'Meeting invitation';
  */
 function parseTeamioMeetingText(bodyText, subject, htmlBodyText) {
   const rawText = String(bodyText || '');
-  const normalizedText = rawText.replace(/\u00A0/g, ' ');
-  const lines = normalizedText.split(/\r\n|\r|\n/).map(function (line) {
-    return line.trim();
-  });
 
-  let selectedPack = null;
-  let whenMatch = null;
-  let timeMatch = null;
-  let whereMatch = null;
-  const searchedLabelPairs = [];
+  // Pack selection is delegated to meetingsSelectLanguagePack (see its own
+  // class-level doc): the SAME function findMeetingProcessingJobs's invitation
+  // detector consults, so the gate and the parser can never disagree about
+  // what counts as invitation-shaped text.
+  const selection = meetingsSelectLanguagePack(rawText);
 
-  const packKeys = Object.keys(MEETINGS_LANGUAGE_PACKS);
-  for (let i = 0; i < packKeys.length; i++) {
-    const pack = MEETINGS_LANGUAGE_PACKS[packKeys[i]];
-    searchedLabelPairs.push(pack.whenLabels.join('/') + ':' + pack.timeLabels.join('/'));
-
-    const foundWhen = meetingsFindLabelLine(lines, pack.whenLabels);
-    const foundTime = meetingsFindLabelLine(lines, pack.timeLabels);
-
-    if (foundWhen && foundTime) {
-      selectedPack = pack;
-      whenMatch = foundWhen;
-      timeMatch = foundTime;
-      whereMatch = meetingsFindLabelLine(lines, pack.whereLabels);
-      break;
-    }
-  }
-
-  if (!selectedPack) {
+  // NOTE (debug teamio-non-invite-error): this throw is now a DEFENSIVE
+  // INVARIANT, not a routine outcome. findMeetingProcessingJobs refuses to
+  // create a job at all for a body this function could not select a pack for,
+  // so reaching here means the gate and the parser disagreed \u2014 a real bug
+  // worth surfacing loudly. Non-invitation emails from a matched sender domain
+  // (the 2026-08-24 Teamio rejection-notice incident) no longer arrive here.
+  if (!selection) {
     throw new Error(
       'Unrecognized meeting invitation: no registered language pack matched (searched label pairs: ' +
-        searchedLabelPairs.join(', ') +
+        meetingsDescribeSearchedLabelPairs().join(', ') +
         '). Full extracted text:\n' +
         rawText
     );
   }
+
+  const selectedPack = selection.pack;
+  const whenMatch = selection.whenMatch;
+  const timeMatch = selection.timeMatch;
+  const whereMatch = selection.whereMatch;
 
   let dateComponents;
   try {
@@ -841,10 +952,45 @@ function parseTeamioMeetingText(bodyText, subject, htmlBodyText) {
  * system (resolveMeetingSystem still finds it) but produces NO processing
  * job (findMeetingProcessingJobs below requires a registered parser too).
  * Adding a brand-new system needs a parser function added here, in
- * addition to the config entry.
+ * addition to the config entry AND a detector in the sibling
+ * MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN registry below — the same
+ * fail-closed "no registration, no job" rule applies to both registries.
  */
 const MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN = {
   '*.teamio.com': parseTeamioMeetingText,
+};
+
+/**
+ * MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN — (debug
+ * teamio-non-invite-error, NEW) the companion registry to
+ * MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN, keyed by the SAME `domainPattern`
+ * string, mapping a system to its INVITATION DETECTOR: a pure, never-throwing
+ * `(plainBodyText) => boolean` predicate answering "is this message a meeting
+ * invitation at all?" WITHOUT attempting a parse.
+ *
+ * WHY A SECOND REGISTRY EXISTS. Matching a sender is not the same claim as
+ * "this email is a meeting invitation", and before this fix the action
+ * conflated the two: findMeetingProcessingJobs admitted a message on envelope
+ * evidence alone, and the parser — the only thing that ever looked at the body
+ * — could say "not an invitation" only by THROWING. That is fine for a system
+ * whose sender address is transactional-only (the precedent this action
+ * inherited from TICKETING_PORTALS_ACTION, which matches EXACT addresses), but
+ * this action is the first to match a whole DOMAIN (D-02), and `*.teamio.com`
+ * is an ATS platform that sends rejections and status updates from the same
+ * domain as its invitations. The envelope simply cannot carry the distinction,
+ * so the content must — before any job is created.
+ *
+ * FAIL-CLOSED BY DESIGN: findMeetingProcessingJobs requires a REGISTERED
+ * detector, exactly as it already requires a registered parser. A system with
+ * a parser but no detector produces NO jobs rather than falling back to the old
+ * envelope-only behaviour. Defaulting the other way ("no detector means admit
+ * everything") is precisely the shape of the bug this fixes, and would silently
+ * reintroduce it for the next system added. The cost is that adding a system
+ * now needs a config entry + a parser + a detector; the registry-key equality
+ * test in test/meetings.test.js enforces that the two registries stay in step.
+ */
+const MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN = {
+  '*.teamio.com': teamioTextLooksLikeMeetingInvitation,
 };
 
 /**
@@ -889,12 +1035,26 @@ function meetingsMessageHasIcsAttachment(message) {
  * returns one job `{ message, system, parser }` per message that (a)
  * resolves to a configured system (resolveMeetingSystem), (b) has a
  * registered parser for that system's `domainPattern`
- * (MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN), AND (c) carries NO `.ics`
- * attachment (D-04, meetingsMessageHasIcsAttachment). Every other message
+ * (MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN), (c) carries NO `.ics`
+ * attachment (D-04, meetingsMessageHasIcsAttachment), AND (d) — debug
+ * teamio-non-invite-error, NEW — has a registered INVITATION DETECTOR for that
+ * `domainPattern` (MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN) which
+ * returns true for the message's PLAIN-TEXT BODY. Every other message
  * contributes nothing. Pure in the sense that matters here — it touches no
  * GAS global, only methods on the passed-in message objects, so it is
  * fully unit-testable under Node with fake message/attachment objects.
  * Never throws.
+ *
+ * CONDITION (d) IS THE FIX for the 2026-08-24 incident: conditions (a)-(c) are
+ * all ENVELOPE evidence, and a sender domain is not proof that an email is a
+ * meeting invitation. `*.teamio.com` is a multi-purpose ATS domain that also
+ * sends candidate-rejection notices, which sailed through (a)-(c) and then made
+ * the parser throw, reaching the owner as an action-failure notification. The
+ * check belongs HERE rather than inside `run` precisely because this resolver
+ * also backs MEETINGS_ACTION.appliesTo — gating only `run` would leave
+ * appliesTo true, so the action would still CLAIM the thread and mark it
+ * processed while doing nothing. Returning no job means the action correctly
+ * does not apply at all.
  */
 function findMeetingProcessingJobs(messages, meetingSystems) {
   const list = messages || [];
@@ -913,6 +1073,14 @@ function findMeetingProcessingJobs(messages, meetingSystems) {
     }
 
     if (meetingsMessageHasIcsAttachment(message)) {
+      continue;
+    }
+
+    // Fail-closed: an unregistered detector yields no job, mirroring the
+    // unregistered-parser rule above. See
+    // MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN's own class-level doc.
+    const looksLikeInvitation = MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN[system.domainPattern];
+    if (!looksLikeInvitation || !looksLikeInvitation(message.getPlainBody())) {
       continue;
     }
 
@@ -1121,6 +1289,12 @@ const MEETINGS_ACTION = {
 // meetingsExtractHtmlLabelValue (ROUND 2 NEW — the HTML-sourced label-value
 // extractor bug 1's fix depends on), buildMeetingIdentifier, the two
 // language packs and their month tables,
+// meetingsDescribeSearchedLabelPairs / meetingsSelectLanguagePack /
+// teamioTextLooksLikeMeetingInvitation /
+// MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN (debug
+// teamio-non-invite-error NEW — the shared pack-selection helper, the
+// invitation detector built on it, and the detector registry
+// findMeetingProcessingJobs's content gate consults),
 // parseTeamioMeetingText, MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN,
 // meetingsIsIcsAttachment, meetingsMessageHasIcsAttachment,
 // findMeetingProcessingJobs, MEETINGS_FALLBACK_SUMMARY,
@@ -1153,8 +1327,12 @@ if (typeof module !== 'undefined' && module.exports) {
     MEETINGS_LANGUAGE_PACKS: MEETINGS_LANGUAGE_PACKS,
     MEETINGS_FALLBACK_SUMMARY: MEETINGS_FALLBACK_SUMMARY,
     MEETINGS_MAX_DESCRIPTION_LINKS: MEETINGS_MAX_DESCRIPTION_LINKS,
+    meetingsDescribeSearchedLabelPairs: meetingsDescribeSearchedLabelPairs,
+    meetingsSelectLanguagePack: meetingsSelectLanguagePack,
+    teamioTextLooksLikeMeetingInvitation: teamioTextLooksLikeMeetingInvitation,
     parseTeamioMeetingText: parseTeamioMeetingText,
     MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN: MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN,
+    MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN: MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN,
     meetingsIsIcsAttachment: meetingsIsIcsAttachment,
     meetingsMessageHasIcsAttachment: meetingsMessageHasIcsAttachment,
     findMeetingProcessingJobs: findMeetingProcessingJobs,

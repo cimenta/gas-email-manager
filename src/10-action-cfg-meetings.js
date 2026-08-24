@@ -49,8 +49,14 @@ const MEETINGS_ACTION_CONFIG = {
   // apex/dot-boundary matching semantics) and the calendar its events should
   // be created on. Adding a further system needs ONE new entry here PLUS one
   // new parser function registered in the sibling action file's
-  // MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN (keyed by the SAME domainPattern
-  // string) -- the matching logic itself never changes.
+  // MEETING_BODY_PARSERS_BY_DOMAIN_PATTERN PLUS one new invitation detector
+  // registered in its MEETING_INVITATION_DETECTORS_BY_DOMAIN_PATTERN (both
+  // keyed by the SAME domainPattern string) -- the matching logic itself never
+  // changes. The detector is what stops a domainPattern from over-claiming: a
+  // domain match alone is NOT evidence that an email is an invitation, and
+  // omitting the detector means the system produces no jobs at all rather than
+  // trying to parse every email from that domain (debug
+  // teamio-non-invite-error).
   //
   // The shipped default seeds ONE entry: Teamio (*.teamio.com, the real
   // system this feature was built from -- see the sibling action file's
