@@ -134,6 +134,18 @@ email qualifies unless explicitly excluded (see
    sub-components (like a VALARM reminder) are correctly excluded from the
    event's own fields, and excessive blank lines common in real
    Outlook/Exchange invites are collapsed to a single blank-line separator.
+4. **Recovers a mislabeled attachment encoding.** Some senders (observed:
+   LinkedIn's "You're attending ..." event mail) declare their `.ics` part as
+   `Content-Transfer-Encoding: 7bit` while the body is actually base64 — a
+   sender-side MIME defect. Since `7bit` means "already plain text," a
+   standards-honoring mail parser performs no decoding, and the parser would
+   otherwise see the literal base64 string instead of calendar data. The
+   parser now recognizes this case and transparently base64-decodes before
+   parsing; a well-formed `.ics` attachment is completely unaffected. If an
+   attachment matched as `.ics` still isn't valid iCalendar data even after
+   that recovery, the action now fails loudly — the thread gets the failed
+   label and you get a notification — instead of silently labeling the
+   thread processed with no event created.
 
 **Hand-off to a more specific action:** a sender with a more specialized
 action registered for it (e.g. the transport-tickets action) can be added to

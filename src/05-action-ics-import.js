@@ -744,14 +744,178 @@ function parseVeventBlock(propertyLines, vtimezones) {
   };
 }
 
+// --- MISLABELED CONTENT-TRANSFER-ENCODING RECOVERY -------------------------
+//
+// Live-reported bug (linkedin-ics-not-imported). LinkedIn's "You're attending
+// ..." mail attaches a genuine, well-formed LinkedInEvent.ics whose MIME part
+// declares `Content-Transfer-Encoding: 7bit` while the part body is in fact
+// base64 text. `7bit` is the identity encoding, so any spec-honouring MIME
+// parser — Gmail included — takes the sender at its word and performs NO
+// decoding. GmailAttachment#getDataAsString() therefore returns the literal
+// base64 string, which contains no `BEGIN:VEVENT` line, so parseIcs found zero
+// blocks and returned [] and the event was silently never created.
+//
+// The recovery below lives in parseIcs (the CHOKE POINT) rather than in
+// ICS_CALENDAR_ACTION, so that TRANSPORT_TICKETS_ACTION's own
+// `parseIcs(attachment.getDataAsString())` call site
+// (src/08-action-transport-tickets.js) and every future caller are fixed by
+// the same change — the same choke-point strategy used for meetings sender
+// attribution (quick-260824-hva).
+
+const ICS_BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+/**
+ * decodeBase64Utf8 — decodes base64 text into a UTF-8 JavaScript string.
+ *
+ * WHY HAND-ROLLED rather than `Utilities.base64Decode`: `Utilities` is a
+ * GAS-only global, and the whole parseIcs path in this file is deliberately
+ * pure and Node-testable. Apps Script's V8 runtime provides neither `atob` nor
+ * `Buffer`, so there is no cross-runtime built-in to lean on either.
+ *
+ * Returns null — never a partial or garbage string — for anything that is not
+ * cleanly decodable base64: characters outside the base64 alphabet, a length
+ * that is not a multiple of 4 (truncated), or empty input. That null return is
+ * precisely how normalizeIcsText knows to leave the text untouched.
+ *
+ * Whitespace is stripped first, so the CRLF wrapping that real MIME base64
+ * bodies carry at 76 columns decodes just as well as LinkedIn's single long
+ * line. Pure, no GAS globals.
+ */
+function decodeBase64Utf8(input) {
+  const compact = String(input == null ? '' : input).replace(/[\s]/g, '');
+
+  if (compact.length === 0 || compact.length % 4 !== 0) {
+    return null;
+  }
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(compact)) {
+    return null;
+  }
+
+  const bytes = [];
+  let buffer = 0;
+  let bits = 0;
+
+  for (let i = 0; i < compact.length; i++) {
+    const ch = compact.charAt(i);
+    if (ch === '=') {
+      break;
+    }
+
+    const index = ICS_BASE64_ALPHABET.indexOf(ch);
+    if (index === -1) {
+      return null;
+    }
+
+    buffer = (buffer << 6) | index;
+    bits += 6;
+
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((buffer >> bits) & 0xff);
+    }
+  }
+
+  return utf8BytesToString(bytes);
+}
+
+/**
+ * utf8BytesToString — assembles a UTF-8 byte array into a JavaScript string,
+ * handling 1-, 2-, 3- and 4-byte sequences (the 4-byte case emitted as a
+ * surrogate pair). Multi-byte correctness matters here: this codebase already
+ * handles Czech senders, so SUMMARY/LOCATION values routinely carry diacritics
+ * that a naive byte-per-character assembly would mangle. A malformed or
+ * truncated sequence degrades to its raw byte rather than throwing. Pure.
+ */
+function utf8BytesToString(bytes) {
+  let out = '';
+  let i = 0;
+
+  while (i < bytes.length) {
+    const b0 = bytes[i];
+
+    if (b0 < 0x80) {
+      out += String.fromCharCode(b0);
+      i += 1;
+    } else if (b0 >= 0xc0 && b0 < 0xe0 && i + 1 < bytes.length) {
+      out += String.fromCharCode(((b0 & 0x1f) << 6) | (bytes[i + 1] & 0x3f));
+      i += 2;
+    } else if (b0 >= 0xe0 && b0 < 0xf0 && i + 2 < bytes.length) {
+      out += String.fromCharCode(((b0 & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f));
+      i += 3;
+    } else if (b0 >= 0xf0 && i + 3 < bytes.length) {
+      const codePoint =
+        ((b0 & 0x07) << 18) | ((bytes[i + 1] & 0x3f) << 12) | ((bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
+      const offset = codePoint - 0x10000;
+      out += String.fromCharCode(0xd800 + (offset >> 10), 0xdc00 + (offset & 0x3ff));
+      i += 4;
+    } else {
+      out += String.fromCharCode(b0);
+      i += 1;
+    }
+  }
+
+  return out;
+}
+
+/**
+ * isIcsText — true when `text` actually looks like iCalendar data, i.e. it
+ * carries a BEGIN:VCALENDAR line (case-insensitive). This is deliberately the
+ * weakest possible structural check: it answers "is this iCalendar AT ALL",
+ * NOT "does this contain any events". That distinction is load-bearing — a
+ * valid VCALENDAR carrying zero VEVENTs is legitimate (cancellations,
+ * VTODO/VFREEBUSY-only calendars) and must stay a silent no-op, whereas text
+ * that is not iCalendar at all is a real defect worth failing loudly on. Pure.
+ */
+function isIcsText(text) {
+  return /BEGIN:VCALENDAR/i.test(String(text == null ? '' : text));
+}
+
+/**
+ * normalizeIcsText — returns iCalendar text for `rawText`, transparently
+ * recovering a base64 body that a sender mislabeled as 7bit/8bit.
+ *
+ * Already-iCalendar text is returned byte-for-byte untouched (the overwhelming
+ * common case — one regex test, no allocation).
+ *
+ * SAFETY / WHY THIS CANNOT MISFIRE: the decoded result is only substituted
+ * when it ITSELF passes isIcsText. Arbitrary text does not base64-decode into
+ * something containing "BEGIN:VCALENDAR", so a false positive is effectively
+ * impossible, and any input that fails to decode cleanly (null) or decodes to
+ * non-iCalendar is returned exactly as it came in. Every pre-existing flow
+ * therefore behaves byte-for-byte as it did before this function existed.
+ * Pure, no GAS globals.
+ */
+function normalizeIcsText(rawText) {
+  const text = String(rawText == null ? '' : rawText);
+
+  if (isIcsText(text)) {
+    return text;
+  }
+
+  const decoded = decodeBase64Utf8(text);
+
+  return decoded !== null && isIcsText(decoded) ? decoded : text;
+}
+
 /**
  * parseIcs — parses raw .ics text into an ordered array of normalized event
  * objects, one per VEVENT block, in source order. Returns [] for input with
  * zero VEVENT blocks. Any BEGIN:VTIMEZONE blocks present are parsed once up
  * front and used to resolve TZID-qualified wall-clock times in every VEVENT.
+ *
+ * Input first passes through normalizeIcsText, which transparently recovers a
+ * base64 body that a sender mislabeled as `Content-Transfer-Encoding: 7bit`
+ * (see the MISLABELED CONTENT-TRANSFER-ENCODING RECOVERY note above). Text
+ * that is already iCalendar is untouched by that step.
+ *
+ * Deliberately stays TOLERANT of input that is not iCalendar at all, returning
+ * [] rather than throwing — several callers legitimately parse speculatively.
+ * Surfacing that case as a loud failure is ICS_CALENDAR_ACTION.run's job (it
+ * knows the text came from an attachment that was explicitly matched as .ics),
+ * not the parser's.
  */
 function parseIcs(text) {
-  const lines = unfoldLines(text);
+  const lines = unfoldLines(normalizeIcsText(text));
   const vtimezones = extractVtimezoneBlocks(lines);
   const blocks = extractVeventBlocks(lines);
   return blocks.map(function (block) {
@@ -1155,7 +1319,31 @@ const ICS_CALENDAR_ACTION = {
     // though different groups may end up targeting different calendars.
     const parsedGroups = messageGroups.map(function (group) {
       const events = group.texts.reduce(function (allEvents, attachmentText) {
-        return allEvents.concat(parseIcs(attachmentText));
+        // SILENT-FAILURE GUARD (live-reported bug linkedin-ics-not-imported).
+        // This attachment was ALREADY matched as .ics by isIcsAttachment, so
+        // its content not being iCalendar — even after normalizeIcsText's
+        // mislabeled-base64 recovery — is a genuine defect, not a no-op.
+        // Before this guard, parseIcs returned [] for such an attachment and
+        // the forEach below simply iterated zero times: no calendar write, no
+        // thrown error, so dispatchActions reported success and the thread was
+        // labeled processed with no event and no owner notification. Throwing
+        // here routes the thread to the failed label and (notifyOnFailure)
+        // notifies the owner, via dispatch isolation in
+        // 03-action-management.js.
+        //
+        // Keyed on "not iCalendar AT ALL", never on "parsed to zero events" —
+        // a valid VCALENDAR carrying zero VEVENTs is legitimate (cancellations,
+        // VTODO/VFREEBUSY-only calendars) and must remain a silent no-op.
+        const normalized = normalizeIcsText(attachmentText);
+        if (!isIcsText(normalized)) {
+          throw new Error(
+            'Attachment matched as .ics but its content is not iCalendar data ' +
+              '(no BEGIN:VCALENDAR, and it did not base64-decode to iCalendar either) on thread: ' +
+              thread.getId()
+          );
+        }
+
+        return allEvents.concat(parseIcs(normalized));
       }, []);
       return { fromHeader: group.fromHeader, events: events };
     });
@@ -1493,7 +1681,9 @@ function getIcsAttachmentTextsByMessage(thread) {
 
 // GAS-safe Node export: `typeof module` is safely "undefined" in the Apps
 // Script runtime, so this line is inert there and only active under Node.
-// Single merged export carries parseIcs (parser tests), the two pure
+// Single merged export carries parseIcs (parser tests), the three pure
+// mislabeled-transfer-encoding recovery helpers (decodeBase64Utf8, isIcsText,
+// normalizeIcsText — bug linkedin-ics-not-imported), the two pure
 // resource builders (buildRRuleString, buildEventResource), the two pure
 // sender-allow-list helpers (extractEmailAddress, isAllowedSender), the
 // pure multi-calendar-routing resolver (resolveIcsCalendarId), the four
@@ -1510,6 +1700,9 @@ if (typeof module !== 'undefined' && module.exports) {
     findExistingEventByICalUid: findExistingEventByICalUid,
     importIcsEventWithSequenceRetry: importIcsEventWithSequenceRetry,
     parseIcs: parseIcs,
+    decodeBase64Utf8: decodeBase64Utf8,
+    isIcsText: isIcsText,
+    normalizeIcsText: normalizeIcsText,
     buildRRuleString: buildRRuleString,
     buildEventResource: buildEventResource,
     extractEmailAddress: extractEmailAddress,
