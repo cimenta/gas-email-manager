@@ -923,19 +923,6 @@ const SETTINGS_REGISTRY = [
     read: function () { return TRANSPORT_TICKETS_ACTION_CONFIG.transportSenders; },
   },
 
-  // Phase 4 (04-02, amended 04-04): MOJEMENICKA_ACTION_CONFIG's own fields —
-  // registered here for the exact same reason every other action's config
-  // fields are: rebuildScriptProperties/checkScriptPropertiesSyntax manage
-  // them through the ONE established mechanism, not a parallel one. The
-  // amendment (D-08/D-09) changes the trigger setting from a single string
-  // to a list and adds a subordinate weekly-range list.
-  { key: '09-action-mojemenicka-ENABLED', type: 'boolean', read: function () { return MOJEMENICKA_ACTION_CONFIG.enabled; } },
-  { key: '09-action-mojemenicka-NOTIFY_ON_FAILURE', type: 'boolean', read: function () { return MOJEMENICKA_ACTION_CONFIG.notifyOnFailure; } },
-  { key: '09-action-mojemenicka-MENU_URL', type: 'string', read: function () { return MOJEMENICKA_ACTION_CONFIG.menuUrl; } },
-  { key: '09-action-mojemenicka-ALLOWED_SENDERS', type: 'list', read: function () { return MOJEMENICKA_ACTION_CONFIG.allowedSenders; } },
-  { key: '09-action-mojemenicka-TRIGGER_STRINGS', type: 'list', read: function () { return MOJEMENICKA_ACTION_CONFIG.triggerStrings; } },
-  { key: '09-action-mojemenicka-WEEKLY_TRIGGER_STRINGS', type: 'list', read: function () { return MOJEMENICKA_ACTION_CONFIG.weeklyTriggerStrings; } },
-
   // quick-260820-g4r: MEETINGS_ACTION_CONFIG's own fields — registered here
   // for the exact same reason every other action's config fields are:
   // rebuildScriptProperties/checkScriptPropertiesSyntax manage them through

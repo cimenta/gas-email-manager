@@ -22,9 +22,9 @@ const {
 
 // --- webappBuildSettingsFormModel -------------------------------------------
 
-test('webappBuildSettingsFormModel: over the real 38-entry registry, returns 38 models with {key, type, fieldKind, rowFields}', () => {
+test('webappBuildSettingsFormModel: over the real 32-entry registry, returns 32 models with {key, type, fieldKind, rowFields}', () => {
   const models = webappBuildSettingsFormModel(SETTINGS_REGISTRY);
-  assert.equal(models.length, 38);
+  assert.equal(models.length, 32);
   models.forEach(function (model) {
     assert.equal(typeof model.key, 'string');
     assert.equal(typeof model.type, 'string');
@@ -45,13 +45,6 @@ test('webappBuildSettingsFormModel: fieldKind mapping is exactly string->text, n
   assert.equal(byKey['01-setup-INSTALL_TRIGGER'].fieldKind, 'checkbox');
   assert.equal(byKey['05-action-ics-IMPORT_ONLY_FROM'].fieldKind, 'csv');
   assert.equal(byKey['05-action-ics-CALENDAR_ID_BY_SENDER'].fieldKind, 'rows');
-
-  // Phase 4 (04-02, amended 04-04): MojeMenicka's 6 keys.
-  assert.equal(byKey['09-action-mojemenicka-MENU_URL'].fieldKind, 'text');
-  assert.equal(byKey['09-action-mojemenicka-TRIGGER_STRINGS'].fieldKind, 'csv');
-  assert.equal(byKey['09-action-mojemenicka-WEEKLY_TRIGGER_STRINGS'].fieldKind, 'csv');
-  assert.equal(byKey['09-action-mojemenicka-ALLOWED_SENDERS'].fieldKind, 'csv');
-  assert.equal(byKey['09-action-mojemenicka-ENABLED'].fieldKind, 'checkbox');
 
   // quick-260820-g4r: Meetings' 4 keys.
   assert.equal(byKey['10-action-meetings-ENABLED'].fieldKind, 'checkbox');

@@ -91,8 +91,8 @@
 /**
  * meetingsExtractEmailAddress — LOCAL copy of the same underlying logic
  * already re-implemented independently in every other action file (see
- * ticketingExtractEmailAddress/mojemenickaExtractEmailAddress for the
- * identical shape). Extracts the bare, trimmed, lowercased email address
+ * ticketingExtractEmailAddress for the identical shape). Extracts the bare,
+ * trimmed, lowercased email address
  * from a Gmail "From" header value, or from a bare address with no display
  * name. Pure, no GAS globals. Never throws: a null/undefined/empty input
  * returns ''.

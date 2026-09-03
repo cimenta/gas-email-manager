@@ -1,4 +1,4 @@
-// Version: 0.15.3
+// Version: 0.16.0
 /**
  * APP_VERSION — the running application version, rendered next to the admin
  * web app's page title via webappGetVersion (src/00-webapp.js, D-01). This
@@ -10,7 +10,7 @@
  * future release -- test/app-version.test.js is the guard that fails the
  * whole suite the moment they ever drift apart.
  */
-const APP_VERSION = '0.15.3';
+const APP_VERSION = '0.16.0';
 
 /**
  * processEmails — the named target of the time-driven trigger installed by

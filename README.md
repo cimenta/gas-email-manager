@@ -79,13 +79,6 @@ in addition to processed, so nothing is lost silently.
   every setting, including the JSON ones as structured rows instead of
   hand-typed JSON, without opening the Apps Script editor. See
   [Admin web app](#admin-web-app).
-- **MojeMenicka menu replies** — an allow-listed sender whose SUBJECT
-  carries any one of a configured list of trigger strings gets an automatic
-  in-thread reply with the freshly-fetched HTML menu, used verbatim; a
-  subject that also carries a weekly indicator gets the whole week's menu
-  instead of just today's. If the fetch fails, the requester still gets a
-  brief apology reply instead of silence. See
-  [MojeMenicka menu replies](#mojemenicka-menu-replies).
 - **Fail-closed parsing** — a malformed `.ics` is fully parsed before any
   calendar write; a parse error produces zero calendar writes.
 - **Owner failure notifications** — if an action fails, a plain-text email
@@ -281,7 +274,9 @@ differs.
 1. Reuses the ICS action's own iCalendar parser to read the invite's `.ics`
    attachment: departure/arrival stops and times (resolved through the
    invite's own `VTIMEZONE` rules, same as the ICS action), route summary,
-   and the invite's `UID`/`SEQUENCE`.
+   and the invite's `UID`/`SEQUENCE`. Sharing the same parser also means it
+   inherits the ICS action's mislabeled-encoding recovery (see
+   [ICS-to-Calendar import](#ics-to-calendar-import)) for free.
 
 **`mode: 'body'`** (IDOS.cz):
 
@@ -408,46 +403,6 @@ attachment — a general meeting invite with no attachment has nothing for it
 to parse. This action is scoped to exactly the complementary case (no `.ics`
 present) so the two never compete for the same email.
 
-## MojeMenicka menu replies
-
-Unlike every other action in this project, this one replies to the
-requester rather than notifying the owner — its job is to answer an
-incoming question, not to record a calendar side effect.
-
-**Trigger:** `appliesTo` fires only when BOTH are true for a message on the
-thread: the sender is in the configured allow-list (exact address match,
-case-insensitive), and the message's SUBJECT line contains ANY ONE of a
-configured list of trigger strings (case-insensitive substring, OR across
-the list). The message BODY is never inspected. Both the allow-list and
-the trigger-string list default to unset/empty, so a fresh install does
-nothing until the owner configures them — this action sends outbound mail
-to a third party, so it is deliberately fail-closed rather than
-fail-open like the ICS action's sender filter.
-
-**Today or the whole week:** once a message has already matched a trigger
-string above, its subject is checked for any of a second, subordinate list
-of weekly-indicator strings. A weekly indicator on its own — without a
-trigger string also present — never makes the action apply. When the
-already-matched subject also carries a weekly indicator, the reply
-requests the whole week's menu; otherwise it requests just today's.
-
-**Reply:** on a match, the action fetches the menu from the configured
-base URL, appending `?format=html&range=today` or `?format=html&range=week`
-itself (the configured URL must be a bare base URL with no query string of
-its own — a URL that already carries one is treated as a misconfiguration,
-see below). The response body is used **verbatim** as the reply's HTML —
-no template wrapping, no text extraction, no reformatting.
-
-**Graceful fallback:** if the fetch fails for any reason (network error,
-non-2xx status, empty body), the requester still receives an in-thread
-reply, just with a short, fixed apology message instead of the menu. This
-deliberately does **not** raise an owner failure notification — the
-requester is a real person waiting on a reply, and silence would be the
-worse outcome. An actual misconfiguration — the menu URL left unset, or a
-menu URL that already carries a query string of its own — remains a
-genuine error: it throws and still notifies the owner as usual, rather
-than degrading into an apology reply.
-
 ## Security notes
 
 - **Attendees are never real Calendar guests.** Organizer/attendee names
@@ -471,20 +426,6 @@ than degrading into an apology reply.
   yourself, rather than only folders the script created — be aware this
   scope grants the script access to your Drive generally, not just the
   folders this feature uses.
-- **The MojeMenicka action introduces the
-  `https://www.googleapis.com/auth/script.external_request` OAuth scope**,
-  required by `UrlFetchApp` to reach an external menu URL — you'll be
-  prompted to re-authorize the first time you run anything after this
-  scope is added. Its sender allow-list is, like every other action's, a
-  convenience filter over a forgeable "From" header, not authentication.
-  Its fallback reply deliberately carries no URL, HTTP status code, or
-  error text, since it is sent to an external recipient rather than logged
-  for the owner only. The `range` value sent to the menu endpoint is always
-  one of exactly two fixed literals (`today`/`week`) chosen in-script by
-  matching the incoming subject against the configured weekly-indicator
-  list — the incoming email subject can never influence the outgoing query
-  string beyond that binary choice.
-
 ## Project layout
 
 Apps Script's editor lists files alphabetically with no manual reordering,
@@ -506,8 +447,6 @@ so files are numbered to keep related code grouped:
 | `src/07-action-ticketing-portals.js` | The ticketing-portals action (Drive/OCR pipeline, every portal's parser, action descriptor) |
 | `src/08-action-cfg-transport-tickets.js` | `TRANSPORT_TICKETS_ACTION_CONFIG` — the transport-tickets action's settings |
 | `src/08-action-transport-tickets.js` | The transport-tickets action (.ics-VEVENT-sourced, reuses the ICS action's parser, action descriptor) |
-| `src/09-action-cfg-mojemenicka.js` | `MOJEMENICKA_ACTION_CONFIG` — the MojeMenicka action's settings |
-| `src/09-action-mojemenicka.js` | The MojeMenicka menu-request action: sender/subject matching, menu fetch, in-thread reply |
 | `src/10-action-cfg-meetings.js` | `MEETINGS_ACTION_CONFIG` — the meetings action's settings |
 | `src/10-action-meetings.js` | The meetings action (domain-matched systems, Teamio's body/HTML parser, action descriptor) |
 | `src/appsscript.json` | Apps Script manifest (timezone, OAuth scopes, Advanced Calendar/Drive/Documents Services) |
@@ -621,21 +560,6 @@ lives separately — see [Language packs](#language-packs)):
 | `notifyOnFailure` | Whether a failure notification email is sent when this action throws |
 | `transportSenders` | Array of `{ identifyingEmail, calendarId, insertPdfIntoEvent, mode }` — one entry per supported carrier, matched by its confirmation email's sender address. `mode` is `'ics'` or `'body'` (see [Transport tickets](#transport-tickets)); always set it explicitly for a new carrier — an entry with no `mode` falls back to `'ics'` unless a body parser is registered for that address in the source code. `calendarId` falls back to `CONFIG.calendarId` when unset. Ships with a RegioJet (`mode: 'ics'`) and an IDOS.cz (`mode: 'body'`) entry by default. For an `'ics'`-mode carrier, remember to also add its sender address to `ICS_ACTION_CONFIG.excludeFrom` above |
 
-**MojeMenicka menu-request action** — `MOJEMENICKA_ACTION_CONFIG` in
-`src/09-action-cfg-mojemenicka.js`. Script Property keys: boolean
-`09-action-mojemenicka-ENABLED` / `09-action-mojemenicka-NOTIFY_ON_FAILURE`,
-string `09-action-mojemenicka-MENU_URL`, list `09-action-mojemenicka-ALLOWED_SENDERS`
-/ `09-action-mojemenicka-TRIGGER_STRINGS` / `09-action-mojemenicka-WEEKLY_TRIGGER_STRINGS`:
-
-| Field | Type | Shipped default | Meaning |
-|-------|------|------------------|---------|
-| `enabled` (`09-action-mojemenicka-ENABLED`) | boolean | `true` | Cross-cutting toggle — `false` skips this action entirely |
-| `notifyOnFailure` (`09-action-mojemenicka-NOTIFY_ON_FAILURE`) | boolean | `true` | Whether a failure notification email is sent when this action throws (a genuine misconfiguration only — the graceful menu-fetch fallback below never triggers this) |
-| `menuUrl` (`09-action-mojemenicka-MENU_URL`) | string | unset | The bare base URL fetched for the menu HTML, with no query string of its own (e.g. `https://example-restaurant.cz/menu`) — the action appends its own `?format=html&range=today`/`?format=html&range=week`; an unset URL or one that already carries a query string throws and notifies the owner rather than replying |
-| `allowedSenders` (`09-action-mojemenicka-ALLOWED_SENDERS`) | list | empty | Sender addresses allowed to trigger a menu reply (e.g. `jana@example.com, petr@example.com`) — FAIL-CLOSED, so an unconfigured install replies to nobody |
-| `triggerStrings` (`09-action-mojemenicka-TRIGGER_STRINGS`) | list | empty | Substrings looked for in the message SUBJECT only, never the body (e.g. `menu, jidelnicek`) — matches on ANY ONE entry, FAIL-CLOSED, same rationale as `allowedSenders` |
-| `weeklyTriggerStrings` (`09-action-mojemenicka-WEEKLY_TRIGGER_STRINGS`) | list | empty | Substrings that select the week range instead of today (e.g. `tyden, na tyden, weekly`) — SUBORDINATE to `triggerStrings`: only consulted on a subject that already matched one of those, so a weekly indicator alone never triggers a reply; empty means every matched request uses the today range |
-
 **Meetings action** — `MEETINGS_ACTION_CONFIG` in
 `src/10-action-cfg-meetings.js`:
 
@@ -657,7 +581,7 @@ fallback default and living documentation (comments, examples) — the
 *actual* live value, once set, survives every future push.
 
 **Setup:** run `rebuildScriptProperties()` once from the function picker.
-It writes all 38 settings as visible rows — anything you've already
+It writes all 32 settings as visible rows — anything you've already
 customized in code is preserved as-is, and everything else appears with the
 literal placeholder text `DefaultValue` (Script Properties can't store an
 empty value, so this stands in for "not overridden — use the code
@@ -671,8 +595,7 @@ value, and keeps every row in a consistent order.
 from — `01-setup-*` (from `CONFIG`), `05-action-ics-*` (from
 `ICS_ACTION_CONFIG`), `06-action-booking-com-*` (from `BOOKING_ACTION_CONFIG`),
 `07-action-ticketing-portals-*` (from `TICKETING_PORTALS_ACTION_CONFIG`),
-`08-action-transport-tickets-*` (from `TRANSPORT_TICKETS_ACTION_CONFIG`),
-`09-action-mojemenicka-*` (from `MOJEMENICKA_ACTION_CONFIG`)
+`08-action-transport-tickets-*` (from `TRANSPORT_TICKETS_ACTION_CONFIG`)
 — followed by the setting name in caps, e.g. `01-setup-CALENDAR_ID`,
 `06-action-booking-com-CALENDAR_ID`. Simple list settings
 (`importOnlyFrom`, `excludeFrom`, `senderAllowList`) are entered as a
@@ -727,7 +650,7 @@ entirely: there's nothing to hand-type, so there's nothing to get wrong.
 **On the page:** a **Run** tab with the three maintenance buttons (one shared
 result box, labeled by which action produced it) and a **Settings** tab, with
 six sub-tabs mirroring this codebase's own file layout (Setup, ICS Import,
-Booking.com, Ticketing Portals, Transport Tickets, MojeMenicka). Settings load showing
+Booking.com, Ticketing Portals, Transport Tickets, Meetings). Settings load showing
 their current *effective* value (a live Script Property override if one is
 set, otherwise the code default) and save with one **Save settings** button
 that writes every changed key in a single all-or-nothing call — if any value
