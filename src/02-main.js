@@ -1,4 +1,4 @@
-// Version: 0.16.0
+// Version: 0.16.2
 /**
  * APP_VERSION — the running application version, rendered next to the admin
  * web app's page title via webappGetVersion (src/00-webapp.js, D-01). This
@@ -10,7 +10,75 @@
  * future release -- test/app-version.test.js is the guard that fails the
  * whole suite the moment they ever drift apart.
  */
-const APP_VERSION = '0.16.0';
+const APP_VERSION = '0.16.2';
+
+/**
+ * orderThreadsForProcessing — CAUSAL ORDERING GUARANTEE (live-reported bug
+ * regiojet-cancel-not-deleted). Returns a NEW array of the same threads
+ * sorted OLDEST-FIRST by `getLastMessageDate()`, i.e. in the order the mail
+ * actually arrived. Never mutates the input; a null/undefined input returns
+ * [].
+ *
+ * WHY THIS EXISTS: processEmails used to consume `GmailApp.search()`'s result
+ * array in whatever order Gmail handed it back. That order is NOT DOCUMENTED
+ * anywhere in the Apps Script reference — empirically it mirrors the Gmail UI,
+ * i.e. NEWEST FIRST. Nothing in this codebase ever established it, and nothing
+ * would notice if Google changed it.
+ *
+ * That silence was load-bearing. Every cancellation-capable action here
+ * (TRANSPORT_TICKETS_ACTION's cancelTransportTicketEvent,
+ * BOOKING_MANAGEMENT_ACTION's handleCancellation) deletes an event that an
+ * EARLIER email created. A cancellation is by definition NEWER than the
+ * confirmation it cancels, so under newest-first the cancellation is
+ * dispatched FIRST — it finds no event to delete, takes its documented silent
+ * no-op branch, and the confirmation, processed second, then creates an event
+ * that nothing will ever delete. The cancelled trip stays on the calendar
+ * forever, with no error and no failure label. This is exactly the live
+ * RegioJet report: a ticket bought and cancelled inside ONE trigger window
+ * left both emails unprocessed for the same run.
+ *
+ * Sorting by LAST message date (not first) is deliberate: it is when the
+ * thread last became relevant, which is what determines whether its newest
+ * message is a confirmation or a cancellation.
+ *
+ * A thread whose date cannot be read (missing accessor, null, unparseable)
+ * sorts FIRST rather than last — fail toward "create before cancel", never
+ * toward letting an unknown date push a thread behind a cancellation. Pure
+ * (touches only the passed-in objects), so it is Node-testable — see
+ * test/thread-processing-order.test.js.
+ */
+function orderThreadsForProcessing(threads) {
+  const list = (threads || []).slice();
+
+  return list.sort(function (a, b) {
+    return threadLastMessageTime(a) - threadLastMessageTime(b);
+  });
+}
+
+/**
+ * threadLastMessageTime — orderThreadsForProcessing's sort key: the thread's
+ * last-message time in epoch milliseconds, or 0 when it cannot be determined
+ * (no accessor, a throwing accessor, a null/invalid Date). 0 sorts such a
+ * thread first — see orderThreadsForProcessing's own JSDoc for why the
+ * unknown case must fail toward EARLIER, never later. Pure, never throws.
+ */
+function threadLastMessageTime(thread) {
+  try {
+    if (!thread || typeof thread.getLastMessageDate !== 'function') {
+      return 0;
+    }
+
+    const date = thread.getLastMessageDate();
+    if (!(date instanceof Date)) {
+      return 0;
+    }
+
+    const time = date.getTime();
+    return Number.isNaN(time) ? 0 : time;
+  } catch (e) {
+    return 0;
+  }
+}
 
 /**
  * processEmails — the named target of the time-driven trigger installed by
@@ -18,10 +86,16 @@ const APP_VERSION = '0.16.0';
  * dispatches each through the pluggable action registry, and labels each
  * thread by outcome. Already-labeled threads are excluded from selection, so
  * a handled thread (success or failure) is never reprocessed.
+ *
+ * Threads are dispatched OLDEST-FIRST via orderThreadsForProcessing (see its
+ * JSDoc for the live cancellation bug that made this explicit rather than
+ * inherited from GmailApp.search's undocumented order). Ordering changes only
+ * the sequence, never the membership: every selected thread is still
+ * processed exactly once and labeled exactly as before.
  */
 function processEmails() {
   const query = 'newer_than:' + CONFIG.daysBack + 'd -label:"' + CONFIG.labelName + '"';
-  const threads = GmailApp.search(query);
+  const threads = orderThreadsForProcessing(GmailApp.search(query));
 
   threads.forEach(function (thread) {
     const result = dispatchActions(thread);
@@ -109,5 +183,9 @@ function notifyOwnerOfFailure(actionName, thread, error) {
 
 // GAS-safe Node export (inert under the Apps Script runtime).
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { composeFailureBody: composeFailureBody, APP_VERSION: APP_VERSION };
+  module.exports = {
+    composeFailureBody: composeFailureBody,
+    orderThreadsForProcessing: orderThreadsForProcessing,
+    APP_VERSION: APP_VERSION,
+  };
 }

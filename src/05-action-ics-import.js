@@ -616,10 +616,20 @@ function collapseBlankLines(text) {
  * empty value from an absent property). This exists so TRANSPORT_TICKETS_ACTION
  * can detect a RegioJet cancellation purely from `event.status === 'CANCELLED'`
  * — a fixed, language-independent RFC 5545 token, deliberately never from
- * email subject/body text (which vary per RegioJet locale). This field is
- * parser-level only and purely additive: `buildEventResource` deliberately
- * does NOT copy it onto the Calendar API resource, so every other caller
- * (ICS_CALENDAR_ACTION included) is bit-for-bit unchanged.
+ * email subject/body text (which vary per RegioJet locale).
+ * `buildEventResource` deliberately does NOT copy it onto the Calendar API
+ * resource — the D-01 firewall, still intact and still load-bearing for
+ * TRANSPORT_TICKETS_ACTION, which shares that pure builder.
+ *
+ * SECOND CONSUMER (live-reported bug regiojet-cancel-not-deleted):
+ * ICS_CALENDAR_ACTION now reads this field too, via planIcsEventWrite, so a
+ * STATUS:CANCELLED VEVENT can never be imported as a live event. That is a
+ * WRITE-SITE decision — it reads `event.status` and declines to build a
+ * resource at all — NOT a change to the resource shape, so the firewall
+ * above is unaffected. The "every other caller is bit-for-bit unchanged"
+ * claim this paragraph used to make was true when written and is no longer:
+ * a cancelled VEVENT is now handled rather than blindly imported. Every
+ * NON-cancelled VEVENT is still bit-for-bit unchanged.
  *
  * DTSTAMP (RFC 5545 section 3.8.7.2, RegioJet cancel/rebook staleness
  * detection, D-09/D-10/D-11 of quick-260813-dq2 Task 3): `dtstamp` is the
@@ -1021,6 +1031,79 @@ function buildEventResource(event) {
 }
 
 /**
+ * planIcsEventWrite — the pure, total decision function behind
+ * ICS_CALENDAR_ACTION.run's per-VEVENT write: given a normalized parsed
+ * event (see parseVeventBlock), returns exactly one of four plans,
+ * `{ action, uid, resource }`:
+ *
+ *   live      + uid -> { action: 'import', uid, resource }  (idempotent by iCalUID)
+ *   live      + no  -> { action: 'insert', uid: null, resource }  (uid-less fallback)
+ *   CANCELLED + uid -> { action: 'cancel', uid, resource: null }
+ *   CANCELLED + no  -> { action: 'skip',   uid: null, resource: null }
+ *
+ * WHY IT EXISTS (live-reported bug regiojet-cancel-not-deleted, the deferred
+ * blind_spot the owner asked to close). ICS_CALENDAR_ACTION is registry
+ * index 0 — it runs BEFORE TRANSPORT_TICKETS_ACTION on the same thread — and
+ * `run` previously had NO branch on `event.status` whatsoever: every parsed
+ * VEVENT went to Events.import or Events.insert unconditionally. A RegioJet
+ * CANCELLATION .ics (METHOD:CANCEL, one VEVENT carrying STATUS:CANCELLED)
+ * was therefore imported as an ordinary LIVE event. The parser has carried
+ * `event.status` — trimmed, uppercased, the single normalization point —
+ * since D-01/D-02 of quick-260813-dq2, but only TRANSPORT_TICKETS_ACTION
+ * ever read it.
+ *
+ * WHY THIS IS NOT COVERED BY excludeFrom. The only thing that made this
+ * action stand down for RegioJet was the owner having set the
+ * `05-action-ics-EXCLUDE_FROM` Script Property, whose CODE DEFAULT IS `[]`
+ * (see ICS_ACTION_CONFIG.excludeFrom). A correctness guarantee must not rest
+ * on an out-of-band, owner-side configuration step that defaults to off, so
+ * the decision is made here, unconditionally, for every install.
+ *
+ * WHY `resource: null` ON BOTH CANCELLED BRANCHES — and why this function
+ * calls buildEventResource ONLY on the live branches: no Calendar API
+ * resource is ever BUILT from a cancelled VEVENT, so none can reach
+ * import/insert through any later edit. That is a structural guarantee
+ * rather than a convention a future change could quietly violate.
+ *
+ * WHY NOT `resource.status = 'cancelled'` INSTEAD (the tempting one-liner):
+ * two reasons. First, `buildEventResource` is SHARED with
+ * TRANSPORT_TICKETS_ACTION, and its D-01 firewall (it copies neither
+ * `status` nor `dtstamp` onto the resource) is load-bearing there — that
+ * action has its own, ticketIdentifier-keyed cancellation path and does not
+ * route cancel entries through the write path at all. Second, and more
+ * importantly, while the Calendar API documents `status: 'cancelled'` as
+ * meaning "deleted" AND documents `events.import` as an upsert keyed by
+ * iCalUID, it nowhere documents their COMBINATION — that importing a
+ * cancelled resource over a live event cancels it. Hanging the cancellation
+ * guarantee on that unverified inference would repeat the exact fault this
+ * whole debug session diagnosed: a load-bearing assumption about foreign
+ * behaviour that nobody here can verify. The 'cancel' plan is instead
+ * executed by cancelIcsEventByUid below using only operations already proven
+ * in this codebase.
+ *
+ * TOTAL and defensive: an event object with no `status` key at all (a
+ * hand-built one, not from parseVeventBlock) routes to the live branches
+ * exactly as before. A falsy `uid` (null, undefined, empty string) is
+ * treated as "no uid" on BOTH sides, the same rule the pre-existing
+ * insert() fallback already used.
+ *
+ * Pure, no GAS globals — Node-testable like the rest of the parser side.
+ */
+function planIcsEventWrite(event) {
+  if (event && event.status === 'CANCELLED') {
+    return event.uid
+      ? { action: 'cancel', uid: event.uid, resource: null }
+      : { action: 'skip', uid: null, resource: null };
+  }
+
+  const resource = buildEventResource(event);
+
+  return event.uid
+    ? { action: 'import', uid: event.uid, resource: resource }
+    : { action: 'insert', uid: null, resource: resource };
+}
+
+/**
  * extractEmailAddress — extracts the bare, trimmed, lowercased email address
  * from a Gmail "From" header value (e.g. 'Jana Nováková <jana@example.com>') or
  * from a bare address with no display name (e.g. 'jana@example.com'). Pure, no
@@ -1298,18 +1381,37 @@ const ICS_CALENDAR_ACTION = {
    * a malformed .ics throws before any write call — fail closed, still
    * true even though writes may target more than one calendar), then for
    * each message's group: resolves that message's calendar ONCE
-   * (resolveIcsCalendarId — see MULTI-CALENDAR ROUTING above) and writes
-   * one calendar event per parsed VEVENT into it via buildEventResource +
-   * the Advanced Calendar Service: Calendar.Events.import (via
-   * importIcsEventWithSequenceRetry, which adds a bounded single-shot
-   * sequence-conflict recovery — see its own doc comment and the
-   * class-level "SEQUENCE-CONFLICT RECOVERY" paragraph above) when the
-   * event carries a UID (idempotent by iCalUID — the dedup fix),
-   * Calendar.Events.insert otherwise (UID-less fallback, no dedup
-   * guarantee). Throws a clear error if a resolved calendar cannot be
-   * found — dispatch isolation (03-action-management.js) contains the
-   * throw, routes the thread to the failed label, and
-   * (config.notifyOnFailure) notifies the owner.
+   * (resolveIcsCalendarId — see MULTI-CALENDAR ROUTING above) and acts on
+   * one parsed VEVENT at a time through the Advanced Calendar Service.
+   *
+   * WHICH ACTION each VEVENT gets is decided by the pure planIcsEventWrite
+   * (see its own doc comment); this loop is a dispatcher over its four
+   * plans:
+   *   'import' — live event WITH a UID: Calendar.Events.import via
+   *      importIcsEventWithSequenceRetry, which adds a bounded single-shot
+   *      sequence-conflict recovery and the preserve-existing-invite guard
+   *      (see its doc comment and the class-level "SEQUENCE-CONFLICT
+   *      RECOVERY" paragraph above). Idempotent by iCalUID — the dedup fix.
+   *   'insert' — live event WITHOUT a UID: Calendar.Events.insert, the
+   *      UID-less fallback, no dedup guarantee.
+   *   'cancel' — STATUS:CANCELLED VEVENT WITH a UID: cancelIcsEventByUid,
+   *      which deletes the event already stored under that iCalUID on the
+   *      RESOLVED calendar (never on CONFIG.calendarId blindly).
+   *   'skip'   — STATUS:CANCELLED VEVENT WITHOUT a UID: nothing to
+   *      reference, nothing to cancel, logged and dropped.
+   *
+   * The 'cancel'/'skip' plans are the fix for the live-reported bug
+   * regiojet-cancel-not-deleted: this action is registry index 0, so it
+   * reaches a RegioJet cancellation email BEFORE TRANSPORT_TICKETS_ACTION
+   * does, and it previously imported that cancellation as an ordinary LIVE
+   * event whenever the owner had not set the `05-action-ics-EXCLUDE_FROM`
+   * Script Property (code default `[]`). No cancelled VEVENT can reach
+   * Events.import or Events.insert any more, in any configuration.
+   *
+   * Throws a clear error if a resolved calendar cannot be found — dispatch
+   * isolation (03-action-management.js) contains the throw, routes the
+   * thread to the failed label, and (config.notifyOnFailure) notifies the
+   * owner.
    */
   run: function (thread) {
     const messageGroups = getIcsAttachmentTextsByMessage(thread);
@@ -1356,17 +1458,40 @@ const ICS_CALENDAR_ACTION = {
       }
 
       group.events.forEach(function (event) {
-        const resource = buildEventResource(event);
+        // CANCELLED-VEVENT GUARD (live-reported bug
+        // regiojet-cancel-not-deleted). The write decision now lives in the
+        // pure planIcsEventWrite — see its doc comment for the full
+        // rationale, including why a cancelled VEVENT never gets a resource
+        // built for it at all. This branch is a dispatcher only.
+        const plan = planIcsEventWrite(event);
 
-        if (event.uid) {
+        if (plan.action === 'skip') {
+          // CANCELLED with no UID: it references nothing, so there is
+          // nothing to create and nothing to cancel. Creating a live event
+          // out of a cancellation — which the old unconditional insert()
+          // fallback did — is the one outcome that is unambiguously wrong.
+          console.log(
+            'ICS import: skipping a STATUS:CANCELLED VEVENT that carries no UID (nothing to reference, ' +
+              'nothing to cancel) on thread: ' + thread.getId()
+          );
+          return;
+        }
+
+        if (plan.action === 'cancel') {
+          cancelIcsEventByUid(calendarId, plan.uid);
+          return;
+        }
+
+        if (plan.action === 'import') {
           // Idempotent by iCalUID — the actual dedup fix. See
           // importIcsEventWithSequenceRetry's own doc comment for the
           // bounded sequence-conflict recovery wrapped around this call.
-          importIcsEventWithSequenceRetry(resource, calendarId, event.uid);
-        } else {
-          // No identity key to dedup against; ordinary create.
-          Calendar.Events.insert(resource, calendarId);
+          importIcsEventWithSequenceRetry(plan.resource, calendarId, plan.uid);
+          return;
         }
+
+        // No identity key to dedup against; ordinary create.
+        Calendar.Events.insert(plan.resource, calendarId);
       });
     });
   },
@@ -1432,6 +1557,75 @@ function findExistingEventByICalUid(calendarId, uid) {
   const response = Calendar.Events.list(calendarId, { iCalUID: uid, singleEvents: false });
 
   return response && response.items && response.items.length > 0 ? response.items[0] : null;
+}
+
+/**
+ * cancelIcsEventByUid — executes planIcsEventWrite's `'cancel'` plan: deletes
+ * the event already stored under iCalUID `uid` on `calendarId`. Returns a
+ * small result object — `{ action: 'cancelled' | 'not-found' |
+ * 'skipped-existing-invite', eventId }` — mirroring
+ * importIcsEventWithSequenceRetry's own return shape so both write paths
+ * report themselves the same way.
+ *
+ * WHY DELETE RATHER THAN IMPORT A CANCELLED RESOURCE: see planIcsEventWrite's
+ * doc paragraph. This uses ONLY operations already proven in this codebase —
+ * the same `findExistingEventByICalUid` lookup the preserve-existing-invite
+ * guard uses, and the same `Calendar.Events.remove` call
+ * `cancelTransportTicketEvent` (src/08-action-transport-tickets.js) has been
+ * running against the live calendar — instead of an undocumented inference
+ * about what `events.import` does with `status: 'cancelled'`.
+ *
+ * NOT FOUND IS A CLEAN NO-OP, NOT AN ERROR. `findExistingEventByICalUid`
+ * leaves `showDeleted` at its default false, so an ALREADY-cancelled event
+ * is invisible to it — which makes re-processing the same cancellation
+ * idempotent. A cancellation whose confirmation this script never imported
+ * (or which arrives before it, though orderThreadsForProcessing in
+ * src/02-main.js now makes that the unusual case) likewise finds nothing.
+ * Both are correct outcomes: the desired end state — no live event under
+ * that UID — already holds. Critically, NOTHING IS CREATED in either case.
+ *
+ * PRESERVE-EXISTING-INVITE, same stance and same discriminator as
+ * importIcsEventWithSequenceRetry's guard: an event carrying a real guest
+ * relationship is Gmail's own native attendee copy, not one this script
+ * created (buildEventResource never emits attendees — the T-03-05 firewall),
+ * and Gmail's native detection handles the organizer's cancellation itself
+ * at strictly higher fidelity. Deleting someone else's meeting on the
+ * strength of an attachment we parsed is destructive and unnecessary, so
+ * such an event is left untouched. The negative guarantee still holds
+ * absolutely: this branch writes NOTHING, so the cancelled VEVENT is still
+ * never materialized as a live event.
+ *
+ * GAS-only (Calendar global); exercised in tests through a faked Calendar
+ * global, the harness convention established in test/calendar-routing.test.js
+ * and test/existing-invite-guard.test.js.
+ */
+function cancelIcsEventByUid(calendarId, uid) {
+  const existing = findExistingEventByICalUid(calendarId, uid);
+
+  if (!existing) {
+    console.log(
+      'ICS import: STATUS:CANCELLED VEVENT for iCalUID ' + uid + ' — no live event found on calendar ' +
+        calendarId + ', nothing to cancel (and nothing created).'
+    );
+    return { action: 'not-found', eventId: null };
+  }
+
+  if (hasGuestRelationship(existing)) {
+    console.log(
+      'ICS import: STATUS:CANCELLED VEVENT for iCalUID ' + uid + ' matches an event on calendar ' +
+        calendarId + ' carrying ' + existing.attendees.length +
+        ' guest(s) — leaving it untouched (Gmail owns that attendee copy and handles the cancellation itself).'
+    );
+    return { action: 'skipped-existing-invite', eventId: existing.id };
+  }
+
+  Calendar.Events.remove(calendarId, existing.id);
+  console.log(
+    'ICS import: STATUS:CANCELLED VEVENT for iCalUID ' + uid + ' — deleted calendar event ' +
+      existing.id + ' on calendar ' + calendarId + '.'
+  );
+
+  return { action: 'cancelled', eventId: existing.id };
 }
 
 /**
@@ -1692,13 +1886,17 @@ function getIcsAttachmentTextsByMessage(thread) {
 // collapseBlankLines), the preserve-existing-invite guard's two pieces
 // (hasGuestRelationship — pure; findExistingEventByICalUid and
 // importIcsEventWithSequenceRetry — GAS-only, exported so the guard's
-// branching can be exercised against a faked Calendar global), and
-// ICS_CALENDAR_ACTION (action registry).
+// branching can be exercised against a faked Calendar global), the
+// cancelled-VEVENT guard's two pieces (planIcsEventWrite — pure and
+// directly unit-tested; cancelIcsEventByUid — GAS-only, same faked-global
+// treatment), and ICS_CALENDAR_ACTION (action registry).
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     hasGuestRelationship: hasGuestRelationship,
     findExistingEventByICalUid: findExistingEventByICalUid,
     importIcsEventWithSequenceRetry: importIcsEventWithSequenceRetry,
+    planIcsEventWrite: planIcsEventWrite,
+    cancelIcsEventByUid: cancelIcsEventByUid,
     parseIcs: parseIcs,
     decodeBase64Utf8: decodeBase64Utf8,
     isIcsText: isIcsText,

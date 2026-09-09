@@ -1429,3 +1429,283 @@ test('ORDER 2 (rebooking first, then cancel -- THE EXACT SCENARIO THE OWNER ASKE
     assert.equal(removeCalls.length, 0, 'the stale cancellation must not call Calendar.Events.remove');
   });
 });
+
+// --- MULTI-MATCH CANCELLATION (debug/regiojet-cancel-not-deleted) -----------
+//
+// THE FAULT: findTransportEventByIdentifier returned `items[0]` and
+// cancelTransportTicketEvent removed exactly that ONE id, then logged
+// "cancelled (deleted) calendar event for ticket identifier X" -- an
+// UNCONDITIONAL success message naming only the identifier, saying nothing
+// about how many events actually carried it.
+//
+// That was safe only while "one ticketIdentifier == at most one event" held.
+// quick-260813-dq2 Task 3 (D-08, Problem A) ENDED that invariant: the
+// isDuplicateTransportTicket pre-check is now skipped for every uid-bearing
+// entry, on the reasoning that Calendar.Events.import's iCalUID keying already
+// dedups. It does -- BY UID, NOT by ticket number. A RegioJet reissue whose UID
+// hash changes, or a multi-VEVENT/multi-leg ticket, therefore yields TWO live
+// events sharing ONE ticketIdentifier. The cancellation deleted one of them,
+// logged full success, and left the other on the calendar: the exact reported
+// contradiction -- "the log says deleted, the event is still there".
+//
+// The lookup must be plural, and the success log must state the count.
+
+test('cancelTransportTicketEvent: TWO events sharing ONE ticketIdentifier -- BOTH are removed, not just items[0] (the reported contradiction)', () => {
+  const firstEvent = { id: 'event-original', extendedProperties: { private: { ticketIdentifier: '4400574546' } } };
+  const secondEvent = { id: 'event-reissue', extendedProperties: { private: { ticketIdentifier: '4400574546' } } };
+
+  withFakeCalendar([firstEvent, secondEvent], function (calls) {
+    cancelTransportTicketEvent('4400574546', 'calendar-a');
+
+    assert.equal(calls.removeCalls.length, 2);
+    assert.deepEqual(
+      calls.removeCalls
+        .map(function (call) {
+          return call.eventId;
+        })
+        .sort(),
+      ['event-original', 'event-reissue']
+    );
+  });
+});
+
+test('cancelTransportTicketEvent: THREE events sharing one ticketIdentifier -- all three removed, each against the resolved calendarId', () => {
+  const events = ['a', 'b', 'c'].map(function (suffix) {
+    return { id: 'event-' + suffix, extendedProperties: { private: { ticketIdentifier: '4400574546' } } };
+  });
+
+  withFakeCalendar(events, function (calls) {
+    cancelTransportTicketEvent('4400574546', 'calendar-a');
+
+    assert.equal(calls.removeCalls.length, 3);
+    calls.removeCalls.forEach(function (call) {
+      assert.equal(call.calendarId, 'calendar-a');
+    });
+  });
+});
+
+test('cancelTransportTicketEvent: staleness is evaluated PER EVENT -- a stale (already-rebooked) match survives while a non-stale match sharing the identifier is still removed', () => {
+  const cancelDtstamp = new Date('2026-09-08T13:10:30Z');
+  // Tagged with a dtstamp NEWER than this cancellation -> a rebooking has
+  // already superseded it (D-11), so it must survive.
+  const staleEvent = {
+    id: 'event-already-rebooked',
+    extendedProperties: { private: { ticketIdentifier: '4400574546', dtstamp: '2026-09-08T13:15:00.000Z' } },
+  };
+  const liveEvent = {
+    id: 'event-still-live',
+    extendedProperties: { private: { ticketIdentifier: '4400574546', dtstamp: '2026-09-08T13:05:00.000Z' } },
+  };
+
+  withFakeCalendar([staleEvent, liveEvent], function (calls) {
+    cancelTransportTicketEvent('4400574546', 'calendar-a', cancelDtstamp);
+
+    assert.equal(calls.removeCalls.length, 1);
+    assert.equal(calls.removeCalls[0].eventId, 'event-still-live');
+  });
+});
+
+test('cancelTransportTicketEvent: when EVERY match is stale, nothing is removed at all (D-11 fully preserved under the plural lookup)', () => {
+  const cancelDtstamp = new Date('2026-09-08T13:10:30Z');
+  const events = ['a', 'b'].map(function (suffix) {
+    return {
+      id: 'event-' + suffix,
+      extendedProperties: { private: { ticketIdentifier: '4400574546', dtstamp: '2026-09-08T13:15:00.000Z' } },
+    };
+  });
+
+  withFakeCalendar(events, function (calls) {
+    cancelTransportTicketEvent('4400574546', 'calendar-a', cancelDtstamp);
+
+    assert.equal(calls.removeCalls.length, 0);
+  });
+});
+
+// --- INTRA-JOB CREATE/CANCEL ORDER (debug/regiojet-cancel-not-deleted) ------
+//
+// THE FAULT: processTransportTicketJob ran `toCancel` BEFORE `toCreate`.
+// Its own JSDoc recorded the consequence as an "ACCEPTED ORDERING CONSEQUENCE
+// (known, not a bug)" justified by "RegioJet does not send such a message" --
+// an assumption about a foreign sender's future behavior, load-bearing for the
+// whole cancellation guarantee and verifiable by nobody here.
+//
+// It is the SAME defect as the thread-level one (test/thread-processing-order.test.js):
+// a cancel evaluated before the create it refers to finds nothing, no-ops, and
+// the create then wins. Whenever one message carries both a live VEVENT and a
+// CANCELLED VEVENT for one ticket, the cancelled ticket ends up ON the calendar.
+// Creates must settle before cancels, at every level.
+
+function withTransportRunGlobals(store, fn) {
+  const previous = {
+    Calendar: global.Calendar,
+    CalendarApp: global.CalendarApp,
+    DriveApp: global.DriveApp,
+    CONFIG: global.CONFIG,
+    importIcsEventWithSequenceRetry: global.importIcsEventWithSequenceRetry,
+  };
+  const realConsoleLog = console.log;
+
+  global.CONFIG = { calendarId: 'calendar-a', ticketAttachmentDriveFolderName: 'tickets' };
+  global.CalendarApp = {
+    getCalendarById: function () {
+      return {
+        getTimeZone: function () {
+          return 'Europe/Prague';
+        },
+      };
+    },
+  };
+  global.DriveApp = {
+    getFoldersByName: function () {
+      return {
+        hasNext: function () {
+          return false;
+        },
+      };
+    },
+  };
+  global.Calendar = {
+    Events: {
+      list: function (calendarId, options) {
+        if (options && options.iCalUID) {
+          return {
+            items: store.filter(function (event) {
+              return event.iCalUID === options.iCalUID;
+            }),
+          };
+        }
+        const match = /^ticketIdentifier=(.*)$/.exec((options && options.privateExtendedProperty) || '');
+        const wanted = match ? match[1] : null;
+        return {
+          items: store.filter(function (event) {
+            return (
+              event.extendedProperties &&
+              event.extendedProperties.private &&
+              event.extendedProperties.private.ticketIdentifier === wanted
+            );
+          }),
+        };
+      },
+      insert: function (resource) {
+        store.push(Object.assign({ id: 'event-' + (store.length + 1) }, resource));
+      },
+      remove: function (calendarId, eventId) {
+        const index = store.findIndex(function (event) {
+          return event.id === eventId;
+        });
+        if (index !== -1) {
+          store.splice(index, 1);
+        }
+      },
+    },
+  };
+  // GAS concatenates every project file into ONE shared global scope, so
+  // processTransportTicketJob's bare `importIcsEventWithSequenceRetry` reference
+  // resolves there. Under Node each file is its own module, so wire it as the
+  // runtime would. Models Calendar.Events.import's real semantics: a
+  // full-resource UPSERT keyed on iCalUID.
+  global.importIcsEventWithSequenceRetry = function (resource, calendarId, uid) {
+    const existing = store.find(function (event) {
+      return event.iCalUID === uid;
+    });
+    if (existing) {
+      Object.keys(resource).forEach(function (key) {
+        existing[key] = resource[key];
+      });
+      return { action: 'imported', eventId: existing.id };
+    }
+    store.push(Object.assign({ id: 'event-' + (store.length + 1) }, resource));
+    return { action: 'imported', eventId: null };
+  };
+  console.log = function () {};
+
+  try {
+    fn();
+  } finally {
+    console.log = realConsoleLog;
+    Object.keys(previous).forEach(function (key) {
+      if (previous[key] === undefined) {
+        delete global[key];
+      } else {
+        global[key] = previous[key];
+      }
+    });
+  }
+}
+
+function regiojetIcsMessage(icsTexts) {
+  return {
+    getFrom: function () {
+      return 'RegioJet <jizdenky@regiojet.cz>';
+    },
+    getPlainBody: function () {
+      return '';
+    },
+    getAttachments: function () {
+      return icsTexts.map(function (text, index) {
+        return fakeAttachment('ticket-' + index + '.ics', 'text/calendar', text);
+      });
+    },
+  };
+}
+
+function regiojetThread(messages) {
+  return {
+    getId: function () {
+      return 'thread-1';
+    },
+    getMessages: function () {
+      return messages;
+    },
+  };
+}
+
+test('TRANSPORT_TICKETS_ACTION.run: ONE message carrying both a live VEVENT and a CANCELLED VEVENT for the SAME ticket ends with NO event -- the cancel must settle after the create, not before it', () => {
+  const store = [];
+
+  withTransportRunGlobals(store, function () {
+    TRANSPORT_TICKETS_ACTION.run(regiojetThread([regiojetIcsMessage([REAL_REGIOJET_ICS, REAL_REGIOJET_CANCEL_ICS])]));
+
+    assert.equal(store.length, 0, 'a cancelled ticket must never survive its own message');
+  });
+});
+
+test('TRANSPORT_TICKETS_ACTION.run: the cancel still runs when NOTHING is left to create -- the early "nothing to create" return must never bypass the cancellations', () => {
+  const store = [
+    {
+      id: 'event-existing',
+      iCalUID: '-9876543210@regiojet.cz',
+      extendedProperties: { private: { ticketIdentifier: '7788123456' } },
+    },
+  ];
+
+  withTransportRunGlobals(store, function () {
+    TRANSPORT_TICKETS_ACTION.run(regiojetThread([regiojetIcsMessage([REAL_REGIOJET_CANCEL_ICS])]));
+
+    assert.equal(store.length, 0);
+  });
+});
+
+test('TRANSPORT_TICKETS_ACTION.run: an ordinary confirmation-only message still creates exactly one tagged event (the happy path is unchanged)', () => {
+  const store = [];
+
+  withTransportRunGlobals(store, function () {
+    TRANSPORT_TICKETS_ACTION.run(regiojetThread([regiojetIcsMessage([REAL_REGIOJET_ICS])]));
+
+    assert.equal(store.length, 1);
+    assert.equal(store[0].extendedProperties.private.ticketIdentifier, '7788123456');
+    assert.equal(store[0].iCalUID, '-9876543210@regiojet.cz');
+  });
+});
+
+test('TRANSPORT_TICKETS_ACTION.run: a thread whose messages arrive confirmation-then-cancellation ends with no event (message order is already causal and stays so)', () => {
+  const store = [];
+
+  withTransportRunGlobals(store, function () {
+    TRANSPORT_TICKETS_ACTION.run(
+      regiojetThread([regiojetIcsMessage([REAL_REGIOJET_ICS]), regiojetIcsMessage([REAL_REGIOJET_CANCEL_ICS])])
+    );
+
+    assert.equal(store.length, 0);
+  });
+});

@@ -765,16 +765,45 @@ function getOrCreateTransportDriveFolder(name) {
  * singleEvents: true })`. Not paginated/time-windowed — a
  * `privateExtendedProperty` filter against a near-certainly-unique
  * per-ticket number is already an EXACT match expected to return 0 or 1
- * events. Returns the first matching event, or `null` if none found.
- * GAS-only (Calendar global) — not unit-tested, proven only by the live
- * checkpoint.
+ * events. Returns EVERY matching event (possibly empty), never null.
+ *
+ * PLURAL BY CONSTRUCTION (live-reported bug regiojet-cancel-not-deleted):
+ * this used to return `items[0]` alone, on the documented assumption that a
+ * per-ticket number is "near-certainly unique" so the query returns 0 or 1
+ * events. quick-260813-dq2 Task 3 (D-08, Problem A) silently ENDED that
+ * invariant: filterTransportEntriesToCreate now skips
+ * isDuplicateTransportTicket for every uid-bearing entry, reasoning that
+ * `Calendar.Events.import`'s iCalUID keying already dedups. It does — BY UID,
+ * NOT by ticket number. A RegioJet reissue whose UID hash changes, or a
+ * multi-VEVENT / multi-leg ticket, therefore produces TWO live events sharing
+ * ONE ticketIdentifier, and a caller that looked only at `items[0]` acted on
+ * an arbitrary one of them while reporting unqualified success. Callers that
+ * genuinely want a single representative event use
+ * findTransportEventByIdentifier below; callers that must act on ALL of them
+ * (cancelTransportTicketEvent) use this one.
+ *
+ * GAS-only (Calendar global) — not unit-tested directly, but fully exercised
+ * through cancelTransportTicketEvent under a fake global.Calendar.
  */
-function findTransportEventByIdentifier(ticketIdentifier, calendarId) {
+function findTransportEventsByIdentifier(ticketIdentifier, calendarId) {
   const response = Calendar.Events.list(calendarId, {
     privateExtendedProperty: 'ticketIdentifier=' + ticketIdentifier,
     singleEvents: true,
   });
-  const items = (response && response.items) || [];
+  return (response && response.items) || [];
+}
+
+/**
+ * findTransportEventByIdentifier — the single-event convenience wrapper over
+ * findTransportEventsByIdentifier above: returns the first matching event, or
+ * `null` if none found. This is the right shape for the DEDUP SAFETY NET's
+ * existence question (isDuplicateTransportTicket), which only ever asks
+ * "does any event already carry this identifier?" — never "which ones?".
+ * GAS-only (Calendar global) — not unit-tested, proven only by the live
+ * checkpoint.
+ */
+function findTransportEventByIdentifier(ticketIdentifier, calendarId) {
+  const items = findTransportEventsByIdentifier(ticketIdentifier, calendarId);
   return items.length > 0 ? items[0] : null;
 }
 
@@ -943,24 +972,51 @@ function cancelTransportTicketEvent(ticketIdentifier, calendarId, cancelDtstamp)
     return;
   }
 
-  const existingEvent = findTransportEventByIdentifier(ticketIdentifier, calendarId);
-  if (!existingEvent) {
+  const existingEvents = findTransportEventsByIdentifier(ticketIdentifier, calendarId);
+  if (existingEvents.length === 0) {
     console.log(
       'Transport tickets: cancellation for ticket identifier ' + ticketIdentifier + ' has no matching calendar event, skipping (silent no-op, D-05 accepted limitation).'
     );
     return;
   }
 
-  if (isTransportCancellationStale(existingEvent, cancelDtstamp)) {
-    const storedDtstamp = existingEvent.extendedProperties.private.dtstamp;
+  let removedCount = 0;
+
+  existingEvents.forEach(function (existingEvent) {
+    // Staleness is a property of the INDIVIDUAL event (its own stored
+    // dtstamp tag), never of the identifier as a whole -- two events sharing
+    // one ticket number can genuinely disagree about it, e.g. an original
+    // event this cancellation supersedes alongside a rebooking that
+    // supersedes the cancellation. Evaluating it per event keeps the D-11
+    // guarantee exact instead of letting one stale match veto every deletion.
+    if (isTransportCancellationStale(existingEvent, cancelDtstamp)) {
+      const storedDtstamp = existingEvent.extendedProperties.private.dtstamp;
+      console.log(
+        'Transport tickets: cancellation for ticket identifier ' + ticketIdentifier + ' is STALE for event ' + existingEvent.id + ' (event dtstamp ' + storedDtstamp + ' is newer than the cancellation\'s own dtstamp ' + cancelDtstamp + ') -- a rebooking already superseded this event, skipping its deletion (D-11).'
+      );
+      return;
+    }
+
+    Calendar.Events.remove(calendarId, existingEvent.id);
+    removedCount += 1;
+  });
+
+  // The count is part of the message, not decoration. The pre-fix log said
+  // "cancelled (deleted) calendar event for ticket identifier X" whether it
+  // had deleted the only match or one of several -- which is precisely how a
+  // half-done cancellation read as a complete one in the live report that
+  // produced this fix. A log that cannot distinguish those two outcomes
+  // cannot be used to diagnose them.
+  if (removedCount === 0) {
     console.log(
-      'Transport tickets: cancellation for ticket identifier ' + ticketIdentifier + ' is STALE (event dtstamp ' + storedDtstamp + ' is newer than the cancellation\'s own dtstamp ' + cancelDtstamp + ') -- a rebooking already superseded this event, skipping the deletion (D-11).'
+      'Transport tickets: cancellation for ticket identifier ' + ticketIdentifier + ' matched ' + existingEvents.length + ' event(s) on calendar ' + calendarId + ', but every one was stale -- nothing deleted (D-11).'
     );
     return;
   }
 
-  Calendar.Events.remove(calendarId, existingEvent.id);
-  console.log('Transport tickets: cancelled (deleted) calendar event for ticket identifier ' + ticketIdentifier + ' on calendar ' + calendarId + '.');
+  console.log(
+    'Transport tickets: cancelled (deleted) ' + removedCount + ' of ' + existingEvents.length + ' matching calendar event(s) for ticket identifier ' + ticketIdentifier + ' on calendar ' + calendarId + '.'
+  );
 }
 
 /**
@@ -1051,27 +1107,15 @@ function filterTransportEntriesToCreate(entries, calendarId) {
  *      now happening here (before the dedup filter below) are reads/pure
  *      calls, not writes — this file's "ORDERING GUARANTEE" doc concerns
  *      Drive/Calendar WRITES specifically, and remains unaffected.
- *   2.5. CANCELLATION (D-03/D-04/D-05 of quick-260813-dq2, D-11 staleness
- *      guard added at Task 3): partition `entries` via
- *      partitionTransportEntriesByCancellation into `{ toCancel, toCreate }`,
- *      run cancelTransportTicketEvent over EVERY `toCancel` entry — with the
- *      already-resolved `calendarId` AND, since Task 3, `entry.dtstamp` as
- *      the third argument so a cancellation that has already been
- *      superseded by a newer rebooking is detected and skipped (D-11) —
- *      then let every step below operate on `toCreate` instead of `entries`.
+ *   2.5. PARTITION (D-03/D-04/D-05 of quick-260813-dq2, D-11 staleness
+ *      guard added at Task 3): split `entries` via
+ *      partitionTransportEntriesByCancellation into `{ toCancel, toCreate }`.
  *      This MUST sit here — AFTER entries is built, BEFORE the dedup filter
  *      in step 3 — because a cancel entry's ticketIdentifier deliberately
  *      matches the very event it is meant to delete; running the dedup
  *      filter on it first would drop it as an "already exists" duplicate
- *      and the cancellation would silently vanish. ACCEPTED ORDERING
- *      CONSEQUENCE (known, not a bug): resolveTransportProcessingJobs emits
- *      one job per MESSAGE, so a confirmation and its later cancellation
- *      are two independent processTransportTicketJob calls in thread
- *      order — if a single `.ics` ever carried both a REQUEST VEVENT and a
- *      CANCEL VEVENT for the same ticket in ONE job's `entries`, the cancel
- *      would run first (no-op, nothing exists yet) and the create would
- *      then win. RegioJet does not send such a message; no ordering
- *      machinery is added for a shape that does not occur.
+ *      and the cancellation would silently vanish. Only the SPLIT happens
+ *      here; the cancellations themselves now run LAST (step 6).
  *   3. Drop already-present `toCreate` entries via
  *      filterTransportEntriesToCreate(toCreate, calendarId) — the EXISTING
  *      seenInBatch + isDuplicateTransportTicket filter, extracted verbatim
@@ -1083,7 +1127,11 @@ function filterTransportEntriesToCreate(entries, calendarId) {
  *      that guarantee on its own. `seenInBatch` still applies to every
  *      entry unchanged (D-08's deliberate scope limit — see
  *      filterTransportEntriesToCreate's own JSDoc for the full rationale).
- *      If nothing remains, return immediately — no Drive upload, no write.
+ *      If nothing remains, steps 4 and 5 are skipped entirely — no Drive
+ *      upload, no write — but step 6 STILL RUNS (see writeTransportTicketEvents'
+ *      own JSDoc: that early exit ends the WRITE PHASE, never the job; a
+ *      cancellation-only message has nothing to create by definition and
+ *      must still cancel).
  *   4. If `job.sender.insertPdfIntoEvent` is true: find the ticket PDF
  *      (findTransportTicketPdfAttachment, which excludes invoice.pdf; also
  *      matches the IDOS.cz ticket PDF despite its application/octet-stream
@@ -1122,6 +1170,25 @@ function filterTransportEntriesToCreate(entries, calendarId) {
  *      which never carry a UID). This EXISTING write loop is kept
  *      verbatim, now operating on `entry.resource`/`entry.uid` instead of
  *      a raw parsed `.ics` event.
+ *   6. CANCELLATION, LAST (D-03/D-04/D-05, D-11 staleness guard): run
+ *      cancelTransportTicketEvent over EVERY `toCancel` entry from step 2.5,
+ *      with the already-resolved `calendarId` AND `entry.dtstamp` as the
+ *      third argument, so a cancellation already superseded by a newer
+ *      rebooking is detected and skipped (D-11).
+ *
+ *      WHY LAST (live-reported bug regiojet-cancel-not-deleted): this used to
+ *      be step 2.5, ahead of the writes. A cancel evaluated BEFORE the create
+ *      it refers to finds no event, takes its silent no-op branch, and the
+ *      create then wins — leaving a CANCELLED ticket on the calendar with no
+ *      error and no failure label. The old ordering was documented as an
+ *      "accepted consequence" on the grounds that RegioJet does not package a
+ *      REQUEST and a CANCEL VEVENT in one message; that was an assumption
+ *      about a foreign sender's future behaviour, load-bearing for the whole
+ *      cancellation guarantee and verifiable by nobody here. Creating first
+ *      makes STATUS:CANCELLED authoritative regardless of how a sender
+ *      packages its VEVENTs, and mirrors the same causal ordering
+ *      orderThreadsForProcessing (src/02-main.js) now guarantees one level up,
+ *      across threads.
  *
  * FLAGGED ASSUMPTION: passing `supportsAttachments` to
  * `Calendar.Events.import` (as opposed to `Calendar.Events.insert`, where
@@ -1173,9 +1240,6 @@ function processTransportTicketJob(job) {
   // exists" duplicate and the cancellation would silently vanish (see this
   // function's own JSDoc, step 2.5).
   const partitioned = partitionTransportEntriesByCancellation(entries);
-  partitioned.toCancel.forEach(function (entry) {
-    cancelTransportTicketEvent(entry.ticketIdentifier, calendarId, entry.dtstamp);
-  });
 
   // D-08 of quick-260813-dq2 Task 3: filterTransportEntriesToCreate is the
   // EXISTING seenInBatch + isDuplicateTransportTicket filter (WR-01 of the
@@ -1183,6 +1247,48 @@ function processTransportTicketJob(job) {
   // change — see its own JSDoc for the full Problem A rationale.
   const entriesToCreate = filterTransportEntriesToCreate(partitioned.toCreate, calendarId);
 
+  // CREATES SETTLE BEFORE CANCELS (live-reported bug
+  // regiojet-cancel-not-deleted). The cancellations used to run HERE, before
+  // the write loop. This function's own JSDoc recorded the consequence as an
+  // "ACCEPTED ORDERING CONSEQUENCE (known, not a bug)" — a cancel and a create
+  // for one ticket inside a single job would resolve cancel-first (no-op,
+  // nothing exists yet) and the create would then win, leaving a CANCELLED
+  // ticket on the calendar — justified by "RegioJet does not send such a
+  // message". That was an assumption about a foreign sender's future
+  // behaviour, load-bearing for the whole cancellation guarantee and
+  // verifiable by nobody here.
+  //
+  // It is the same defect as the thread-level one orderThreadsForProcessing
+  // (src/02-main.js) fixes: a cancel evaluated before the create it refers to
+  // finds nothing and no-ops. Running writes first makes the outcome causal at
+  // every level, so STATUS:CANCELLED is authoritative no matter how a sender
+  // packages its VEVENTs. The partition itself deliberately stays where it was
+  // — above the dedup filter — so a cancel entry is still never dedup-dropped.
+  writeTransportTicketEvents(job, entriesToCreate, calendarId);
+
+  partitioned.toCancel.forEach(function (entry) {
+    cancelTransportTicketEvent(entry.ticketIdentifier, calendarId, entry.dtstamp);
+  });
+}
+
+/**
+ * writeTransportTicketEvents — steps 4 and 5 of processTransportTicketJob (the
+ * PDF archive/attach block and the calendar write loop), extracted verbatim at
+ * the regiojet-cancel-not-deleted fix so the create phase can be sequenced
+ * BEFORE the cancel phase without the "nothing to create" early return
+ * swallowing the cancellations along with it. That early return is now a local
+ * `return` from THIS function only — it ends the write phase, never the job.
+ * Returning out of the whole job at that point (which is what the pre-fix
+ * `return` did once the phases were reordered) would silently skip every
+ * cancellation on a cancellation-only message: the single most common shape
+ * this action sees, and the exact failure the fix exists to prevent.
+ *
+ * Behaviour of the two steps themselves is UNCHANGED — see
+ * processTransportTicketJob's JSDoc (steps 4 and 5) for their full contract,
+ * including the FLAGGED ASSUMPTION about supportsAttachments on the import
+ * path. GAS-only (DriveApp/Calendar globals).
+ */
+function writeTransportTicketEvents(job, entriesToCreate, calendarId) {
   if (entriesToCreate.length === 0) {
     return;
   }
@@ -1313,10 +1419,20 @@ const TRANSPORT_TICKETS_ACTION = {
 // A regression and the D-11/D-12 stale-cancellation/ordering scenarios can
 // all be proven under Node with a fake global.Calendar, rather than deferred
 // entirely to a live round. getOrCreateTransportDriveFolder/
-// findTransportEventByIdentifier/isDuplicateTransportTicket/
+// findTransportEventByIdentifier/findTransportEventsByIdentifier/
+// isDuplicateTransportTicket/writeTransportTicketEvents/
 // processTransportTicketJob remain genuinely GAS-only (reference
-// DriveApp/CalendarApp/Calendar globals directly) and are NOT exported —
-// they are never invoked under Node.
+// DriveApp/CalendarApp/Calendar globals directly) and are NOT exported.
+//
+// They ARE reachable under Node INDIRECTLY, through the exported
+// TRANSPORT_TICKETS_ACTION.run with faked Calendar/CalendarApp/DriveApp
+// globals — which is how the regiojet-cancel-not-deleted create-before-cancel
+// ordering regression is proven (see withTransportRunGlobals in
+// test/transport-tickets.test.js). That helper must ALSO wire
+// `globalThis.importIcsEventWithSequenceRetry`: GAS concatenates every project
+// file into ONE shared global scope, so processTransportTicketJob's bare
+// reference to it resolves there, but this file's Node bridge above only wires
+// parseIcs/buildEventResource/isIcsAttachment from that same sibling module.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     transportExtractEmailAddress: transportExtractEmailAddress,
