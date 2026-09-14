@@ -430,7 +430,15 @@
             refs[field.name] = cellInput;
           });
 
-          var removeTd = document.createElement('td');
+          var actionsTd = document.createElement('td');
+          var copyButton = document.createElement('button');
+          copyButton.type = 'button';
+          copyButton.textContent = 'Copy';
+          copyButton.addEventListener('click', function () {
+            addDataRow(readRowFromRefs(model.rowFields, refs));
+          });
+          actionsTd.appendChild(copyButton);
+
           var removeButton = document.createElement('button');
           removeButton.type = 'button';
           removeButton.textContent = 'Remove';
@@ -441,8 +449,8 @@
               rowRefs.splice(idx, 1);
             }
           });
-          removeTd.appendChild(removeButton);
-          tr.appendChild(removeTd);
+          actionsTd.appendChild(removeButton);
+          tr.appendChild(actionsTd);
 
           tbody.appendChild(tr);
           rowRefs.push(refs);
@@ -467,17 +475,21 @@
         return wrapper;
       }
 
+      function readRowFromRefs(rowFields, refs) {
+        var row = {};
+        rowFields.forEach(function (field) {
+          var el = refs[field.name];
+          row[field.name] = field.kind === 'boolean' ? el.checked : el.value;
+        });
+        return row;
+      }
+
       function collectSubmittedValue(entry) {
         var model = entry.model;
 
         if (model.fieldKind === 'rows') {
           return entry.rowRefs.map(function (refs) {
-            var row = {};
-            model.rowFields.forEach(function (field) {
-              var el = refs[field.name];
-              row[field.name] = field.kind === 'boolean' ? el.checked : el.value;
-            });
-            return row;
+            return readRowFromRefs(model.rowFields, refs);
           });
         }
 

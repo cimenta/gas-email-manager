@@ -8,7 +8,7 @@ Five actions ship today:
 
 - **ICS-to-Calendar import** — any sender, generic `.ics` calendar attachments
 - **Booking.com reservation management** — booking.com
-- **Ticketing-portal PDF import** — enigoo.cz, Kino Art (kinoart.cz), Ticketmaster CZ (ticketmaster.cz)
+- **Ticketing-portal import** — enigoo.cz, Kino Art (kinoart.cz), Ticketmaster CZ (ticketmaster.cz), Entradio (app.entradio.cz)
 - **Transport ticket import** — RegioJet (regiojet.cz), IDOS.cz (idos.svt.cz)
 - **Meetings** — body-sourced meeting invites with no `.ics` attachment, matched by sender domain; Teamio (teamio.com) ships first
 
@@ -31,12 +31,14 @@ in addition to processed, so nothing is lost silently.
   Gmail-to-Calendar detection hasn't already created one for that
   reservation. On a cancellation email, deletes the matching event. See
   [Booking.com matching](#bookingcom-matching) for how a match is found.
-- **Ticketing-portal PDF import** — for a configured portal (identified by
-  its confirmation email's sender address), extracts the event name,
-  date/time, and venue from the attached PDF ticket via Google Drive's
-  PDF-to-Docs OCR conversion (Apps Script has no native PDF text parser),
-  creates one calendar event per purchase regardless of how many tickets it
-  contains, and optionally attaches the original PDF to the event. See
+- **Ticketing-portal import** — for a configured portal (identified by its
+  confirmation email's sender address), extracts the event name, date/time,
+  and venue either from the attached PDF ticket via Google Drive's
+  PDF-to-Docs OCR conversion (Apps Script has no native PDF text parser) or
+  straight from the plain-text email body, depending on where that portal
+  actually puts the data. Either way it creates one calendar event per
+  purchase regardless of how many tickets it contains, and can optionally
+  attach the original ticket PDF to the event. See
   [Ticketing portals](#ticketing-portals).
 - **Transport ticket import (train/bus)** — for a configured carrier
   (identified by its confirmation email's sender address), builds the
@@ -218,11 +220,29 @@ exact required keys.
 
 ## Ticketing portals
 
-Unlike the ICS and booking.com actions, a ticket-purchase confirmation
-email's body is typically pure boilerplate ("thanks for your purchase, your
-e-ticket is attached") — every real detail (event name, date/time, venue)
-lives only inside the attached PDF. Since Apps Script has no native PDF text
-parser, this action:
+Ticketing portals disagree about where the event's real data lives, so this
+action supports **two processing modes** and each configured portal uses
+whichever one matches its emails. Both modes converge on the same
+one-event-per-purchase creation, dedup, and PDF-attachment steps downstream —
+only the extraction differs.
+
+| Portal | Mode | Where the event data comes from |
+| --- | --- | --- |
+| enigoo.cz | PDF/OCR | the attached PDF ticket |
+| Kino Art (kinoart.cz) | body | the plain-text email body |
+| Ticketmaster CZ (ticketmaster.cz) | body | the plain-text email body |
+| Entradio (app.entradio.cz) | body | the plain-text email body |
+
+A portal is assigned a mode implicitly, by which parser registry its sender
+address is registered in — there is no `mode` config field here (unlike the
+transport-tickets action, which declares one explicitly).
+
+### PDF/OCR mode
+
+Some portals send a confirmation whose body is pure boilerplate ("thanks for
+your purchase, your e-ticket is attached") — every real detail (event name,
+date/time, venue) lives only inside the attached PDF. Since Apps Script has
+no native PDF text parser, this mode:
 
 1. Uploads the PDF to a project-owned, auto-managed temp Drive folder
    (`GAS Email Manager - Temp`, created automatically if missing).
@@ -238,14 +258,47 @@ parser, this action:
    real Calendar attachment; otherwise deletes it. Nothing lingers in
    either Drive folder unless you asked for it.
 
-**Duplicate protection:** each created event is tagged with a stable
-identifier extracted from the ticket (e.g. its ticket number) via a private
-`extendedProperties` tag, checked against existing calendar events before
-creating a new one — the same tag-before-create pattern the booking.com
-action already uses, so reprocessing the same email can never create a
-second event.
+### Body mode
 
-**Per-portal parsers, one shared file.** A portal's PDF layout is
+Other portals put everything in the email body itself. This mode reads
+`message.getPlainBody()` and never touches Drive or OCR at all — no temp
+folder, no Doc conversion. If that portal's `insertPdfIntoEvent` is on and it
+has a ticket PDF worth keeping, the PDF is moved straight into your permanent
+Drive folder and attached; there is nothing to clean up otherwise, because
+nothing was ever uploaded.
+
+Each body-mode portal anchors on literal markers that actually appear in its
+own emails, never on line positions — email-to-plain-text rendering reflows
+text unpredictably, and a layout-position parser breaks the first time a
+template shifts.
+
+**Entradio** (`no-reply@app.entradio.cz`) is worth calling out: it is a
+white-label platform many venues send through, not a venue itself, so the one
+sender address covers every venue on it and its parser anchors purely on
+Entradio's own template structure. Its confirmations carry **no ticket PDF at
+all** — the only attachment is the venue's terms and conditions, so no PDF
+finder is registered for it. Instead, when that portal's `insertPdfIntoEvent`
+is on, the action follows the confirmation's own "download tickets" link and
+attaches whatever file comes back; unconditionally (regardless of that
+toggle), it also fetches each purchased seat's QR-code image straight from
+Entradio's own endpoint and attaches those too — both land in your permanent
+Drive folder alongside every other portal's attachments. If a fetch fails
+(an expired link, a network hiccup), the event is still created — an
+attachment is never allowed to block the event — and you get a one-off
+e-mail only if literally nothing could be attached. The created event gets
+the order number, the venue address, and a description listing each seat
+(section/row/seat) from the order.
+
+**Duplicate protection:** each created event is tagged with a stable
+identifier extracted from the ticket (its ticket or order number) via a
+private `extendedProperties` tag, checked against existing calendar events
+before creating a new one — the same tag-before-create pattern the
+booking.com action already uses, so reprocessing the same email can never
+create a second event. A portal whose emails carry no stable number at all
+(Ticketmaster CZ) is a documented exception that simply does not get this
+protection.
+
+**Per-portal parsers, one shared file.** A portal's PDF or body layout is
 platform-specific code, not just configuration — same principle as a
 language pack's `parseDateLine`. Unlike language packs, all portal parsers
 live together in one file, `src/07-action-ticketing-portals.js` (an explicit
@@ -255,8 +308,10 @@ config entry plus a parser function in that same file.
 **New OAuth scopes:** this action needs `https://www.googleapis.com/auth/drive`
 (folder/file management — the broader scope, not `drive.file`, since it
 needs to find folders you may have created yourself, not just ones the
-script created) and `https://www.googleapis.com/auth/documents` (reading the
-OCR-converted Doc's text). You'll be prompted to re-authorize the first time
+script created), `https://www.googleapis.com/auth/documents` (reading the
+OCR-converted Doc's text), and `https://www.googleapis.com/auth/script.external_request`
+(this project's first outbound HTTP fetch, added for Entradio's ticket-file
+and QR-code downloads). You'll be prompted to re-authorize the first time
 you run anything after adding this action.
 
 ## Transport tickets
@@ -626,11 +681,14 @@ on demand with the result shown directly in the page, and viewing/editing
 every one of the 34 settings from [Configuration reference](#configuration-reference)
 in one place.
 
-**The three JSON-shaped settings** (`calendarIdBySender`, `ticketingPortals`,
-`transportSenders`) render as structured, add/remove-row tables with one
-input per field — not a free-text JSON box. This removes the JSON-vs-JS-object-
-literal pitfall called out in [Live settings override](#live-settings-override-script-properties)
-entirely: there's nothing to hand-type, so there's nothing to get wrong.
+**The four JSON-shaped settings** (`calendarIdBySender`, `ticketingPortals`,
+`transportSenders`, `meetingSystems`) render as structured, add/copy/remove-row
+tables with one input per field — not a free-text JSON box. This removes the
+JSON-vs-JS-object-literal pitfall called out in [Live settings override](#live-settings-override-script-properties)
+entirely: there's nothing to hand-type, so there's nothing to get wrong. Each
+row also carries a **Copy** button, which appends a new row pre-filled with
+that row's current values — duplicating a near-identical portal or sender
+entry is one click and a tweak, not retyping every field by hand.
 
 **Deploying it:**
 

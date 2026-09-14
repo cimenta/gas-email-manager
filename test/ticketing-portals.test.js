@@ -2,10 +2,13 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const {
   parseEnigooTicketText,
   parseKinoArtTicketText,
   parseTicketmasterCzTicketText,
+  parseEntradioTicketText,
   resolveTicketingPortal,
   resolveTicketingCalendarId,
   addMinutesToWallClockComponents,
@@ -19,6 +22,21 @@ const {
   TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL,
   TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL,
   TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL,
+  TICKETING_PORTALS_ACTION,
+  processTicketFromMessageBody,
+  // ROUND 2 (debug/entradio-portal-not-supported): the ticket-file + QR-code
+  // Calendar-attachment pipeline.
+  extractEntradioTicketCodes,
+  findEntradioTicketDownloadUrl,
+  buildEntradioQrCodeUrl,
+  isEntradioTicketFileResponseAcceptable,
+  isEntradioQrCodeResponseAcceptable,
+  entradioFileExtensionForMimeType,
+  buildEntradioTicketAttachmentFilename,
+  buildEntradioQrCodeFilename,
+  fetchEntradioAttachments,
+  TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL,
+  buildTicketCalendarEventResource,
 } = require('../src/07-action-ticketing-portals.js');
 
 // --- parseEnigooTicketText ---------------------------------------------------
@@ -1116,11 +1134,1760 @@ test('TICKETING_PORTALS_ACTION_CONFIG: the shipped default seeds a THIRD entry f
   assert.equal(resolveTicketingCalendarId(thirdPortal, 'DEFAULT_CAL'), 'DEFAULT_CAL');
 });
 
-test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are still the unchanged enigoo.cz and Kino Art entries, array length is 3', () => {
+test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are still the unchanged enigoo.cz and Kino Art entries, array length is 4 (updated debug/entradio-portal-not-supported)', () => {
   const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
   const portals = TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals;
 
-  assert.equal(portals.length, 3);
+  assert.equal(portals.length, 4);
   assert.deepEqual(portals[0], { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[1], { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false });
+});
+
+// --- parseEntradioTicketText (debug/entradio-portal-not-supported: the ------
+// --- FOURTH supported portal, the THIRD body-sourced one) -------------------
+//
+// THE BUG THIS PORTAL EXISTS TO FIX: an Entradio confirmation
+// (no-reply@app.entradio.cz) produced NO calendar event AND NO error. The
+// sender matched no TICKETING_PORTALS entry, so resolveTicketingPortal
+// returned null, resolveTicketProcessingJobs `continue`d past it without
+// emitting a job, and appliesTo returned false -- a silent skip, which is the
+// correct behaviour for an unknown sender. The defect was that this sender
+// was unknown, not that any matching or parsing logic was broken. The
+// resolveTicketProcessingJobs test at the bottom of this block is the direct
+// reproduction: before the fix it yielded 0 jobs, after it yields exactly 1.
+//
+// Entradio is a white-label PLATFORM, not a venue -- the real sample came
+// from Kino Metropol Olomouc, but the sender address is shared by every venue
+// using the system, so one portal entry covers all of them and every anchor
+// is on Entradio's own template structure rather than any venue's name.
+//
+// The fixture below is the REAL decoded .eml's text/plain part (owner-
+// supplied sample, quoted-printable -> UTF-8), reproduced line for line
+// INCLUDING its whitespace-only separator lines and the trailing spaces after
+// the empty "Poschodí"/"Sleva" labels -- those are exactly the details a
+// hand-approximated fixture would smooth away, and the Kino Art round-3
+// incident is this codebase's standing proof that such smoothing hides real
+// bugs. Two redactions only, neither touching a parse anchor: the buyer's own
+// name/e-mail/phone are fictionalized (mandatory -- push-public.bat hard-
+// aborts if the real address ever reaches src/ or test/), and the four
+// per-recipient SendGrid tracking URLs are collapsed to one placeholder.
+// Verified directly: the redacted fixture and the untouched real body parse
+// to byte-identical results.
+
+const REAL_ENTRADIO_BODY_TEXT = [
+  ' Děkujeme za Vaši objednávku. Vaše platba byla úspěšně zaplacena.',
+  '',
+  'Zobrazit objednávku ve webovém prohlížeči ( https://u00000000.ct.sendgrid.net/ls/click?upn=u001.EXAMPLE-TRACKING-TOKEN )',
+  '',
+  '*Děkujeme za Vaši objednávku*',
+  '',
+  'Vaše platba byla úspěšně zaplacena.',
+  '',
+  'Číslo objednávky',
+  '*2354152*',
+  '',
+  'Při vstupu na událost se prokážete vstupenkami, které jsou součástí tohoto e-mailu. Vstupenky není třeba tisknout, pokud je předložíte v mobilním telefonu.',
+  'Pokud jste při nákupu využili slevu, prosíme, prokažte nárok na slevu při vstupu na událost. V případě, že nárok na slevu prokázat nedokážete, žádáme, vzniklý rozdíl uhraďte v pokladně.',
+  '',
+  'Událost',
+  '---------------------------------------------------------------',
+  '',
+  '',
+  '*ČERNO, VÍR*',
+  '',
+  '27. 9. 2026, 17:30',
+  '',
+  ' ',
+  '',
+  'Brána na událost se otevírá v 27. 9. 2026, od 17:00 hodin.',
+  '',
+  '',
+  '',
+  'Místo konání',
+  '------------',
+  '',
+  '*Kino Metropol, Kino Metropol*',
+  '',
+  ' Sokolská 572/25, 77900 Olomouc, Česká republika',
+  '',
+  'Vstupenky',
+  '---------',
+  '',
+  '',
+  'TM5X59GM • 230 Kč',
+  '',
+  ' ',
+  '',
+  '',
+  '',
+  'Poschodí ',
+  '',
+  ' ',
+  '',
+  'Sekce vlevo',
+  '',
+  ' ',
+  '',
+  'Řada 3',
+  '',
+  ' ',
+  '',
+  'Místo 19',
+  '',
+  '',
+  '',
+  'Sleva ',
+  '',
+  '',
+  '2ZKN9JXVT • 230 Kč',
+  '',
+  ' ',
+  '',
+  '',
+  '',
+  'Poschodí ',
+  '',
+  ' ',
+  '',
+  'Sekce vlevo',
+  '',
+  ' ',
+  '',
+  'Řada 3',
+  '',
+  ' ',
+  '',
+  'Místo 18',
+  '',
+  '',
+  '',
+  'Sleva ',
+  '',
+  '',
+  'Platba',
+  '------',
+  '',
+  'Číslo platby',
+  '',
+  '*2134174*',
+  '',
+  'Celkem',
+  '',
+  '460 Kč',
+  '',
+  'Uhrazeno',
+  '',
+  '14. 9. 2026, 12:28',
+  '',
+  'STÁHNOUT VSTUPENKY ( https://u00000000.ct.sendgrid.net/ls/click?upn=u001.EXAMPLE-TRACKING-TOKEN )',
+  '',
+  'STÁHNOUT JAKO DÁREK ( https://u00000000.ct.sendgrid.net/ls/click?upn=u001.EXAMPLE-TRACKING-TOKEN )',
+  '',
+  ' ',
+  '',
+  'Jméno *Jan Novák*',
+  '',
+  ' ',
+  '',
+  'E-mail *jan.novak@example.com*',
+  '',
+  ' ',
+  '',
+  'Telefon *+420 000 000 000*',
+  '',
+  'Společnost',
+  '',
+  '',
+  'Fakturační adresa',
+  '',
+  '',
+  '',
+  'Adresa doručení',
+  '',
+  '',
+  '',
+  '',
+  '',
+  '',
+  'Odesílatel e-mailu',
+  '',
+  'DCI KINO Olomouc s.r.o., Sokolská 572/25, 779 00 Olomouc, Česká republika, IČ: 29391709, DIČ: CZ29391709, DIČ: CZ29391709.',
+  'Provozovna: Kino Metropol +420 722 955 466 info@kinometropol.cz',
+  '',
+  ' Zásady ochrany osobních údajů ( https://u00000000.ct.sendgrid.net/ls/click?upn=u001.EXAMPLE-TRACKING-TOKEN ) ',
+  '',
+  ' ',
+  '',
+  'Organizator události: DCI KINO Olomouc s.r.o.',
+  '',
+  'Tento e-mail byl vygenerovaný automaticky. Žádáme, neodpovídejte na něj.',
+  '',
+  '♥ VYUŽÍVÁME SYSTÉM ENTRADIO',
+].join('\r\n');
+
+const EXPECTED_ENTRADIO_DESCRIPTION = [
+  'ČERNO, VÍR',
+  '',
+  'Kino Metropol, Sokolská 572/25, 77900 Olomouc, Česká republika',
+  '',
+  '27. 9. 2026, 17:30',
+  '',
+  'Číslo objednávky: 2354152',
+  '',
+  'Vstupenky (2):',
+  'TM5X59GM • Sekce vlevo, Řada 3, Místo 19',
+  '2ZKN9JXVT • Sekce vlevo, Řada 3, Místo 18',
+].join('\n');
+
+test('parseEntradioTicketText: parses the real fixture into the full expected shape in one assertion, September proving the zero-indexed month', () => {
+  assert.deepEqual(parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT), {
+    eventName: 'ČERNO, VÍR',
+    location: 'Kino Metropol, Sokolská 572/25, 77900 Olomouc, Česká republika',
+    year: 2026,
+    month: 8,
+    day: 27,
+    hour: 17,
+    minute: 30,
+    ticketIdentifier: '2354152',
+    ticketQuantity: 2,
+    // ROUND 2 (debug/entradio-portal-not-supported): the RAW per-seat codes,
+    // added so fetchEntradioAttachments can build one QR-code URL per seat.
+    // A TIGHTENING of this assertion, not a loosening -- the expected shape
+    // now pins one more field than it did before round 2.
+    ticketCodes: ['TM5X59GM', '2ZKN9JXVT'],
+    description: EXPECTED_ENTRADIO_DESCRIPTION,
+  });
+});
+
+// THE decisive near-miss test. The "Událost" section carries TWO date/time-
+// shaped strings for the same day: the real 17:30 start, and a gate-opening
+// line at 17:00 ("Brána na událost se otevírá v 27. 9. 2026, od 17:00
+// hodin."). Picking the right one must not depend on which happens to come
+// first in the text, because "correct by ordering luck" and "correct by
+// construction" are indistinguishable until the template shifts. The pattern
+// requires digits where the gate line has the literal "od ", so it cannot
+// match that line at any start offset -- proven twice below: once with the
+// real line present, and once with the real line REMOVED, where a
+// merely-first-wins parser would silently produce an event starting at 17:00.
+
+test('parseEntradioTicketText: picks the real 17:30 start, never the 17:00 gate-opening time in the same section', () => {
+  const parsed = parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT);
+
+  assert.equal(parsed.hour, 17);
+  assert.equal(parsed.minute, 30);
+});
+
+test('parseEntradioTicketText: with the real start-time line REMOVED, the gate-opening line is still not matched -- a controlled throw, never a silent 17:00 event', () => {
+  const rawText = REAL_ENTRADIO_BODY_TEXT.replace('27. 9. 2026, 17:30', '');
+
+  assert.throws(
+    () => parseEntradioTicketText(rawText),
+    (err) => {
+      assert.match(err.message, /no date\/time pattern found after the event name/);
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseEntradioTicketText: the ticketIdentifier is the ORDER number, never the payment number sitting under a near-identical label in the same body', () => {
+  const parsed = parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT);
+
+  assert.equal(parsed.ticketIdentifier, '2354152');
+  assert.notEqual(parsed.ticketIdentifier, '2134174');
+});
+
+test('parseEntradioTicketText: a body with no "Číslo objednávky" label still parses -- ticketIdentifier is null and its description line is omitted, never a throw', () => {
+  const rawText = REAL_ENTRADIO_BODY_TEXT.replace('Číslo objednávky\r\n*2354152*', '');
+  const parsed = parseEntradioTicketText(rawText);
+
+  assert.equal(parsed.ticketIdentifier, null);
+  assert.equal(parsed.eventName, 'ČERNO, VÍR');
+  assert.equal(parsed.description.includes('Číslo objednávky:'), false);
+});
+
+// ONE EVENT PER ORDER (owner-confirmed, and the same one-event-per-purchase
+// design every other portal in this file follows): a 2-seat order yields ONE
+// parsed ticket carrying ONE ticketIdentifier. ticketQuantity reports the
+// seat count for the description and is NEVER an event multiplier -- proven
+// by parsing a 1-seat variant and asserting the event IDENTITY is unchanged.
+
+test('parseEntradioTicketText: a 2-seat order yields ONE parsed ticket with ONE order-scoped identifier, not one per seat', () => {
+  const parsed = parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT);
+
+  assert.equal(parsed.ticketQuantity, 2);
+  assert.equal(parsed.ticketIdentifier, '2354152');
+});
+
+test('parseEntradioTicketText: a 1-seat variant yields the SAME event identity as the 2-seat order -- only ticketQuantity and description differ', () => {
+  // Drops the second seat block entirely, from its ticket code up to the
+  // "Platba" section heading that bounds the tickets region.
+  const oneSeatText = REAL_ENTRADIO_BODY_TEXT.replace(/2ZKN9JXVT[\s\S]*?(?=Platba\r\n-{3,})/, '');
+  const oneSeat = parseEntradioTicketText(oneSeatText);
+  const twoSeats = parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT);
+
+  assert.equal(oneSeat.eventName, twoSeats.eventName);
+  assert.equal(oneSeat.location, twoSeats.location);
+  assert.equal(oneSeat.year, twoSeats.year);
+  assert.equal(oneSeat.month, twoSeats.month);
+  assert.equal(oneSeat.day, twoSeats.day);
+  assert.equal(oneSeat.hour, twoSeats.hour);
+  assert.equal(oneSeat.minute, twoSeats.minute);
+  assert.equal(oneSeat.ticketIdentifier, twoSeats.ticketIdentifier);
+
+  assert.equal(oneSeat.ticketQuantity, 1);
+  assert.equal(oneSeat.description.includes('Vstupenky (1):'), true);
+  assert.equal(oneSeat.description.includes('2ZKN9JXVT'), false);
+
+  // ROUND 2: ticketCodes tracks the seat count the same way ticketQuantity
+  // does -- one QR-code attachment per seat, never one per order.
+  assert.deepEqual(oneSeat.ticketCodes, ['TM5X59GM']);
+  assert.deepEqual(twoSeats.ticketCodes, ['TM5X59GM', '2ZKN9JXVT']);
+});
+
+// Section headings are anchored together with their dashes underline, not by
+// a bare indexOf. This matters: the SAME body contains the prose sentence
+// "Vstupenky není třeba tisknout..." well before the real "Vstupenky"
+// section, and "Vaše platba byla úspěšně zaplacena" before the real "Platba"
+// section. A bare indexOf on either word would scope the tickets region to
+// the wrong span entirely.
+
+test('parseEntradioTicketText: the earlier prose sentence containing the bare word "Vstupenky" is not mistaken for the tickets section heading', () => {
+  const parsed = parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT);
+
+  // Had the prose sentence won, the region would have started ~20 lines too
+  // early and swept in no ticket-code lines at all.
+  assert.equal(parsed.ticketQuantity, 2);
+  assert.equal(parsed.description.includes('TM5X59GM'), true);
+});
+
+test('parseEntradioTicketText: with the whole tickets section removed, the parse still succeeds -- ticketQuantity is null and the seat block is omitted from the description', () => {
+  const rawText = REAL_ENTRADIO_BODY_TEXT.replace(/Vstupenky\r\n-{3,}[\s\S]*?(?=Platba\r\n-{3,})/, '');
+  const parsed = parseEntradioTicketText(rawText);
+
+  assert.equal(parsed.ticketQuantity, null);
+  assert.equal(parsed.description.includes('Vstupenky ('), false);
+  assert.equal(parsed.eventName, 'ČERNO, VÍR');
+  assert.equal(parsed.location, 'Kino Metropol, Sokolská 572/25, 77900 Olomouc, Česká republika');
+
+  // ROUND 2: no seat block means no codes to build QR URLs from -- an EMPTY
+  // ARRAY, never null/undefined, so fetchEntradioAttachments can iterate it
+  // unconditionally without a shape check.
+  assert.deepEqual(parsed.ticketCodes, []);
+});
+
+// Seat fields are matched on their OWN line. The real sample leaves
+// "Poschodí" and "Sleva" with an empty value, and a `\s+`-based pattern would
+// jump the blank lines and capture the NEXT label's value -- silently
+// rendering "Poschodí vlevo".
+
+test('parseEntradioTicketText: the empty "Poschodí" label is omitted from the seat line, never filled in with the following field value', () => {
+  const parsed = parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT);
+
+  assert.equal(parsed.description.includes('Poschodí'), false);
+  assert.equal(parsed.description.includes('TM5X59GM • Sekce vlevo, Řada 3, Místo 19'), true);
+});
+
+test('parseEntradioTicketText: a populated "Poschodí" value IS rendered, in the email\'s own field order', () => {
+  const rawText = REAL_ENTRADIO_BODY_TEXT.replace('Poschodí \r\n\r\n \r\n\r\nSekce vlevo\r\n\r\n \r\n\r\nŘada 3\r\n\r\n \r\n\r\nMísto 19', 'Poschodí 1\r\n\r\n \r\n\r\nSekce vlevo\r\n\r\n \r\n\r\nŘada 3\r\n\r\n \r\n\r\nMísto 19');
+  const parsed = parseEntradioTicketText(rawText);
+
+  assert.equal(parsed.description.includes('TM5X59GM • Poschodí 1, Sekce vlevo, Řada 3, Místo 19'), true);
+});
+
+// The venue arrives as "<venue>, <hall>" and this tenant named its only hall
+// after the venue, so the real value stutters: "Kino Metropol, Kino
+// Metropol". De-stuttering is safe rather than speculative -- it can only
+// change a value whose segments genuinely repeat.
+
+test('parseEntradioTicketText: the stuttered venue name is collapsed once, then joined to the street address', () => {
+  const parsed = parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT);
+
+  assert.equal(parsed.location, 'Kino Metropol, Sokolská 572/25, 77900 Olomouc, Česká republika');
+});
+
+test('parseEntradioTicketText: a normal non-repeating "<venue>, <hall>" pair passes through completely untouched', () => {
+  const rawText = REAL_ENTRADIO_BODY_TEXT.replace('*Kino Metropol, Kino Metropol*', '*Kino Metropol, Velký sál*');
+  const parsed = parseEntradioTicketText(rawText);
+
+  assert.equal(parsed.location, 'Kino Metropol, Velký sál, Sokolská 572/25, 77900 Olomouc, Česká republika');
+});
+
+test('parseEntradioTicketText: a venue with no address line still yields a usable location rather than a throw', () => {
+  const rawText = REAL_ENTRADIO_BODY_TEXT.replace(' Sokolská 572/25, 77900 Olomouc, Česká republika', '');
+  const parsed = parseEntradioTicketText(rawText);
+
+  assert.equal(parsed.location, 'Kino Metropol');
+});
+
+test('parseEntradioTicketText: LF-only and CR-only variants of the same fixture parse identically -- separator-agnostic, same convention as the other three parsers', () => {
+  const lfOnly = REAL_ENTRADIO_BODY_TEXT.replace(/\r\n/g, '\n');
+  const crOnly = REAL_ENTRADIO_BODY_TEXT.replace(/\r\n/g, '\r');
+
+  assert.deepEqual(parseEntradioTicketText(lfOnly), parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT));
+  assert.deepEqual(parseEntradioTicketText(crOnly), parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT));
+});
+
+// Controlled throws. Every one must carry the FULL raw text untruncated, per
+// this file's diagnostic-on-failure convention -- the owner's failure
+// notification email is the next diagnostic artifact.
+
+test('parseEntradioTicketText: a body with no dash-underlined "Událost" section throws a controlled error carrying the FULL raw text', () => {
+  const rawText = REAL_ENTRADIO_BODY_TEXT.replace('Událost\r\n', 'Udalost\r\n');
+
+  assert.throws(
+    () => parseEntradioTicketText(rawText),
+    (err) => {
+      assert.match(err.message, /no dash-underlined "Událost" section heading found/);
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseEntradioTicketText: a body with no dash-underlined "Místo konání" section throws a controlled error carrying the FULL raw text', () => {
+  const rawText = REAL_ENTRADIO_BODY_TEXT.replace('Místo konání\r\n', 'Misto konani\r\n');
+
+  assert.throws(
+    () => parseEntradioTicketText(rawText),
+    (err) => {
+      assert.match(err.message, /no dash-underlined "Místo konání" section heading found/);
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseEntradioTicketText: a body with no bold event name throws a controlled error carrying the FULL raw text', () => {
+  const rawText = REAL_ENTRADIO_BODY_TEXT.replace('*ČERNO, VÍR*', 'ČERNO, VÍR');
+
+  assert.throws(
+    () => parseEntradioTicketText(rawText),
+    (err) => {
+      assert.match(err.message, /no bold event name/);
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseEntradioTicketText: a body with no bold venue name throws a controlled error carrying the FULL raw text', () => {
+  const rawText = REAL_ENTRADIO_BODY_TEXT.replace('*Kino Metropol, Kino Metropol*', 'Kino Metropol');
+
+  assert.throws(
+    () => parseEntradioTicketText(rawText),
+    (err) => {
+      assert.match(err.message, /no bold venue name/);
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseEntradioTicketText: hour out of range throws with "Hour out of range" and the FULL raw text', () => {
+  const rawText = REAL_ENTRADIO_BODY_TEXT.replace('27. 9. 2026, 17:30', '27. 9. 2026, 25:30');
+
+  assert.throws(
+    () => parseEntradioTicketText(rawText),
+    (err) => {
+      assert.match(err.message, /Hour out of range \(0-23\)/);
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseEntradioTicketText: minute out of range throws with "Minute out of range" and the FULL raw text', () => {
+  const rawText = REAL_ENTRADIO_BODY_TEXT.replace('27. 9. 2026, 17:30', '27. 9. 2026, 17:75');
+
+  assert.throws(
+    () => parseEntradioTicketText(rawText),
+    (err) => {
+      assert.match(err.message, /Minute out of range \(0-59\)/);
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+// --- Entradio wiring ---------------------------------------------------------
+
+test('parseEntradioTicketText: TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL is wired to the exported parser', () => {
+  assert.strictEqual(TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL['no-reply@app.entradio.cz'], parseEntradioTicketText);
+});
+
+test('Entradio has NO OCR/PDF-TEXT-parsing pipeline: TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL has no no-reply@app.entradio.cz key', () => {
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL, 'no-reply@app.entradio.cz'), false);
+});
+
+// A DELIBERATE absence, not an omission: an Entradio confirmation carries no
+// ticket PDF at all -- its only attachment is the venue's terms and
+// conditions (VOP_Metropol.pdf), so a finder registered here could only ever
+// attach the wrong document to the owner's calendar.
+test('Entradio is deliberately NOT registered in TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL -- its only PDF is the venue terms, never a ticket', () => {
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL, 'no-reply@app.entradio.cz'), false);
+});
+
+// THE DIRECT REPRODUCTION of the reported bug, against the SHIPPED default
+// config rather than a hand-built portal list: before this fix the sender
+// resolved to no portal and the message produced ZERO jobs -- silently, with
+// no error anywhere. It must now produce exactly one body-mode job, and the
+// terms-and-conditions PDF must not turn it into a pdf-mode job or a second
+// job.
+
+test('resolveTicketProcessingJobs: an Entradio message resolves against the SHIPPED default portals and yields exactly one "body"-mode job (was ZERO before this fix)', () => {
+  const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
+  const portals = TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals;
+  const message = fakeMessage('Kino Metropol <no-reply@app.entradio.cz>', [fakeAttachment('VOP_Metropol.pdf', 'application/pdf')]);
+
+  const jobs = resolveTicketProcessingJobs([message], portals);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'body');
+  assert.equal(jobs[0].message, message);
+  assert.equal(jobs[0].portal.identifyingEmail, 'no-reply@app.entradio.cz');
+});
+
+test('resolveTicketingPortal: the real "Kino Metropol <no-reply@app.entradio.cz>" From header now resolves against the shipped defaults (it returned null before this fix)', () => {
+  const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
+  const portal = resolveTicketingPortal('Kino Metropol <no-reply@app.entradio.cz>', TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals);
+
+  assert.notEqual(portal, null);
+  assert.equal(portal.identifyingEmail, 'no-reply@app.entradio.cz');
+});
+
+// appliesTo is a SECOND, independent gate -- dispatchActions consults it
+// before run, and it repeats the portal+registry lookup rather than reusing
+// resolveTicketProcessingJobs. A registration that satisfied only one of the
+// two would still leave the email silently unprocessed, so both are pinned.
+test('TICKETING_PORTALS_ACTION.appliesTo: claims an Entradio thread whose only attachment is the venue terms PDF (returned false before this fix)', () => {
+  const message = fakeMessage('Kino Metropol <no-reply@app.entradio.cz>', [fakeAttachment('VOP_Metropol.pdf', 'application/pdf')]);
+  const thread = {
+    getMessages: function () {
+      return [message];
+    },
+  };
+
+  assert.equal(TICKETING_PORTALS_ACTION.appliesTo(thread), true);
+});
+
+test('TICKETING_PORTALS_ACTION.appliesTo: still returns false for an unrelated sender -- the new entry widened nothing else', () => {
+  const thread = {
+    getMessages: function () {
+      return [fakeMessage('someone@unrelated-sender.example', [])];
+    },
+  };
+
+  assert.equal(TICKETING_PORTALS_ACTION.appliesTo(thread), false);
+});
+
+test('TICKETING_PORTALS_ACTION_CONFIG: the shipped default seeds a FOURTH entry for no-reply@app.entradio.cz, and resolveTicketingCalendarId falls back to the passed global default for it', () => {
+  const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
+  const fourthPortal = TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals[3];
+
+  assert.deepEqual(fourthPortal, { identifyingEmail: 'no-reply@app.entradio.cz', calendarId: null, insertPdfIntoEvent: false });
+  assert.equal(resolveTicketingCalendarId(fourthPortal, 'DEFAULT_CAL'), 'DEFAULT_CAL');
+});
+
+// ============================================================================
+// ROUND 2 (debug/entradio-portal-not-supported): REAL TICKET-FILE AND QR-CODE
+// CALENDAR ATTACHMENTS FOR ENTRADIO
+// ============================================================================
+//
+// WHAT CHANGED AND WHY: round 1 shipped the portal registration + body parser,
+// which fixed the reported "no event, no error" silent skip. Before live
+// verification the owner expanded the scope: an Entradio confirmation carries
+// no ticket file in the message at all, so the created event was going to be a
+// bare event with nothing to show at the door. Round 2 fetches the real
+// artifacts over HTTP -- the ticket file behind the "STÁHNOUT VSTUPENKY" link,
+// and one QR-code image PER SEAT from Entradio's own qrcode endpoint -- and
+// attaches them to the Calendar event.
+//
+// OWNER-SETTLED DECISIONS these tests encode (asked and answered, not
+// re-derived here):
+//   - Every seat's QR code is its OWN Calendar attachment, and it is ALWAYS
+//     attempted -- never gated by insertPdfIntoEvent.
+//   - The ticket-file download IS gated by insertPdfIntoEvent, the same toggle
+//     the other three portals already use.
+//   - Both land in the EXISTING shared CONFIG.ticketAttachmentDriveFolderName
+//     folder. No new folder.
+//   - A total attachment failure NEVER blocks event creation; it only sends a
+//     separate notification email.
+//
+// THIS IS THIS CODEBASE'S FIRST-EVER OUTBOUND HTTP CALL, which is why the
+// appsscript.json scope test below exists and why every fetch path is proven
+// NON-THROWING rather than merely proven correct on the happy path.
+
+// --- appsscript.json: the new OAuth scope -----------------------------------
+//
+// UrlFetchApp is unusable without script.external_request, and an Apps Script
+// project that calls it without the scope declared fails at RUNTIME, inside the
+// trigger, where the owner sees it only as a failed execution. Pinning it in
+// the manifest is the only pre-deployment guard available.
+
+function readAppsScriptManifest() {
+  return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'src', 'appsscript.json'), 'utf8'));
+}
+
+test('appsscript.json: declares script.external_request -- without it UrlFetchApp fails at runtime inside the trigger (ROUND 2, this codebase\'s first outbound HTTP)', () => {
+  const manifest = readAppsScriptManifest();
+
+  assert.equal(manifest.oauthScopes.includes('https://www.googleapis.com/auth/script.external_request'), true);
+});
+
+test('appsscript.json: every pre-round-2 scope is STILL declared -- the new scope is additive, it replaces nothing (a dropped scope would silently break another action)', () => {
+  const manifest = readAppsScriptManifest();
+
+  [
+    'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/script.scriptapp',
+    'https://www.googleapis.com/auth/calendar',
+    'https://www.googleapis.com/auth/script.send_mail',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/documents',
+  ].forEach(function (scope) {
+    assert.equal(manifest.oauthScopes.includes(scope), true, 'missing pre-existing scope: ' + scope);
+  });
+});
+
+// --- extractEntradioTicketCodes ---------------------------------------------
+//
+// The RAW codes, as a SIBLING of extractEntradioTicketLines rather than a
+// change to it: that function returns pre-formatted description LINES and is
+// already covered by its own tests, so repurposing its return shape would have
+// meant rewriting working assertions to serve a new caller.
+
+test('extractEntradioTicketCodes: returns the raw per-seat codes from the tickets region, in the email\'s own order', () => {
+  const region = [
+    'TM5X59GM • 230 Kč',
+    'Sekce vlevo',
+    'Řada 3',
+    'Místo 19',
+    '',
+    '2ZKN9JXVT • 230 Kč',
+    'Sekce vlevo',
+    'Řada 3',
+    'Místo 18',
+  ].join('\r\n');
+
+  assert.deepEqual(extractEntradioTicketCodes(region), ['TM5X59GM', '2ZKN9JXVT']);
+});
+
+test('extractEntradioTicketCodes: a region with no ticket-code lines yields [] rather than null -- callers iterate it unconditionally', () => {
+  assert.deepEqual(extractEntradioTicketCodes('Platba\r\n------\r\nCelkem 460 Kč'), []);
+});
+
+test('extractEntradioTicketCodes: agrees seat-for-seat with extractEntradioTicketLines on the real fixture -- the two extractors can never drift apart silently', () => {
+  const parsed = parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT);
+
+  // Every code must head its own description line. If one extractor's scan
+  // changed and the other's did not, the QR attachments would silently stop
+  // matching the seats listed in the event description.
+  assert.equal(parsed.ticketCodes.length, parsed.ticketQuantity);
+  parsed.ticketCodes.forEach(function (code) {
+    const headedLines = parsed.description.split('\n').filter(function (line) {
+      return line.indexOf(code) === 0;
+    });
+    assert.equal(headedLines.length, 1, 'code ' + code + ' must head exactly one description line');
+  });
+});
+
+// --- findEntradioTicketDownloadUrl ------------------------------------------
+//
+// REAL HTML SHAPE, taken verbatim from the owner's sample .eml (text/html part,
+// decoded quoted-printable -> UTF-8, lines 517 and 528). Only the
+// per-recipient SendGrid tracking tokens are replaced with placeholders -- the
+// tag structure, attribute order, styling and inner text are the real thing,
+// because that structure IS what the pattern anchors on.
+//
+// THE NEAR-MISS THIS FIXTURE EXISTS TO PROVE: the very next button in the same
+// email is "STÁHNOUT JAKO DÁREK" (download as a gift) -- an identically shaped
+// anchor with a DIFFERENT URL. A pattern anchored on "STÁHNOUT" alone would
+// fetch the gift artifact, and neither response validator could catch it: the
+// gift link also answers 200 with a non-HTML body. Same class of trap as the
+// gate-opening time round 1 found in the plain body.
+
+const REAL_ENTRADIO_TICKETS_ANCHOR =
+  '                  <a href="https://u00000000.ct.sendgrid.net/ls/click?upn=u001.EXAMPLE-TICKETS-TOKEN" ' +
+  'style="background-color:#6A1B9A; border:1px solid #6A1B9A; border-color:#6A1B9A; border-radius:4px; border-width:1px; ' +
+  'color:#FFFFFF; display:inline-block; font-size:14px; font-weight:bold; letter-spacing:0px; line-height:normal; ' +
+  'padding:10px 16px 10px 16px; text-align:center; text-decoration:none; border-style:solid; ' +
+  'font-family:verdana,geneva,sans-serif;" target="_blank">STÁHNOUT VSTUPENKY</a>';
+
+const REAL_ENTRADIO_GIFT_ANCHOR =
+  '                  <a href="https://u00000000.ct.sendgrid.net/ls/click?upn=u001.EXAMPLE-GIFT-TOKEN" ' +
+  'style="background-color:#FFFFFF; border:1px solid #6A1B9A; border-color:#6A1B9A; border-radius:4px; border-width:1px; ' +
+  'color:#6A1B9A; display:inline-block; font-size:14px; font-weight:bold; letter-spacing:0px; line-height:normal; ' +
+  'padding:10px 16px 10px 16px; text-align:center; text-decoration:none; border-style:solid; ' +
+  'font-family:verdana,geneva,sans-serif;" target="_blank">STÁHNOUT JAKO DÁREK</a>';
+
+const REAL_ENTRADIO_HTML_BODY = [
+  '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">',
+  '<html><body>',
+  '  <table><tr><td>',
+  '    <img src="https://app.entradio.cz/qrcode?code=TM5X59GM&size=200" alt="QR" width="200" height="200" />',
+  '    <img src="https://app.entradio.cz/qrcode?code=2ZKN9JXVT&size=200" alt="QR" width="200" height="200" />',
+  '  </td></tr></table>',
+  '  <table><tr><td align="center" style="padding:0;">',
+  REAL_ENTRADIO_TICKETS_ANCHOR,
+  '  </td></tr>',
+  '  <tr><td align="center" style="padding:0;">',
+  REAL_ENTRADIO_GIFT_ANCHOR,
+  '  </td></tr></table>',
+  '</body></html>',
+].join('\r\n');
+
+const EXPECTED_ENTRADIO_DOWNLOAD_URL = 'https://u00000000.ct.sendgrid.net/ls/click?upn=u001.EXAMPLE-TICKETS-TOKEN';
+
+test('findEntradioTicketDownloadUrl: extracts the STÁHNOUT VSTUPENKY href from the real HTML body', () => {
+  assert.equal(findEntradioTicketDownloadUrl(REAL_ENTRADIO_HTML_BODY), EXPECTED_ENTRADIO_DOWNLOAD_URL);
+});
+
+test('findEntradioTicketDownloadUrl: never returns the "STÁHNOUT JAKO DÁREK" gift link that sits 11 lines below it in the same email', () => {
+  const url = findEntradioTicketDownloadUrl(REAL_ENTRADIO_HTML_BODY);
+
+  assert.equal(url.includes('GIFT'), false);
+  assert.equal(url, EXPECTED_ENTRADIO_DOWNLOAD_URL);
+});
+
+test('findEntradioTicketDownloadUrl: the tickets link is selected STRUCTURALLY, not by position -- it still wins when the gift anchor comes FIRST', () => {
+  const reordered = [
+    '<html><body><table>',
+    '  <tr><td>' + REAL_ENTRADIO_GIFT_ANCHOR + '</td></tr>',
+    '  <tr><td>' + REAL_ENTRADIO_TICKETS_ANCHOR + '</td></tr>',
+    '</table></body></html>',
+  ].join('\r\n');
+
+  assert.equal(findEntradioTicketDownloadUrl(reordered), EXPECTED_ENTRADIO_DOWNLOAD_URL);
+});
+
+test('findEntradioTicketDownloadUrl: an HTML body with ONLY the gift anchor returns null -- a controlled miss, never the wrong URL', () => {
+  const giftOnly = '<html><body><table><tr><td>' + REAL_ENTRADIO_GIFT_ANCHOR + '</td></tr></table></body></html>';
+
+  assert.equal(findEntradioTicketDownloadUrl(giftOnly), null);
+});
+
+test('findEntradioTicketDownloadUrl: null, undefined and empty input all return null rather than throwing', () => {
+  assert.equal(findEntradioTicketDownloadUrl(null), null);
+  assert.equal(findEntradioTicketDownloadUrl(undefined), null);
+  assert.equal(findEntradioTicketDownloadUrl(''), null);
+});
+
+test('findEntradioTicketDownloadUrl: tolerates arbitrary attributes on EITHER side of href, including none at all', () => {
+  const attributesBefore = '<a class="btn" data-x="1" href="https://example.test/t" target="_blank">STÁHNOUT VSTUPENKY</a>';
+  const noOtherAttributes = '<a href="https://example.test/t">STÁHNOUT VSTUPENKY</a>';
+
+  assert.equal(findEntradioTicketDownloadUrl(attributesBefore), 'https://example.test/t');
+  assert.equal(findEntradioTicketDownloadUrl(noOtherAttributes), 'https://example.test/t');
+});
+
+test('findEntradioTicketDownloadUrl: tolerates whitespace/newlines between the tag and its inner text', () => {
+  const spaced = '<a href="https://example.test/t" target="_blank">\r\n  STÁHNOUT VSTUPENKY\r\n</a>';
+
+  assert.equal(findEntradioTicketDownloadUrl(spaced), 'https://example.test/t');
+});
+
+test('findEntradioTicketDownloadUrl: an HTML-escaped &amp; in the href is decoded -- an un-decoded one would produce a URL that fetches nothing', () => {
+  const escaped = '<a href="https://example.test/t?a=1&amp;b=2" target="_blank">STÁHNOUT VSTUPENKY</a>';
+
+  assert.equal(findEntradioTicketDownloadUrl(escaped), 'https://example.test/t?a=1&b=2');
+});
+
+// --- buildEntradioQrCodeUrl -------------------------------------------------
+//
+// THE URL TEMPLATE IS NOT INVENTED: the real email's HTML renders each seat's
+// QR inline as <img src="https://app.entradio.cz/qrcode?code=TM5X59GM&size=200">
+// for exactly the two codes the body parser extracts. This function reproduces
+// Entradio's own endpoint.
+
+test('buildEntradioQrCodeUrl: reproduces the real per-seat QR endpoint observed in the sample email\'s own <img> tags', () => {
+  assert.equal(buildEntradioQrCodeUrl('TM5X59GM'), 'https://app.entradio.cz/qrcode?code=TM5X59GM&size=200');
+  assert.equal(buildEntradioQrCodeUrl('2ZKN9JXVT'), 'https://app.entradio.cz/qrcode?code=2ZKN9JXVT&size=200');
+});
+
+test('buildEntradioQrCodeUrl: percent-encodes the code -- an unencoded separator would silently truncate the query string', () => {
+  assert.equal(buildEntradioQrCodeUrl('A&B=C D'), 'https://app.entradio.cz/qrcode?code=A%26B%3DC%20D&size=200');
+});
+
+// --- response validators ----------------------------------------------------
+//
+// muteHttpExceptions is required precisely so a non-200 arrives as a VALUE
+// rather than a throw; these two functions are what turn that value into a
+// decision. The text/html rejection is the important one: an expired SendGrid
+// click wrapper, or a login wall, answers 200 with an HTML page -- saving that
+// to Drive and attaching it to the calendar would look like a success and be
+// worthless at the door.
+
+test('isEntradioTicketFileResponseAcceptable: a 200 with a real file content-type is accepted', () => {
+  assert.equal(isEntradioTicketFileResponseAcceptable(200, 'application/pdf'), true);
+  assert.equal(isEntradioTicketFileResponseAcceptable(200, 'application/octet-stream'), true);
+  assert.equal(isEntradioTicketFileResponseAcceptable(200, 'image/png'), true);
+});
+
+test('isEntradioTicketFileResponseAcceptable: a 200 that returns text/html is REJECTED -- that is a login/error page, not a ticket', () => {
+  assert.equal(isEntradioTicketFileResponseAcceptable(200, 'text/html'), false);
+  assert.equal(isEntradioTicketFileResponseAcceptable(200, 'text/html; charset=utf-8'), false);
+  assert.equal(isEntradioTicketFileResponseAcceptable(200, 'TEXT/HTML; charset=UTF-8'), false);
+});
+
+test('isEntradioTicketFileResponseAcceptable: any non-200 is rejected, including a redirect followRedirects failed to resolve', () => {
+  assert.equal(isEntradioTicketFileResponseAcceptable(302, 'application/pdf'), false);
+  assert.equal(isEntradioTicketFileResponseAcceptable(403, 'application/pdf'), false);
+  assert.equal(isEntradioTicketFileResponseAcceptable(404, 'application/pdf'), false);
+  assert.equal(isEntradioTicketFileResponseAcceptable(500, 'application/pdf'), false);
+});
+
+test('isEntradioQrCodeResponseAcceptable: a 200 with an image/* content-type is accepted, case-insensitively', () => {
+  assert.equal(isEntradioQrCodeResponseAcceptable(200, 'image/png'), true);
+  assert.equal(isEntradioQrCodeResponseAcceptable(200, 'IMAGE/PNG'), true);
+  assert.equal(isEntradioQrCodeResponseAcceptable(200, 'image/jpeg'), true);
+});
+
+test('isEntradioQrCodeResponseAcceptable: a QR endpoint is held to a STRICTER rule than the ticket file -- anything not image/* is rejected even at 200', () => {
+  assert.equal(isEntradioQrCodeResponseAcceptable(200, 'text/html'), false);
+  assert.equal(isEntradioQrCodeResponseAcceptable(200, 'application/pdf'), false);
+  assert.equal(isEntradioQrCodeResponseAcceptable(200, 'application/octet-stream'), false);
+  assert.equal(isEntradioQrCodeResponseAcceptable(200, ''), false);
+  assert.equal(isEntradioQrCodeResponseAcceptable(500, 'image/png'), false);
+});
+
+// --- filenames --------------------------------------------------------------
+//
+// buildTicketAttachmentFilename hardcodes ".pdf", which is exactly why it is
+// not reused here: the real format behind the Entradio download link is
+// UNVERIFIED until live-tested, so the extension has to come from the fetched
+// blob's own content-type rather than from an assumption.
+
+test('entradioFileExtensionForMimeType: maps the formats a ticket download plausibly returns', () => {
+  assert.equal(entradioFileExtensionForMimeType('application/pdf'), '.pdf');
+  assert.equal(entradioFileExtensionForMimeType('image/png'), '.png');
+  assert.equal(entradioFileExtensionForMimeType('image/jpeg'), '.jpg');
+  assert.equal(entradioFileExtensionForMimeType('application/zip'), '.zip');
+});
+
+test('entradioFileExtensionForMimeType: strips content-type parameters and lowercases before matching', () => {
+  assert.equal(entradioFileExtensionForMimeType('Application/PDF; charset=binary'), '.pdf');
+  assert.equal(entradioFileExtensionForMimeType('  image/png  '), '.png');
+});
+
+test('entradioFileExtensionForMimeType: an unknown or missing content-type yields NO extension -- an honest missing suffix beats a confidently wrong one', () => {
+  assert.equal(entradioFileExtensionForMimeType('application/octet-stream'), '');
+  assert.equal(entradioFileExtensionForMimeType('application/x-unheard-of'), '');
+  assert.equal(entradioFileExtensionForMimeType(''), '');
+  assert.equal(entradioFileExtensionForMimeType(null), '');
+  assert.equal(entradioFileExtensionForMimeType(undefined), '');
+});
+
+test('buildEntradioTicketAttachmentFilename: follows the shared "{event} - {YYYY-MM-DD} - {identifier}" convention, with the extension derived from the blob', () => {
+  const components = { year: 2026, month: 8, day: 27, hour: 17, minute: 30 };
+
+  assert.equal(
+    buildEntradioTicketAttachmentFilename('ČERNO, VÍR', components, '2354152', 'application/pdf'),
+    'ČERNO, VÍR - 2026-09-27 - 2354152.pdf'
+  );
+  assert.equal(
+    buildEntradioTicketAttachmentFilename('ČERNO, VÍR', components, '2354152', 'application/zip'),
+    'ČERNO, VÍR - 2026-09-27 - 2354152.zip'
+  );
+});
+
+// THE DRIFT GUARD for the deliberate duplication: this function reimplements
+// buildTicketAttachmentFilename's stem rather than delegating to it, so that
+// the three already-live portals' naming path is not touched at all. That
+// choice is only safe while the two agree -- so pin it.
+test('buildEntradioTicketAttachmentFilename: produces the EXACT same name as buildTicketAttachmentFilename when the blob is a PDF -- the two must never drift apart', () => {
+  const components = { year: 2026, month: 8, day: 27 };
+
+  assert.equal(
+    buildEntradioTicketAttachmentFilename('ČERNO, VÍR', components, '2354152', 'application/pdf'),
+    buildTicketAttachmentFilename('ČERNO, VÍR', components, '2354152')
+  );
+  assert.equal(
+    buildEntradioTicketAttachmentFilename('Tajný ostrov', { year: 2026, month: 7, day: 7 }, null, 'application/pdf'),
+    buildTicketAttachmentFilename('Tajný ostrov', { year: 2026, month: 7, day: 7 }, null)
+  );
+});
+
+test('buildEntradioTicketAttachmentFilename: a null ticketIdentifier omits the segment entirely, never the literal word "null" (the round-4 Kino Art incident)', () => {
+  const name = buildEntradioTicketAttachmentFilename('ČERNO, VÍR', { year: 2026, month: 8, day: 27 }, null, 'application/pdf');
+
+  assert.equal(name, 'ČERNO, VÍR - 2026-09-27.pdf');
+  assert.equal(name.includes('null'), false);
+});
+
+test('buildEntradioTicketAttachmentFilename: filesystem-unsafe characters in the event name are sanitized', () => {
+  assert.equal(
+    buildEntradioTicketAttachmentFilename('AC/DC: Live?', { year: 2026, month: 0, day: 5 }, '9', 'application/pdf'),
+    'AC-DC- Live- - 2026-01-05 - 9.pdf'
+  );
+});
+
+test('buildEntradioQrCodeFilename: one file per seat, named "{event} - QR - {code}.png"', () => {
+  assert.equal(buildEntradioQrCodeFilename('ČERNO, VÍR', 'TM5X59GM'), 'ČERNO, VÍR - QR - TM5X59GM.png');
+  assert.equal(buildEntradioQrCodeFilename('ČERNO, VÍR', '2ZKN9JXVT'), 'ČERNO, VÍR - QR - 2ZKN9JXVT.png');
+});
+
+test('buildEntradioQrCodeFilename: the two seats of one order produce DISTINCT filenames -- the code is what disambiguates them', () => {
+  const parsed = parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT);
+  const names = parsed.ticketCodes.map(function (code) {
+    return buildEntradioQrCodeFilename(parsed.eventName, code);
+  });
+
+  assert.equal(names.length, 2);
+  assert.notEqual(names[0], names[1]);
+});
+
+test('buildEntradioQrCodeFilename: sanitizes both the event name and the code', () => {
+  assert.equal(buildEntradioQrCodeFilename('AC/DC', 'A/B'), 'AC-DC - QR - A-B.png');
+});
+
+// --- buildTicketCalendarEventResource ---------------------------------------
+//
+// EXTRACTED FROM createTicketCalendarEvent so that round 2's third-parameter
+// change (a single attachmentInfo object -> an ARRAY of attachments, each
+// carrying its OWN mimeType) is PROVABLE rather than merely reviewed.
+// createTicketCalendarEvent keeps only the two GAS calls it cannot shed
+// (CalendarApp.getCalendarById().getTimeZone(), Calendar.Events.insert).
+//
+// THE BLAST-RADIUS TEST is the first one below: enigoo.cz, Kino Art and
+// Ticketmaster CZ all now pass a ONE-ELEMENT array with mimeType
+// 'application/pdf' where they used to pass a bare object, and the resource
+// that reaches Calendar.Events.insert must be byte-for-byte what it was
+// before round 2.
+
+const ENIGOO_SHAPED_PARSED_TICKET = {
+  eventName: 'Letní hudební festival',
+  location: 'Nádvoří kulturního domu',
+  year: 2026,
+  month: 7,
+  day: 15,
+  hour: 19,
+  minute: 0,
+  ticketIdentifier: '24601',
+};
+
+test('buildTicketCalendarEventResource: a one-element PDF array produces EXACTLY the pre-round-2 resource -- the three live portals are provably unaffected by the signature change', () => {
+  const built = buildTicketCalendarEventResource(ENIGOO_SHAPED_PARSED_TICKET, 'Europe/Prague', [
+    {
+      fileId: 'FILE_ID',
+      fileUrl: 'https://drive.example/FILE_ID',
+      title: 'Letní hudební festival - 2026-08-15 - 24601.pdf',
+      mimeType: 'application/pdf',
+    },
+  ]);
+
+  assert.deepEqual(built.resource, {
+    summary: 'Letní hudební festival',
+    location: 'Nádvoří kulturního domu',
+    start: { dateTime: '2026-08-15T19:00:00', timeZone: 'Europe/Prague' },
+    end: { dateTime: '2026-08-15T21:00:00', timeZone: 'Europe/Prague' },
+    extendedProperties: { private: { ticketIdentifier: '24601' } },
+    attachments: [
+      {
+        fileId: 'FILE_ID',
+        fileUrl: 'https://drive.example/FILE_ID',
+        title: 'Letní hudební festival - 2026-08-15 - 24601.pdf',
+        mimeType: 'application/pdf',
+      },
+    ],
+  });
+  assert.deepEqual(built.optionalArgs, { supportsAttachments: true });
+});
+
+test('buildTicketCalendarEventResource: with NO attachments the resource has no attachments key and supportsAttachments is never set -- unchanged no-attachment behavior', () => {
+  const forEmptyArray = buildTicketCalendarEventResource(ENIGOO_SHAPED_PARSED_TICKET, 'Europe/Prague', []);
+  const forNull = buildTicketCalendarEventResource(ENIGOO_SHAPED_PARSED_TICKET, 'Europe/Prague', null);
+  const forUndefined = buildTicketCalendarEventResource(ENIGOO_SHAPED_PARSED_TICKET, 'Europe/Prague', undefined);
+
+  [forEmptyArray, forNull, forUndefined].forEach(function (built) {
+    assert.equal(Object.prototype.hasOwnProperty.call(built.resource, 'attachments'), false);
+    assert.deepEqual(built.optionalArgs, {});
+  });
+});
+
+test('buildTicketCalendarEventResource: EVERY attachment keeps its OWN mimeType -- mimeType is no longer hardcoded to application/pdf', () => {
+  const built = buildTicketCalendarEventResource(ENIGOO_SHAPED_PARSED_TICKET, 'Europe/Prague', [
+    { fileId: 'F1', fileUrl: 'u1', title: 'ticket.pdf', mimeType: 'application/pdf' },
+    { fileId: 'F2', fileUrl: 'u2', title: 'qr-a.png', mimeType: 'image/png' },
+    { fileId: 'F3', fileUrl: 'u3', title: 'qr-b.png', mimeType: 'image/png' },
+  ]);
+
+  assert.equal(built.resource.attachments.length, 3);
+  assert.deepEqual(
+    built.resource.attachments.map(function (a) {
+      return a.mimeType;
+    }),
+    ['application/pdf', 'image/png', 'image/png']
+  );
+  // Order is preserved: the ticket file first, then one QR per seat in seat
+  // order, which is how they render on the calendar event.
+  assert.deepEqual(
+    built.resource.attachments.map(function (a) {
+      return a.title;
+    }),
+    ['ticket.pdf', 'qr-a.png', 'qr-b.png']
+  );
+  assert.deepEqual(built.optionalArgs, { supportsAttachments: true });
+});
+
+test('buildTicketCalendarEventResource: description is set only when the parsed ticket carries one (enigoo.cz and Kino Art never do)', () => {
+  const withoutDescription = buildTicketCalendarEventResource(ENIGOO_SHAPED_PARSED_TICKET, 'Europe/Prague', []);
+  const parsed = parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT);
+  const withDescription = buildTicketCalendarEventResource(parsed, 'Europe/Prague', []);
+
+  assert.equal(Object.prototype.hasOwnProperty.call(withoutDescription.resource, 'description'), false);
+  assert.equal(withDescription.resource.description, parsed.description);
+});
+
+test('buildTicketCalendarEventResource: a parser that could not extract a ticketIdentifier produces no extendedProperties tag at all', () => {
+  const untagged = Object.assign({}, ENIGOO_SHAPED_PARSED_TICKET, { ticketIdentifier: null });
+  const built = buildTicketCalendarEventResource(untagged, 'Europe/Prague', []);
+
+  assert.equal(Object.prototype.hasOwnProperty.call(built.resource, 'extendedProperties'), false);
+});
+
+test('buildTicketCalendarEventResource: the real Entradio order becomes ONE 17:30-19:30 event tagged with the order number', () => {
+  const parsed = parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT);
+  const built = buildTicketCalendarEventResource(parsed, 'Europe/Prague', []);
+
+  assert.equal(built.resource.summary, 'ČERNO, VÍR');
+  assert.equal(built.resource.location, 'Kino Metropol, Sokolská 572/25, 77900 Olomouc, Česká republika');
+  assert.equal(built.resource.start.dateTime, '2026-09-27T17:30:00');
+  assert.equal(built.resource.end.dateTime, '2026-09-27T19:30:00');
+  assert.deepEqual(built.resource.extendedProperties, { private: { ticketIdentifier: '2354152' } });
+});
+
+// --- the attachment-fetcher registry ----------------------------------------
+
+test('TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL: Entradio is wired to fetchEntradioAttachments', () => {
+  assert.strictEqual(
+    TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL['no-reply@app.entradio.cz'],
+    fetchEntradioAttachments
+  );
+});
+
+// THE "EXISTING PORTALS UNCHANGED" GUARD at the registry level: the new
+// fetcher path must be reachable ONLY from Entradio. A key appearing here for
+// any other portal would start making outbound HTTP calls on their behalf.
+test('TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL: has NO key for any other portal -- Entradio is the only sender that triggers an outbound fetch', () => {
+  assert.deepEqual(Object.keys(TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL), ['no-reply@app.entradio.cz']);
+});
+
+test('the three pre-existing portals are still routed EXACTLY as before: same body parsers, same PDF finders, no attachment fetcher', () => {
+  assert.strictEqual(TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL['no-reply@enigoo.cz'], parseEnigooTicketText);
+  assert.strictEqual(TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL['rezervace@kinoart.cz'], parseKinoArtTicketText);
+  assert.strictEqual(TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL['noreply@ticketmaster.cz'], parseTicketmasterCzTicketText);
+  assert.strictEqual(TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL['rezervace@kinoart.cz'], findKinoArtTicketPdfAttachment);
+  assert.strictEqual(
+    TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL['noreply@ticketmaster.cz'],
+    findTicketmasterCzTicketPdfAttachment
+  );
+
+  ['no-reply@enigoo.cz', 'rezervace@kinoart.cz', 'noreply@ticketmaster.cz'].forEach(function (sender) {
+    assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL, sender), false);
+  });
+});
+
+// --- fetchEntradioAttachments -----------------------------------------------
+//
+// The orchestrator IS unit-tested despite touching UrlFetchApp/DriveApp/CONFIG,
+// using the same global-injection harness this repo already established for the
+// transport-tickets and ICS actions (GAS concatenates every file into one
+// shared global scope, so a bare `UrlFetchApp` reference resolves through
+// globalThis under Node too). It is tested because its contract is a NEGATIVE
+// one -- "never throws, always returns an array" -- and a negative contract
+// cannot be verified by reading the happy path.
+
+function entradioFakeBlob(contentType) {
+  return {
+    getContentType: function () {
+      return contentType;
+    },
+  };
+}
+
+function withEntradioFetchGlobals(options, fn) {
+  const previous = {
+    CONFIG: global.CONFIG,
+    UrlFetchApp: global.UrlFetchApp,
+    DriveApp: global.DriveApp,
+  };
+  const realConsoleLog = console.log;
+  const calls = { fetched: [], created: [], folders: [] };
+
+  global.CONFIG = { ticketAttachmentDriveFolderName: 'GAS Email Manager - Tickets' };
+
+  global.UrlFetchApp = {
+    fetch: function (url, params) {
+      calls.fetched.push({ url: url, params: params });
+      const responder = options.respond(url);
+      if (responder instanceof Error) {
+        throw responder;
+      }
+      return {
+        getResponseCode: function () {
+          return responder.code;
+        },
+        getBlob: function () {
+          return entradioFakeBlob(responder.contentType);
+        },
+      };
+    },
+  };
+
+  let createdCount = 0;
+  global.DriveApp = {
+    getFoldersByName: function (name) {
+      calls.folders.push(name);
+      if (options.driveThrows) {
+        throw new Error('Drive is unavailable');
+      }
+      return {
+        hasNext: function () {
+          return true;
+        },
+        next: function () {
+          return {
+            createFile: function (blob) {
+              createdCount += 1;
+              const record = { id: 'FILE_' + createdCount, name: null, contentType: blob.getContentType() };
+              calls.created.push(record);
+              return {
+                getId: function () {
+                  return record.id;
+                },
+                getUrl: function () {
+                  return 'https://drive.example/' + record.id;
+                },
+                getName: function () {
+                  return record.name;
+                },
+                setName: function (newName) {
+                  record.name = newName;
+                },
+              };
+            },
+          };
+        },
+      };
+    },
+  };
+
+  console.log = function () {};
+
+  try {
+    return fn(calls);
+  } finally {
+    console.log = realConsoleLog;
+    Object.keys(previous).forEach(function (key) {
+      if (previous[key] === undefined) {
+        delete global[key];
+      } else {
+        global[key] = previous[key];
+      }
+    });
+  }
+}
+
+function entradioFakeMessage(htmlBody) {
+  return {
+    getBody: function () {
+      if (htmlBody instanceof Error) {
+        throw htmlBody;
+      }
+      return htmlBody;
+    },
+  };
+}
+
+const ENTRADIO_PARSED_FOR_FETCH = {
+  eventName: 'ČERNO, VÍR',
+  year: 2026,
+  month: 8,
+  day: 27,
+  ticketIdentifier: '2354152',
+  ticketCodes: ['TM5X59GM', '2ZKN9JXVT'],
+};
+
+function entradioRespondOk(url) {
+  if (url.indexOf('app.entradio.cz/qrcode') !== -1) {
+    return { code: 200, contentType: 'image/png' };
+  }
+  return { code: 200, contentType: 'application/pdf' };
+}
+
+test('fetchEntradioAttachments: with insertPdfIntoEvent ON, returns the ticket file FIRST then one QR attachment per seat, all in the shared permanent folder', () => {
+  withEntradioFetchGlobals({ respond: entradioRespondOk }, function (calls) {
+    const attachments = fetchEntradioAttachments(entradioFakeMessage(REAL_ENTRADIO_HTML_BODY), ENTRADIO_PARSED_FOR_FETCH, {
+      identifyingEmail: 'no-reply@app.entradio.cz',
+      insertPdfIntoEvent: true,
+    });
+
+    assert.deepEqual(
+      attachments.map(function (a) {
+        return a.title;
+      }),
+      ['ČERNO, VÍR - 2026-09-27 - 2354152.pdf', 'ČERNO, VÍR - QR - TM5X59GM.png', 'ČERNO, VÍR - QR - 2ZKN9JXVT.png']
+    );
+    assert.deepEqual(
+      attachments.map(function (a) {
+        return a.mimeType;
+      }),
+      ['application/pdf', 'image/png', 'image/png']
+    );
+    attachments.forEach(function (a) {
+      assert.equal(typeof a.fileId, 'string');
+      assert.equal(a.fileUrl, 'https://drive.example/' + a.fileId);
+    });
+
+    // The EXISTING shared folder, never a new Entradio-specific one.
+    assert.deepEqual(
+      calls.folders.filter(function (name, i, all) {
+        return all.indexOf(name) === i;
+      }),
+      ['GAS Email Manager - Tickets']
+    );
+  });
+});
+
+test('fetchEntradioAttachments: every fetch uses followRedirects AND muteHttpExceptions -- a SendGrid click wrapper IS a redirect, and a non-200 must arrive as a value not a throw', () => {
+  withEntradioFetchGlobals({ respond: entradioRespondOk }, function (calls) {
+    fetchEntradioAttachments(entradioFakeMessage(REAL_ENTRADIO_HTML_BODY), ENTRADIO_PARSED_FOR_FETCH, {
+      identifyingEmail: 'no-reply@app.entradio.cz',
+      insertPdfIntoEvent: true,
+    });
+
+    assert.equal(calls.fetched.length, 3);
+    calls.fetched.forEach(function (call) {
+      assert.equal(call.params.followRedirects, true);
+      assert.equal(call.params.muteHttpExceptions, true);
+    });
+    assert.equal(calls.fetched[0].url, EXPECTED_ENTRADIO_DOWNLOAD_URL);
+    assert.equal(calls.fetched[1].url, 'https://app.entradio.cz/qrcode?code=TM5X59GM&size=200');
+    assert.equal(calls.fetched[2].url, 'https://app.entradio.cz/qrcode?code=2ZKN9JXVT&size=200');
+  });
+});
+
+// THE OWNER'S EXPLICIT DECISION, pinned: a QR code is not a PDF, so the PDF
+// toggle has no business gating it. A regression here would silently strip the
+// one artifact that actually gets the owner through the door.
+test('fetchEntradioAttachments: with insertPdfIntoEvent OFF, the QR codes are STILL fetched -- only the ticket-file download is gated by that toggle', () => {
+  withEntradioFetchGlobals({ respond: entradioRespondOk }, function (calls) {
+    const attachments = fetchEntradioAttachments(entradioFakeMessage(REAL_ENTRADIO_HTML_BODY), ENTRADIO_PARSED_FOR_FETCH, {
+      identifyingEmail: 'no-reply@app.entradio.cz',
+      insertPdfIntoEvent: false,
+    });
+
+    assert.deepEqual(
+      attachments.map(function (a) {
+        return a.title;
+      }),
+      ['ČERNO, VÍR - QR - TM5X59GM.png', 'ČERNO, VÍR - QR - 2ZKN9JXVT.png']
+    );
+    // The download link is never even fetched when the toggle is off.
+    assert.equal(
+      calls.fetched.some(function (call) {
+        return call.url === EXPECTED_ENTRADIO_DOWNLOAD_URL;
+      }),
+      false
+    );
+  });
+});
+
+test('fetchEntradioAttachments: a ticket download answering 200 with text/html is rejected, but the QR codes still come through', () => {
+  withEntradioFetchGlobals(
+    {
+      respond: function (url) {
+        if (url.indexOf('app.entradio.cz/qrcode') !== -1) {
+          return { code: 200, contentType: 'image/png' };
+        }
+        return { code: 200, contentType: 'text/html; charset=utf-8' };
+      },
+    },
+    function () {
+      const attachments = fetchEntradioAttachments(entradioFakeMessage(REAL_ENTRADIO_HTML_BODY), ENTRADIO_PARSED_FOR_FETCH, {
+        identifyingEmail: 'no-reply@app.entradio.cz',
+        insertPdfIntoEvent: true,
+      });
+
+      assert.equal(attachments.length, 2);
+      assert.deepEqual(
+        attachments.map(function (a) {
+          return a.mimeType;
+        }),
+        ['image/png', 'image/png']
+      );
+    }
+  );
+});
+
+test('fetchEntradioAttachments: ONE failing QR fetch does not take the other seat down with it', () => {
+  withEntradioFetchGlobals(
+    {
+      respond: function (url) {
+        if (url.indexOf('code=TM5X59GM') !== -1) {
+          return { code: 500, contentType: 'text/plain' };
+        }
+        return entradioRespondOk(url);
+      },
+    },
+    function () {
+      const attachments = fetchEntradioAttachments(entradioFakeMessage(REAL_ENTRADIO_HTML_BODY), ENTRADIO_PARSED_FOR_FETCH, {
+        identifyingEmail: 'no-reply@app.entradio.cz',
+        insertPdfIntoEvent: true,
+      });
+
+      assert.deepEqual(
+        attachments.map(function (a) {
+          return a.title;
+        }),
+        ['ČERNO, VÍR - 2026-09-27 - 2354152.pdf', 'ČERNO, VÍR - QR - 2ZKN9JXVT.png']
+      );
+    }
+  );
+});
+
+test('fetchEntradioAttachments: an HTML body with no STÁHNOUT VSTUPENKY link yields the QR codes only, never a throw', () => {
+  withEntradioFetchGlobals({ respond: entradioRespondOk }, function () {
+    const attachments = fetchEntradioAttachments(
+      entradioFakeMessage('<html><body>no button here</body></html>'),
+      ENTRADIO_PARSED_FOR_FETCH,
+      { identifyingEmail: 'no-reply@app.entradio.cz', insertPdfIntoEvent: true }
+    );
+
+    assert.equal(attachments.length, 2);
+  });
+});
+
+// THE NEGATIVE CONTRACT. processTicketFromMessageBody calls this BEFORE
+// creating the calendar event, so anything escaping here would abort the event
+// -- exactly the outcome the owner ruled out ("vytvořit událost i tak").
+test('fetchEntradioAttachments: UrlFetchApp itself throwing returns [] -- it NEVER propagates, so the calendar event is never blocked by a network failure', () => {
+  withEntradioFetchGlobals(
+    {
+      respond: function () {
+        return new Error('DNS lookup failed');
+      },
+    },
+    function () {
+      const attachments = fetchEntradioAttachments(entradioFakeMessage(REAL_ENTRADIO_HTML_BODY), ENTRADIO_PARSED_FOR_FETCH, {
+        identifyingEmail: 'no-reply@app.entradio.cz',
+        insertPdfIntoEvent: true,
+      });
+
+      assert.deepEqual(attachments, []);
+    }
+  );
+});
+
+test('fetchEntradioAttachments: Drive throwing on every write returns [] rather than propagating', () => {
+  withEntradioFetchGlobals({ respond: entradioRespondOk, driveThrows: true }, function () {
+    const attachments = fetchEntradioAttachments(entradioFakeMessage(REAL_ENTRADIO_HTML_BODY), ENTRADIO_PARSED_FOR_FETCH, {
+      identifyingEmail: 'no-reply@app.entradio.cz',
+      insertPdfIntoEvent: true,
+    });
+
+    assert.deepEqual(attachments, []);
+  });
+});
+
+test('fetchEntradioAttachments: message.getBody() throwing returns [] rather than propagating', () => {
+  withEntradioFetchGlobals({ respond: entradioRespondOk }, function () {
+    const attachments = fetchEntradioAttachments(
+      entradioFakeMessage(new Error('body unavailable')),
+      { eventName: 'ČERNO, VÍR', year: 2026, month: 8, day: 27, ticketIdentifier: '2354152', ticketCodes: [] },
+      { identifyingEmail: 'no-reply@app.entradio.cz', insertPdfIntoEvent: true }
+    );
+
+    assert.deepEqual(attachments, []);
+  });
+});
+
+test('fetchEntradioAttachments: a parsed ticket with no ticketCodes and the toggle off returns [] without any fetch at all', () => {
+  withEntradioFetchGlobals({ respond: entradioRespondOk }, function (calls) {
+    const attachments = fetchEntradioAttachments(
+      entradioFakeMessage(REAL_ENTRADIO_HTML_BODY),
+      { eventName: 'ČERNO, VÍR', year: 2026, month: 8, day: 27, ticketIdentifier: '2354152', ticketCodes: [] },
+      { identifyingEmail: 'no-reply@app.entradio.cz', insertPdfIntoEvent: false }
+    );
+
+    assert.deepEqual(attachments, []);
+    assert.equal(calls.fetched.length, 0);
+  });
+});
+
+test('fetchEntradioAttachments: a parsed ticket missing ticketCodes entirely (an older shape) degrades to the ticket file only, never a throw', () => {
+  withEntradioFetchGlobals({ respond: entradioRespondOk }, function () {
+    const attachments = fetchEntradioAttachments(
+      entradioFakeMessage(REAL_ENTRADIO_HTML_BODY),
+      { eventName: 'ČERNO, VÍR', year: 2026, month: 8, day: 27, ticketIdentifier: '2354152' },
+      { identifyingEmail: 'no-reply@app.entradio.cz', insertPdfIntoEvent: true }
+    );
+
+    assert.equal(attachments.length, 1);
+    assert.equal(attachments[0].mimeType, 'application/pdf');
+  });
+});
+
+test('fetchEntradioAttachments: END-TO-END from the REAL fixture -- parse the real body, then attach one ticket file plus exactly one QR per real seat code', () => {
+  const parsed = parseEntradioTicketText(REAL_ENTRADIO_BODY_TEXT);
+
+  withEntradioFetchGlobals({ respond: entradioRespondOk }, function () {
+    const attachments = fetchEntradioAttachments(entradioFakeMessage(REAL_ENTRADIO_HTML_BODY), parsed, {
+      identifyingEmail: 'no-reply@app.entradio.cz',
+      insertPdfIntoEvent: true,
+    });
+
+    assert.equal(attachments.length, 1 + parsed.ticketCodes.length);
+    parsed.ticketCodes.forEach(function (code) {
+      assert.equal(
+        attachments.some(function (a) {
+          return a.title === 'ČERNO, VÍR - QR - ' + code + '.png';
+        }),
+        true
+      );
+    });
+  });
+});
+
+// --- processTicketFromMessageBody: the ROUND 2 WIRING ------------------------
+//
+// WHY THESE EXIST, and why they were written AFTER the first two round-2
+// commits: the mutation pass over round 2's new code killed 12 of 15 mutants,
+// and the three survivors were all in this function -- "never concatenate the
+// fetched attachments onto the event", "never send the zero-attachment
+// notification", and a redundant inner catch. The first two are not obscure
+// edge cases, they are ROUND 2'S ENTIRE POINT: with either one applied, every
+// pure function below still behaved perfectly and the whole feature silently
+// did nothing. A signal that cannot see that is not a signal.
+//
+// This function is GAS-only (GmailMessage/DriveApp/CalendarApp/Calendar/
+// UrlFetchApp), which is why it had never been unit-tested. It is tested here
+// through the same global-injection harness the transport-tickets and ICS
+// actions already use for their own GAS-only pipelines: Apps Script
+// concatenates every project file into ONE shared global scope, so a bare
+// `CONFIG` / `UrlFetchApp` / `notifyOwnerOfTicketAttachmentFailure` reference
+// resolves through globalThis under Node too.
+//
+// The THIRD test is this round's "existing portals provably unchanged" signal
+// in its strongest available form: a Kino Art message driven end-to-end
+// through the SAME changed function, asserting the event it produces still
+// carries exactly one application/pdf attachment and that ZERO outbound HTTP
+// calls were made on its behalf.
+
+function withTicketBodyRunGlobals(options, fn) {
+  const previous = {
+    CONFIG: global.CONFIG,
+    Calendar: global.Calendar,
+    CalendarApp: global.CalendarApp,
+    DriveApp: global.DriveApp,
+    UrlFetchApp: global.UrlFetchApp,
+    notifyOwnerOfTicketAttachmentFailure: global.notifyOwnerOfTicketAttachmentFailure,
+  };
+  const realConsoleLog = console.log;
+  const calls = { inserted: [], fetched: [], notified: [], created: [] };
+
+  global.CONFIG = {
+    calendarId: 'DEFAULT_CAL',
+    ticketAttachmentDriveFolderName: 'GAS Email Manager - Tickets',
+  };
+
+  global.CalendarApp = {
+    getCalendarById: function () {
+      return {
+        getTimeZone: function () {
+          return 'Europe/Prague';
+        },
+      };
+    },
+  };
+
+  global.Calendar = {
+    Events: {
+      // No pre-existing tagged event: the dedup safety net never short-circuits
+      // in these tests, so the creation path is always the one exercised.
+      list: function () {
+        return { items: [] };
+      },
+      insert: function (resource, calendarId, optionalArgs) {
+        calls.inserted.push({ resource: resource, calendarId: calendarId, optionalArgs: optionalArgs });
+      },
+    },
+  };
+
+  global.UrlFetchApp = {
+    fetch: function (url, params) {
+      calls.fetched.push({ url: url, params: params });
+      const responder = options.respond ? options.respond(url) : { code: 404, contentType: 'text/plain' };
+      if (responder instanceof Error) {
+        throw responder;
+      }
+      return {
+        getResponseCode: function () {
+          return responder.code;
+        },
+        getBlob: function () {
+          return entradioFakeBlob(responder.contentType);
+        },
+      };
+    },
+  };
+
+  let createdCount = 0;
+  global.DriveApp = {
+    getFoldersByName: function () {
+      return {
+        hasNext: function () {
+          return true;
+        },
+        next: function () {
+          return {
+            createFile: function () {
+              createdCount += 1;
+              const record = { id: 'FILE_' + createdCount, name: null };
+              calls.created.push(record);
+              return {
+                getId: function () {
+                  return record.id;
+                },
+                getUrl: function () {
+                  return 'https://drive.example/' + record.id;
+                },
+                getName: function () {
+                  return record.name;
+                },
+                setName: function (newName) {
+                  record.name = newName;
+                },
+              };
+            },
+          };
+        },
+      };
+    },
+  };
+
+  // Lives in src/02-main.js. Under GAS both files share one global scope; under
+  // Node it has to be wired the way the runtime would, same as the transport
+  // action's own harness does for importIcsEventWithSequenceRetry.
+  global.notifyOwnerOfTicketAttachmentFailure = function (eventName, calendarId, ticketIdentifier) {
+    calls.notified.push({ eventName: eventName, calendarId: calendarId, ticketIdentifier: ticketIdentifier });
+  };
+
+  console.log = function () {};
+
+  try {
+    return fn(calls);
+  } finally {
+    console.log = realConsoleLog;
+    Object.keys(previous).forEach(function (key) {
+      if (previous[key] === undefined) {
+        delete global[key];
+      } else {
+        global[key] = previous[key];
+      }
+    });
+  }
+}
+
+function entradioBodyModeMessage() {
+  return {
+    getFrom: function () {
+      return 'Kino Metropol <no-reply@app.entradio.cz>';
+    },
+    getPlainBody: function () {
+      return REAL_ENTRADIO_BODY_TEXT;
+    },
+    getBody: function () {
+      return REAL_ENTRADIO_HTML_BODY;
+    },
+    getAttachments: function () {
+      return [fakeAttachment('VOP_Metropol.pdf', 'application/pdf')];
+    },
+  };
+}
+
+const ENTRADIO_PORTAL_PDF_ON = {
+  identifyingEmail: 'no-reply@app.entradio.cz',
+  calendarId: 'KINO_CAL',
+  insertPdfIntoEvent: true,
+};
+
+// KILLS THE "never concatenate the fetched attachments" MUTANT. Everything
+// upstream of this line can be perfect and the owner still gets a bare event.
+test('processTicketFromMessageBody: an Entradio message creates ONE event carrying the downloaded ticket file AND both seats\' QR codes as real Calendar attachments', () => {
+  withTicketBodyRunGlobals({ respond: entradioRespondOk }, function (calls) {
+    processTicketFromMessageBody(entradioBodyModeMessage(), ENTRADIO_PORTAL_PDF_ON);
+
+    assert.equal(calls.inserted.length, 1);
+    const insert = calls.inserted[0];
+
+    assert.equal(insert.calendarId, 'KINO_CAL');
+    assert.equal(insert.resource.summary, 'ČERNO, VÍR');
+    assert.equal(insert.resource.start.dateTime, '2026-09-27T17:30:00');
+    assert.equal(insert.resource.end.dateTime, '2026-09-27T19:30:00');
+    assert.deepEqual(insert.resource.extendedProperties, { private: { ticketIdentifier: '2354152' } });
+
+    assert.deepEqual(
+      insert.resource.attachments.map(function (a) {
+        return a.title;
+      }),
+      ['ČERNO, VÍR - 2026-09-27 - 2354152.pdf', 'ČERNO, VÍR - QR - TM5X59GM.png', 'ČERNO, VÍR - QR - 2ZKN9JXVT.png']
+    );
+    assert.deepEqual(
+      insert.resource.attachments.map(function (a) {
+        return a.mimeType;
+      }),
+      ['application/pdf', 'image/png', 'image/png']
+    );
+    // Without this the Calendar API silently drops the whole attachments array.
+    assert.deepEqual(insert.optionalArgs, { supportsAttachments: true });
+
+    // No attachment failure, so no notification.
+    assert.equal(calls.notified.length, 0);
+  });
+});
+
+test('processTicketFromMessageBody: with insertPdfIntoEvent OFF, the Entradio event still carries both QR codes and no ticket file', () => {
+  withTicketBodyRunGlobals({ respond: entradioRespondOk }, function (calls) {
+    processTicketFromMessageBody(entradioBodyModeMessage(), {
+      identifyingEmail: 'no-reply@app.entradio.cz',
+      calendarId: 'KINO_CAL',
+      insertPdfIntoEvent: false,
+    });
+
+    assert.deepEqual(
+      calls.inserted[0].resource.attachments.map(function (a) {
+        return a.title;
+      }),
+      ['ČERNO, VÍR - QR - TM5X59GM.png', 'ČERNO, VÍR - QR - 2ZKN9JXVT.png']
+    );
+    assert.equal(calls.notified.length, 0);
+  });
+});
+
+// KILLS THE "never send the zero-attachment notification" MUTANT, and pins the
+// owner's explicit rule in the same assertion: "Vytvořit událost i tak, jen
+// upozornit e-mailem" -- create the event regardless, just send a warning.
+test('processTicketFromMessageBody: when NOTHING can be fetched, the event is STILL created and the owner is notified exactly once', () => {
+  withTicketBodyRunGlobals(
+    {
+      respond: function () {
+        return new Error('the network is down');
+      },
+    },
+    function (calls) {
+      processTicketFromMessageBody(entradioBodyModeMessage(), ENTRADIO_PORTAL_PDF_ON);
+
+      // The event is not sacrificed for the attachments.
+      assert.equal(calls.inserted.length, 1);
+      assert.equal(calls.inserted[0].resource.summary, 'ČERNO, VÍR');
+      assert.equal(Object.prototype.hasOwnProperty.call(calls.inserted[0].resource, 'attachments'), false);
+      assert.deepEqual(calls.inserted[0].optionalArgs, {});
+
+      assert.deepEqual(calls.notified, [{ eventName: 'ČERNO, VÍR', calendarId: 'KINO_CAL', ticketIdentifier: '2354152' }]);
+    }
+  );
+});
+
+test('processTicketFromMessageBody: a PARTIAL attachment result is not a failure -- some QR codes and no ticket file sends NO notification', () => {
+  withTicketBodyRunGlobals(
+    {
+      respond: function (url) {
+        if (url.indexOf('app.entradio.cz/qrcode') !== -1) {
+          return { code: 200, contentType: 'image/png' };
+        }
+        return { code: 404, contentType: 'text/plain' };
+      },
+    },
+    function (calls) {
+      processTicketFromMessageBody(entradioBodyModeMessage(), ENTRADIO_PORTAL_PDF_ON);
+
+      assert.equal(calls.inserted[0].resource.attachments.length, 2);
+      assert.equal(calls.notified.length, 0);
+    }
+  );
+});
+
+// THIS ROUND'S "EXISTING PORTALS PROVABLY UNCHANGED" SIGNAL, at the highest
+// level available: the same changed function, driven end-to-end for Kino Art.
+// The event must still carry exactly ONE application/pdf attachment named by
+// the unchanged buildTicketAttachmentFilename convention, and NOT ONE outbound
+// HTTP call may be made on its behalf.
+
+// Deliberately the SAME REAL_KINO_ART_BODY_TEXT fixture the Kino Art parser
+// tests already use, rather than a fresh approximation: the whole point of
+// this test is that nothing about Kino Art changed, so it must be driven by
+// the very data that proved Kino Art worked in the first place.
+
+function kinoArtBodyModeMessage() {
+  return {
+    getFrom: function () {
+      return 'Kino Art <rezervace@kinoart.cz>';
+    },
+    getPlainBody: function () {
+      return REAL_KINO_ART_BODY_TEXT;
+    },
+    getBody: function () {
+      return '<html><body>irrelevant</body></html>';
+    },
+    getAttachments: function () {
+      return [
+        Object.assign(fakeAttachment('Vstupenky.pdf', 'application/pdf'), {
+          copyBlob: function () {
+            return entradioFakeBlob('application/pdf');
+          },
+        }),
+        Object.assign(fakeAttachment('Doklad.pdf', 'application/pdf'), {
+          copyBlob: function () {
+            return entradioFakeBlob('application/pdf');
+          },
+        }),
+      ];
+    },
+  };
+}
+
+test('processTicketFromMessageBody: KINO ART IS UNTOUCHED BY ROUND 2 -- still exactly one application/pdf attachment, still named by the unchanged convention, and ZERO outbound HTTP calls', () => {
+  withTicketBodyRunGlobals({ respond: entradioRespondOk }, function (calls) {
+    const parsed = parseKinoArtTicketText(REAL_KINO_ART_BODY_TEXT);
+
+    processTicketFromMessageBody(kinoArtBodyModeMessage(), {
+      identifyingEmail: 'rezervace@kinoart.cz',
+      calendarId: 'ART_CAL',
+      insertPdfIntoEvent: true,
+    });
+
+    assert.equal(calls.inserted.length, 1);
+    const insert = calls.inserted[0];
+
+    assert.equal(insert.resource.attachments.length, 1);
+    assert.equal(insert.resource.attachments[0].mimeType, 'application/pdf');
+    assert.equal(
+      insert.resource.attachments[0].title,
+      buildTicketAttachmentFilename(parsed.eventName, parsed, parsed.ticketIdentifier)
+    );
+    assert.deepEqual(insert.optionalArgs, { supportsAttachments: true });
+
+    // THE POINT: Kino Art has no registered attachment fetcher, so round 2's
+    // network path is unreachable for it.
+    assert.deepEqual(calls.fetched, []);
+    assert.equal(calls.notified.length, 0);
+  });
+});
+
+test('processTicketFromMessageBody: a Kino Art message with insertPdfIntoEvent OFF still creates an event with no attachments and makes no outbound call', () => {
+  withTicketBodyRunGlobals({ respond: entradioRespondOk }, function (calls) {
+    processTicketFromMessageBody(kinoArtBodyModeMessage(), {
+      identifyingEmail: 'rezervace@kinoart.cz',
+      calendarId: 'ART_CAL',
+      insertPdfIntoEvent: false,
+    });
+
+    assert.equal(Object.prototype.hasOwnProperty.call(calls.inserted[0].resource, 'attachments'), false);
+    assert.deepEqual(calls.inserted[0].optionalArgs, {});
+    assert.deepEqual(calls.fetched, []);
+    assert.equal(calls.notified.length, 0);
+  });
 });

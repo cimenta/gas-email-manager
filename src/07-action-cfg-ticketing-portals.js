@@ -50,19 +50,59 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // whether it then survives in the permanent folder + becomes a real
   // Calendar attachment, or is deleted).
   //
-  // The shipped default seeds THREE entries: enigoo.cz (the original portal
+  // The shipped default seeds FOUR entries: enigoo.cz (the original portal
   // this feature was built from, PDF/OCR-sourced — see the sibling action
   // file's parseEnigooTicketText), Kino Art (kinoart.cz, a Czech cinema,
   // added quick-260731-kar, BODY-SOURCED — see the sibling action file's
   // parseKinoArtTicketText and its class-level "TWO PROCESSING MODES" doc
-  // for the full architecture), and Ticketmaster CZ (ticketmaster.cz,
+  // for the full architecture), Ticketmaster CZ (ticketmaster.cz,
   // added quick-260816-ocw, also BODY-SOURCED — see the sibling action
-  // file's parseTicketmasterCzTicketText). All three entries ship with
+  // file's parseTicketmasterCzTicketText), and Entradio
+  // (no-reply@app.entradio.cz, added debug/entradio-portal-not-supported,
+  // also BODY-SOURCED — see the sibling action file's
+  // parseEntradioTicketText). All four entries ship with
   // calendarId left null and insertPdfIntoEvent left false — the owner
   // fills in the real calendar ID and decides the attachment toggle live,
   // per entry, via rebuildScriptProperties() + Script Properties, matching
   // the now-established settings workflow (never committed to git — same
   // placeholder-calendar-ID convention as CONFIG.calendarId itself).
+  //
+  // ENTRADIO IS A PLATFORM, NOT A VENUE (worth knowing before adding a
+  // "missing" venue here): app.entradio.cz is a white-label ticketing system
+  // that many venues send through — the sample this entry was built from
+  // came from Kino Metropol Olomouc, but the SENDER address is shared across
+  // every venue on the platform, so this ONE entry already covers all of
+  // them. Its parser anchors on Entradio's own template structure, never on
+  // any single venue's name. A new Entradio venue needs no config change at
+  // all; it only needs its own calendarId here if the owner wants it routed
+  // somewhere other than this entry's calendar (a per-venue split this
+  // sender-keyed config shape cannot express — it would need a different
+  // mechanism, and no such need exists today).
+  //
+  // ENTRADIO AND insertPdfIntoEvent (REWRITTEN IN ROUND 2 of
+  // debug/entradio-portal-not-supported — round 1's version of this note said
+  // leaving it false was "the only meaningful setting", which is NO LONGER
+  // TRUE and is corrected here rather than left to contradict the code):
+  //
+  // For this portal the toggle means "ALSO DOWNLOAD THE TICKET FILE". An
+  // Entradio confirmation carries no ticket PDF among its attachments (only
+  // the venue's terms and conditions), so the sibling action file still
+  // registers no PDF finder for it — but it DOES register an attachment
+  // FETCHER (fetchEntradioAttachments), which follows the "STÁHNOUT
+  // VSTUPENKY" link over HTTP when this toggle is ON and attaches the
+  // downloaded file to the event.
+  //
+  // THE PER-SEAT QR CODES ARE NOT GATED BY THIS TOGGLE AT ALL. They are
+  // fetched from Entradio's own qrcode endpoint and attached on EVERY
+  // Entradio event regardless, because a QR code is not a PDF and it is the
+  // artifact that actually gets the owner through the door. So the shipped
+  // `false` below is a real, usable setting rather than a placeholder: the
+  // event still arrives with one QR attachment per seat.
+  //
+  // NOTE: this portal is the reason src/appsscript.json now declares the
+  // script.external_request OAuth scope — the first outbound HTTP in this
+  // project. See the sibling action file's "ENTRADIO ATTACHMENT PIPELINE"
+  // section.
   //
   // Script Property override: 07-action-ticketing-portals-TICKETING_PORTALS
   // (json — array of {identifyingEmail, calendarId, insertPdfIntoEvent}
@@ -73,7 +113,7 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // src/05-action-cfg-ics-import.js for the exact same JSON-vs-JS-object-
   // literal pitfall a real owner mistake already hit once for that other
   // JSON-typed setting):
-  // [{"identifyingEmail":"no-reply@enigoo.cz","calendarId":"abc123@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":"def456@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"noreply@ticketmaster.cz","calendarId":"ghi789@group.calendar.google.com","insertPdfIntoEvent":false}]
+  // [{"identifyingEmail":"no-reply@enigoo.cz","calendarId":"abc123@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":"def456@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"noreply@ticketmaster.cz","calendarId":"ghi789@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"no-reply@app.entradio.cz","calendarId":"jkl012@group.calendar.google.com","insertPdfIntoEvent":false}]
   get ticketingPortals() {
     return getJsonSetting(
       '07-action-ticketing-portals-TICKETING_PORTALS',
@@ -81,6 +121,7 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
         { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false },
         { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false },
         { identifyingEmail: 'noreply@ticketmaster.cz', calendarId: null, insertPdfIntoEvent: false },
+        { identifyingEmail: 'no-reply@app.entradio.cz', calendarId: null, insertPdfIntoEvent: false },
       ],
       isValidTicketingPortalsShape
     );

@@ -1,4 +1,4 @@
-// Version: 0.16.2
+// Version: 0.16.3
 /**
  * APP_VERSION — the running application version, rendered next to the admin
  * web app's page title via webappGetVersion (src/00-webapp.js, D-01). This
@@ -10,7 +10,7 @@
  * future release -- test/app-version.test.js is the guard that fails the
  * whole suite the moment they ever drift apart.
  */
-const APP_VERSION = '0.16.2';
+const APP_VERSION = '0.16.3';
 
 /**
  * orderThreadsForProcessing — CAUSAL ORDERING GUARANTEE (live-reported bug
@@ -181,10 +181,108 @@ function notifyOwnerOfFailure(actionName, thread, error) {
   }
 }
 
+/**
+ * Notifications — ticket ATTACHMENT failure (debug/entradio-portal-not-supported,
+ * round 2).
+ *
+ * A SEPARATE notification from composeFailureBody/notifyOwnerOfFailure above,
+ * deliberately NOT a reuse of them. That pair describes an action that FAILED:
+ * its body states the email "has been labeled as failed" and that "no further
+ * automatic retry will occur". Both sentences would be FALSE in this case —
+ * the calendar event WAS created successfully and the thread WILL be labeled
+ * processed like any other success. Only the ticket attachment(s) are missing.
+ *
+ * Telling the owner an event failed when it did not is worse than sending
+ * nothing: it invites a manual reprocess of a thread the dedup safety net
+ * (isDuplicateTicketPurchase) will then correctly no-op, leaving them with a
+ * "nothing happened again" impression and no idea what to actually do.
+ *
+ * WHO SENDS THIS: processTicketFromMessageBody
+ * (src/07-action-ticketing-portals.js), and only when a portal's registered
+ * attachment fetcher returned ZERO attachments — i.e. nothing at all could be
+ * attached, neither the downloaded ticket file nor a single QR code. A partial
+ * result (some seats' QR codes but not the ticket file, say) is NOT a failure
+ * worth an email; the event carries usable artifacts either way.
+ *
+ * Owner-confirmed behaviour ("Vytvořit událost i tak, jen upozornit e-mailem"):
+ * an attachment failure NEVER blocks calendar-event creation. This email is the
+ * whole of the consequence.
+ *
+ * Trust boundary: identical to notifyOwnerOfFailure's. `eventName` and
+ * `ticketIdentifier` originate in untrusted inbound email content, so the body
+ * is PLAIN TEXT ONLY (no HTML body) — there is no HTML/script execution
+ * context for that content to land in — and the recipient/subject are never
+ * attacker-controlled.
+ */
+
+/**
+ * composeTicketAttachmentFailureBody — pure plain-text description of a
+ * calendar event that was created successfully but reached the calendar with
+ * none of its ticket attachments. Names the event, the calendar it landed on
+ * and the order/ticket identifier, so the owner can find it and download the
+ * tickets by hand. No HTML markup.
+ *
+ * A falsy `ticketIdentifier` (a documented, never-throwing possibility for
+ * every portal parser in this codebase) omits its line entirely rather than
+ * rendering the literal word "null" — the same defensive null-handling lesson
+ * buildTicketAttachmentFilename records from the live Kino Art round-4
+ * incident.
+ */
+function composeTicketAttachmentFailureBody(eventName, calendarId, ticketIdentifier) {
+  const lines = [
+    'A GAS Email Manager calendar event was created, but its ticket attachment(s) could not be fetched.',
+    '',
+    'Event: ' + eventName,
+    'Calendar: ' + calendarId,
+  ];
+
+  if (ticketIdentifier) {
+    lines.push('Order / ticket number: ' + ticketIdentifier);
+  }
+
+  lines.push(
+    '',
+    'The event itself is on the calendar and the email has been labeled as processed -- only the ticket file and/or QR codes are missing.',
+    'Please open the original confirmation email and download the tickets manually.'
+  );
+
+  return lines.join('\n');
+}
+
+/**
+ * notifyOwnerOfTicketAttachmentFailure — resolves the script owner via
+ * Session.getActiveUser().getEmail() and sends a fixed-subject, plain-text
+ * notice that an event was created without its ticket attachments. Subject is
+ * DISTINCT from notifyOwnerOfFailure's, so the two are trivially separable in
+ * the owner's inbox and by any Gmail filter.
+ *
+ * Never sends HTML, never sends to any recipient other than the owner, and the
+ * whole send is wrapped in its own try/catch — this is called from inside a
+ * successful event-creation path, so a mail failure must never be able to turn
+ * a success into a thrown action failure. If the recipient resolves empty, the
+ * send is skipped.
+ */
+function notifyOwnerOfTicketAttachmentFailure(eventName, calendarId, ticketIdentifier) {
+  try {
+    const recipient = Session.getActiveUser().getEmail();
+    if (!recipient) {
+      return;
+    }
+
+    const subject = 'GAS Email Manager: calendar event created without ticket attachments';
+    const body = composeTicketAttachmentFailureBody(eventName, calendarId, ticketIdentifier);
+
+    MailApp.sendEmail(recipient, subject, body);
+  } catch (notifyError) {
+    console.error('notifyOwnerOfTicketAttachmentFailure failed to send: ' + notifyError);
+  }
+}
+
 // GAS-safe Node export (inert under the Apps Script runtime).
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     composeFailureBody: composeFailureBody,
+    composeTicketAttachmentFailureBody: composeTicketAttachmentFailureBody,
     orderThreadsForProcessing: orderThreadsForProcessing,
     APP_VERSION: APP_VERSION,
   };
