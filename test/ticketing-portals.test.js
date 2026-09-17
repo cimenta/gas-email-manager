@@ -37,6 +37,9 @@ const {
   fetchEntradioAttachments,
   TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL,
   buildTicketCalendarEventResource,
+  // debug/ticketmaster-cz-order-confirm: the body-content admission gate.
+  ticketmasterCzTextHasOrderDetails,
+  TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL,
 } = require('../src/07-action-ticketing-portals.js');
 
 // --- parseEnigooTicketText ---------------------------------------------------
@@ -457,13 +460,21 @@ function fakeAttachment(name, contentType) {
   };
 }
 
-function fakeMessage(fromHeader, attachments) {
+// `plainBody` was added by debug/ticketmaster-cz-order-confirm: before that
+// fix this fake could not express body content AT ALL, which is precisely why
+// the envelope-only admission gate went unnoticed (see that session's "why no
+// gate caught it"). It defaults to '' rather than being required, so a portal
+// with no registered body-content detector is unaffected.
+function fakeMessage(fromHeader, attachments, plainBody) {
   return {
     getFrom: function () {
       return fromHeader;
     },
     getAttachments: function () {
       return attachments || [];
+    },
+    getPlainBody: function () {
+      return plainBody || '';
     },
   };
 }
@@ -1104,9 +1115,15 @@ test('findTicketmasterCzTicketPdfAttachment: returns null when the message carri
   assert.equal(findTicketmasterCzTicketPdfAttachment(message), null);
 });
 
+// AMENDED by debug/ticketmaster-cz-order-confirm: both tests below now pass the
+// real order-details body. They previously passed NO body at all and still
+// asserted a job, which is exactly the envelope-only contract that produced the
+// bug. The assertions are unchanged -- a Ticketmaster CZ message carrying real
+// order details must still yield exactly one body-mode job.
+
 test('resolveTicketProcessingJobs: a noreply@ticketmaster.cz message with no attachments yields exactly one "body"-mode job (D-01)', () => {
   const portals = [{ identifyingEmail: 'noreply@ticketmaster.cz', calendarId: 'CAL_A', insertPdfIntoEvent: false }];
-  const message = fakeMessage('noreply@ticketmaster.cz', []);
+  const message = fakeMessage('noreply@ticketmaster.cz', [], REAL_TICKETMASTER_CZ_BODY_TEXT);
 
   const jobs = resolveTicketProcessingJobs([message], portals);
 
@@ -1118,7 +1135,11 @@ test('resolveTicketProcessingJobs: a noreply@ticketmaster.cz message with no att
 
 test('resolveTicketProcessingJobs: the SAME Ticketmaster CZ message carrying the real eTicket.pdf attachment STILL yields exactly one "body"-mode job -- never one job per attachment, never a "pdf"-mode job (D-01)', () => {
   const portals = [{ identifyingEmail: 'noreply@ticketmaster.cz', calendarId: 'CAL_A', insertPdfIntoEvent: false }];
-  const message = fakeMessage('noreply@ticketmaster.cz', [fakeAttachment('eTicket.pdf', 'application/pdf')]);
+  const message = fakeMessage(
+    'noreply@ticketmaster.cz',
+    [fakeAttachment('eTicket.pdf', 'application/pdf')],
+    REAL_TICKETMASTER_CZ_BODY_TEXT
+  );
 
   const jobs = resolveTicketProcessingJobs([message], portals);
 
@@ -1141,6 +1162,421 @@ test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are s
   assert.equal(portals.length, 4);
   assert.deepEqual(portals[0], { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[1], { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false });
+});
+
+// --- THE BODY-CONTENT ADMISSION GATE (debug/ticketmaster-cz-order-confirm) ---
+//
+// THE BUG: a real, legitimate Ticketmaster CZ PURCHASE CONFIRMATION (the email
+// sent BEFORE the tickets themselves, which arrive in a separate follow-up)
+// was admitted into the body-mode processing path on SENDER ALONE and then
+// threw "Unrecognized Ticketmaster CZ ticket text: \"YOUR ORDER DETAILS\"
+// marker not found", surfacing to the owner as an action-failure notification.
+//
+// Ticketmaster CZ sends at least TWO distinct templates from the one address
+// noreply@ticketmaster.cz -- this confirmation, and the ticket-delivery email
+// that already works. Config matches ADDRESSES, not templates, so no config
+// change can separate them; only body content can. resolveTicketProcessingJobs
+// and appliesTo both decided "this is a ticket" from the envelope and never
+// called getPlainBody(), leaving the parser's marker THROW as the only way the
+// system could say "this is not an order-details block".
+//
+// THE FIDELITY PROPERTY (established by debug/teamio-non-invite-error):
+// ticketmasterCzTextHasOrderDetails is built on the SAME marker constant and
+// the SAME NBSP normalization parseTicketmasterCzTicketText itself uses, so the
+// detector returns false for EXACTLY the bodies the parser would have thrown
+// the marker error on. It is not an independent heuristic and cannot drift.
+//
+// WHY NOT A POSITIVE "tickets follow separately" MARKER: the obvious candidate
+// sentence is HARD-WRAPPED mid-phrase in the real body ("...with your\ntickets
+// attached."), so a literal substring match finds NOTHING -- it would have
+// looked like a fix while changing nothing. Matching it would need a
+// whitespace-tolerant regex over MARKETING COPY, the exact drift-prone second
+// marker the fidelity property exists to forbid.
+//
+// The fixture below is the REAL owner-supplied .eml's text/plain part
+// (quoted-printable -> UTF-8), reproduced line for line INCLUDING its
+// NBSP-only separator lines, its trailing-space lines and its mid-sentence
+// wrap -- those are exactly the details a hand-approximated fixture would
+// smooth away. Only the buyer's NAME and PHONE are redacted (PII, per
+// push-public.bat's scrub convention); there is no buyer address in the body,
+// and the only address present is Ticketmaster's own public registered office.
+// Full fidelity matters here specifically because the whole claim under test is
+// "the marker appears NOWHERE in the body" -- a truncated fixture could not
+// support it.
+
+const REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT = [
+  '',
+  '',
+  '',
+  'YOU GOT THE TICKETS!',
+  '\u00A0',
+  'ORDER NUMBER: 2387845',
+  '',
+  '',
+  'ČESKÝ MEJDAN S IMPULSEM 2026',
+  '\u00A0',
+  '\u00A0',
+  'O2 arena',
+  '\u00A0',
+  'Saturday 17 October 2026 at 18:00',
+  '\u00A0',
+  '2 x tickets',
+  '\u00A0',
+  'Promoter: Bestsport, a.s., IČ: 24214795',
+  '\u00A0',
+  '',
+  '',
+  '',
+  '',
+  'View Tickets [https://www.ticketmaster.cz/user/orders]',
+  '',
+  '',
+  ' This email cannot be used for event entry.',
+  ' ',
+  '',
+  'TICKET DELIVERY',
+  '\u00A0',
+  'eTicket',
+  '\u00A0',
+  'Delivery fee: 0 Kč',
+  '',
+  'Delivery information: You will receive a separate email with your',
+  'tickets attached. You can also download your tickets at any time',
+  'via your account, save them to your mobile wallet, or view them in',
+  'the Ticketmaster mobile app for Android or iOS.',
+  '',
+  '',
+  'ORDER SUMMARY',
+  ' 2 ticket(s)',
+  ' ',
+  'Level',
+  ' Section',
+  ' Row',
+  ' Seat',
+  ' ',
+  '4. POSCHODÍ',
+  ' 421',
+  ' 14',
+  ' 13',
+  ' ',
+  '      ',
+  '',
+  '',
+  '',
+  '',
+  '',
+  'Level',
+  ' Section',
+  ' Row',
+  ' Seat',
+  ' ',
+  '4. POSCHODÍ',
+  ' 421',
+  ' 14',
+  ' 12',
+  ' ',
+  '      ',
+  '',
+  '',
+  '',
+  '',
+  '',
+  '',
+  '      ',
+  '',
+  '',
+  'PAYMENT SUMMARY',
+  '',
+  'Total',
+  ' 2\u00A0010,00 Kč',
+  ' ',
+  'Payment Method',
+  ' Mastercard',
+  '',
+  '',
+  ' ',
+  '      ',
+  '',
+  'YOUR CONTACT DETAILS',
+  '\u00A0',
+  'Jan Novák\u00A0\u00A0\u00A0',
+  '\u00A0',
+  'Phone: 420700000000',
+  '',
+  '',
+  ' YOUR PHONE IS YOUR TICKET',
+  '',
+  ' Download the Ticketmaster App',
+  ' ',
+  ' Sign in to view your ticket(s)',
+  ' ',
+  ' For entry to the event, scan your ticket directly from your phone',
+  ' ',
+  '  ',
+  '',
+  ' ',
+  '',
+  'LET\'S CONNECT',
+  '',
+  '     ',
+  'Need Help? Contact our Fan Support Team [https://help.ticketmaster.cz/hc/en-us]',
+  '',
+  '',
+  'Ticketmaster [https://www.ticketmaster.cz/]\u00A0\u00A0\u00A0\u00A0\u00A0 Privacy Policy [https://privacy.ticketmaster.cz/en/privacy-policy]\u00A0\u00A0\u00A0\u00A0\u00A0 My Account [https://my.ticketmaster.cz/settings]',
+  '',
+  '© 2026 Ticketmaster Česká republika, a.s.',
+  'Jungmannova 26/15, 110 00 Praha 1, Česká republika',
+  'All rights reserved.',
+].join('\n');
+
+// FIXTURE INTEGRITY -- pins the three properties every test below depends on.
+// If a future edit smooths the fixture, these fail FIRST and name the reason,
+// rather than letting the regression tests pass for the wrong reason.
+
+test('fixture integrity: the real order-confirmation body contains NO "YOUR ORDER DETAILS" and NO "Ticket Quantity:" marker anywhere, but DOES carry "ORDER SUMMARY"', () => {
+  assert.equal(REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT.indexOf('YOUR ORDER DETAILS'), -1);
+  assert.equal(REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT.indexOf('Ticket Quantity:'), -1);
+  assert.notEqual(REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT.indexOf('ORDER SUMMARY'), -1);
+});
+
+test('fixture integrity: the "tickets follow separately" sentence is hard-wrapped mid-phrase, so NO literal one-line marker can match it -- this is why the detector shares the parser marker instead', () => {
+  assert.equal(
+    REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT.indexOf('You will receive a separate email with your tickets attached'),
+    -1
+  );
+  assert.notEqual(REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT.indexOf('with your\ntickets attached'), -1);
+});
+
+test('fixture integrity: the confirmation carries a WELL-FORMED date/time the parser pattern matches -- so a date-shaped detector would wrongly admit it, and only the region marker separates the two templates', () => {
+  const dateTimePattern = /(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s+at\s+(\d{1,2}):(\d{2})/;
+  const match = dateTimePattern.exec(REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT.replace(/\u00A0/g, ' '));
+
+  assert.notEqual(match, null);
+  assert.equal(match[0], '17 October 2026 at 18:00');
+});
+
+test('fixture integrity: the buyer name and phone number are redacted -- no real PII reaches the public repo', () => {
+  assert.equal(REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT.indexOf('Radek'), -1);
+  assert.equal(REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT.indexOf('420704145475'), -1);
+});
+
+// THE REGRESSION -- the two gates, against the SHIPPED default config rather
+// than a hand-built portal list. Before the fix each admitted the message and
+// the run then threw; both must now refuse it outright. These assert the
+// action DOES NOT APPLY, not merely that it "does not throw": a run that still
+// claimed and labelled the thread would satisfy a crash-freedom oracle while
+// leaving the real defect in place.
+
+test('THE REGRESSION -- resolveTicketProcessingJobs: the real Ticketmaster CZ ORDER CONFIRMATION (tickets follow separately) yields ZERO jobs against the shipped defaults', () => {
+  const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
+  const message = fakeMessage(
+    'Ticketmaster <noreply@ticketmaster.cz>',
+    [],
+    REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT
+  );
+
+  assert.deepEqual(resolveTicketProcessingJobs([message], TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals), []);
+});
+
+test('THE REGRESSION -- TICKETING_PORTALS_ACTION.appliesTo: returns false for the real order-confirmation thread, so the action never claims or labels it', () => {
+  const message = fakeMessage(
+    'Ticketmaster <noreply@ticketmaster.cz>',
+    [],
+    REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT
+  );
+  const thread = {
+    getMessages: function () {
+      return [message];
+    },
+  };
+
+  assert.equal(TICKETING_PORTALS_ACTION.appliesTo(thread), false);
+});
+
+test('THE REGRESSION: the order confirmation is refused even when it carries an eTicket.pdf attachment -- the attachment never re-opens the gate', () => {
+  const portals = [{ identifyingEmail: 'noreply@ticketmaster.cz', calendarId: 'CAL_A', insertPdfIntoEvent: true }];
+  const message = fakeMessage(
+    'noreply@ticketmaster.cz',
+    [fakeAttachment('eTicket.pdf', 'application/pdf')],
+    REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT
+  );
+
+  assert.deepEqual(resolveTicketProcessingJobs([message], portals), []);
+});
+
+// THE HAPPY PATH -- the working ticket-details email must be entirely
+// unaffected. This is the load-bearing counterweight: the fix adds a gate that
+// could in principle refuse a genuine ticket email.
+
+test('THE HAPPY PATH: the working Ticketmaster CZ ticket-details body still yields exactly one "body"-mode job against the shipped defaults', () => {
+  const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
+  const message = fakeMessage('Ticketmaster <noreply@ticketmaster.cz>', [], REAL_TICKETMASTER_CZ_BODY_TEXT);
+
+  const jobs = resolveTicketProcessingJobs([message], TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'body');
+  assert.equal(jobs[0].message, message);
+  assert.equal(jobs[0].portal.identifyingEmail, 'noreply@ticketmaster.cz');
+});
+
+test('THE HAPPY PATH: appliesTo still claims a thread carrying the working ticket-details body', () => {
+  const thread = {
+    getMessages: function () {
+      return [fakeMessage('noreply@ticketmaster.cz', [], REAL_TICKETMASTER_CZ_BODY_TEXT)];
+    },
+  };
+
+  assert.equal(TICKETING_PORTALS_ACTION.appliesTo(thread), true);
+});
+
+test('THE HAPPY PATH: a thread mixing the confirmation AND the ticket-details email yields exactly ONE job -- for the ticket-details message only', () => {
+  const portals = [{ identifyingEmail: 'noreply@ticketmaster.cz', calendarId: 'CAL_A', insertPdfIntoEvent: false }];
+  const confirmation = fakeMessage('noreply@ticketmaster.cz', [], REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT);
+  const ticketDetails = fakeMessage('noreply@ticketmaster.cz', [], REAL_TICKETMASTER_CZ_BODY_TEXT);
+
+  const jobs = resolveTicketProcessingJobs([confirmation, ticketDetails], portals);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].message, ticketDetails);
+});
+
+// STRUCTURE PRESENT BUT UNPARSEABLE MUST STILL THROW. The gate only converts
+// "no order-details region at all" into a silent skip; a genuinely malformed
+// region is still admitted as a job so the parser can report it loudly.
+
+test('a MALFORMED Ticketmaster CZ body (has "YOUR ORDER DETAILS" but no "Ticket Quantity:") is still ADMITTED as a job -- the gate never suppresses a real parse failure', () => {
+  const portals = [{ identifyingEmail: 'noreply@ticketmaster.cz', calendarId: 'CAL_A', insertPdfIntoEvent: false }];
+  const malformed = REAL_TICKETMASTER_CZ_BODY_TEXT.replace('Ticket Quantity: 2', 'Tickets: 2');
+  const message = fakeMessage('noreply@ticketmaster.cz', [], malformed);
+
+  const jobs = resolveTicketProcessingJobs([message], portals);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'body');
+});
+
+test('a MALFORMED Ticketmaster CZ body still THROWS from the parser, unchanged -- structure-present-but-unparseable stays a loud error', () => {
+  const malformed = REAL_TICKETMASTER_CZ_BODY_TEXT.replace('Ticket Quantity: 2', 'Tickets: 2');
+
+  assert.throws(() => parseTicketmasterCzTicketText(malformed), /"Ticket Quantity:" marker not found/);
+});
+
+test('the parser STILL throws the marker error when called directly on the order confirmation -- the throw is a defensive invariant, now unreachable from the production path', () => {
+  assert.throws(
+    () => parseTicketmasterCzTicketText(REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT),
+    /"YOUR ORDER DETAILS" marker not found/
+  );
+});
+
+// THE FIDELITY PROPERTY -- the detector must return false for EXACTLY the
+// bodies the parser throws the marker error on. Proved by construction over
+// both real fixtures plus the boundary cases, so detector and parser cannot
+// drift apart in a future edit.
+
+test('FIDELITY PROPERTY: for every probe body, ticketmasterCzTextHasOrderDetails() === false IFF the parser throws the "YOUR ORDER DETAILS" marker error', () => {
+  const probes = [
+    REAL_TICKETMASTER_CZ_ORDER_CONFIRMATION_BODY_TEXT,
+    REAL_TICKETMASTER_CZ_BODY_TEXT,
+    REAL_TICKETMASTER_CZ_BODY_TEXT.replace('Ticket Quantity: 2', 'Tickets: 2'),
+    REAL_TICKETMASTER_CZ_BODY_TEXT.replace('YOUR ORDER DETAILS', 'YOUR\u00A0ORDER DETAILS'),
+    '',
+    'nothing resembling a ticket',
+    'YOUR ORDER DETAILS',
+  ];
+
+  probes.forEach(function (probe) {
+    let threwMarkerError = false;
+    try {
+      parseTicketmasterCzTicketText(probe);
+    } catch (error) {
+      threwMarkerError = /"YOUR ORDER DETAILS" marker not found/.test(error.message);
+    }
+
+    assert.equal(ticketmasterCzTextHasOrderDetails(probe), !threwMarkerError, 'fidelity broken for probe: ' + JSON.stringify(probe.slice(0, 60)));
+  });
+});
+
+test('ticketmasterCzTextHasOrderDetails: shares the parser NBSP normalization -- a marker split by non-breaking spaces is still detected', () => {
+  assert.equal(ticketmasterCzTextHasOrderDetails('YOUR\u00A0ORDER\u00A0DETAILS\n\u00A0\nX\n\u00A0\nTicket Quantity: 1'), true);
+});
+
+test('ticketmasterCzTextHasOrderDetails: never throws on empty/null/undefined/non-string input, always returns a literal boolean', () => {
+  [undefined, null, '', 0, 42, {}, []].forEach(function (input) {
+    const result = ticketmasterCzTextHasOrderDetails(input);
+    assert.equal(typeof result, 'boolean');
+  });
+
+  assert.equal(ticketmasterCzTextHasOrderDetails(undefined), false);
+  assert.equal(ticketmasterCzTextHasOrderDetails(null), false);
+  assert.equal(ticketmasterCzTextHasOrderDetails(''), false);
+});
+
+test('ticketmasterCzTextHasOrderDetails: the marker is matched case-SENSITIVELY and as a whole -- a lowercased or partial heading is not an order-details block', () => {
+  assert.equal(ticketmasterCzTextHasOrderDetails('your order details'), false);
+  assert.equal(ticketmasterCzTextHasOrderDetails('YOUR ORDER'), false);
+  assert.equal(ticketmasterCzTextHasOrderDetails('ORDER DETAILS'), false);
+  assert.equal(ticketmasterCzTextHasOrderDetails('preamble YOUR ORDER DETAILS trailing'), true);
+});
+
+// THE REGISTRY, and its deliberately FAIL-OPEN default. This gate diverges
+// from debug/teamio-non-invite-error's FAIL-CLOSED one on purpose: the owner
+// scoped this fix to Ticketmaster CZ only, and Kino Art / Entradio variants are
+// unverified. Fail-closed would have silently disabled both. The two tests
+// below pin that as a DECISION rather than leaving it an untested default.
+
+test('TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL: noreply@ticketmaster.cz is wired to the exported detector', () => {
+  assert.strictEqual(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL['noreply@ticketmaster.cz'], ticketmasterCzTextHasOrderDetails);
+});
+
+test('TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL: has NO entry for Kino Art or Entradio -- the fix is scoped to Ticketmaster CZ only, their variants are unverified', () => {
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL, 'rezervace@kinoart.cz'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL, 'no-reply@app.entradio.cz'), false);
+  assert.deepEqual(Object.keys(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL), ['noreply@ticketmaster.cz']);
+});
+
+test('FAIL-OPEN on a missing detector: a Kino Art message with an EMPTY body still yields exactly one "body"-mode job -- unchanged from before the fix', () => {
+  const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
+  const message = fakeMessage('rezervace@kinoart.cz', [], '');
+
+  const jobs = resolveTicketProcessingJobs([message], TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'body');
+  assert.equal(jobs[0].portal.identifyingEmail, 'rezervace@kinoart.cz');
+});
+
+test('FAIL-OPEN on a missing detector: an Entradio message with an EMPTY body still yields exactly one "body"-mode job -- unchanged from before the fix', () => {
+  const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
+  const message = fakeMessage('Kino Metropol <no-reply@app.entradio.cz>', [], '');
+
+  const jobs = resolveTicketProcessingJobs([message], TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'body');
+  assert.equal(jobs[0].portal.identifyingEmail, 'no-reply@app.entradio.cz');
+});
+
+test('FAIL-OPEN on a missing detector: appliesTo still claims Kino Art and Entradio threads with empty bodies', () => {
+  ['rezervace@kinoart.cz', 'no-reply@app.entradio.cz'].forEach(function (sender) {
+    const thread = {
+      getMessages: function () {
+        return [fakeMessage(sender, [], '')];
+      },
+    };
+
+    assert.equal(TICKETING_PORTALS_ACTION.appliesTo(thread), true, 'fail-open broken for ' + sender);
+  });
+});
+
+test('the gate never consults the body for a PDF/OCR-sourced portal: an enigoo.cz message with an empty body still yields its "pdf"-mode job', () => {
+  const portals = [{ identifyingEmail: 'no-reply@enigoo.cz', calendarId: 'CAL_A', insertPdfIntoEvent: true }];
+  const message = fakeMessage('no-reply@enigoo.cz', [fakeAttachment('tickets.pdf', 'application/pdf')], '');
+
+  const jobs = resolveTicketProcessingJobs([message], portals);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'pdf');
 });
 
 // --- parseEntradioTicketText (debug/entradio-portal-not-supported: the ------

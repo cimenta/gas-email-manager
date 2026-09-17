@@ -1,110 +1,47 @@
 /**
- * TICKETING_PORTALS_ACTION — v0.6.0 NEW ACTION (quick-260731-tix): detects
- * ticket-purchase confirmation emails (concerts, theater, cinema, events)
- * from configured ticketing portals and creates ONE calendar event per
- * email/purchase.
+ * TICKETING_PORTALS_ACTION — detects ticket-purchase confirmation emails
+ * (concerts, theater, cinema, events) from configured ticketing portals and
+ * creates ONE calendar event per email/purchase, never one per ticket
+ * page/seat within that purchase: a purchase with multiple ticket pages for
+ * the SAME event must yield exactly one event. A portal's text parser only
+ * ever reads the FIRST occurrence of its anchored fields, and every ticket
+ * page in a single-purchase PDF repeats the same event name/date/venue
+ * (only a trailing per-ticket number differs).
  *
- * FIRST-EVER Drive/PDF/OCR usage and FIRST-EVER Calendar event attachment
- * usage in this codebase. Unlike the ICS action (a structured .ics
- * attachment) and the booking.com action (a parseable plain-text email
- * body), a ticketing-portal confirmation email's BODY carries NO usable
- * event data at all — everything (event name, date/time, venue) is inside
- * an attached PDF ticket, which must be extracted via Google Drive's
- * PDF-to-Google-Docs OCR conversion, since Apps Script has no native PDF
- * text parser.
+ * Two processing modes, depending on the portal:
+ *   - PDF/OCR-sourced (e.g. enigoo.cz): the confirmation email's BODY
+ *     carries no usable event data — everything (event name, date/time,
+ *     venue) is inside an attached PDF ticket, extracted via Google
+ *     Drive's PDF-to-Google-Docs OCR conversion, since Apps Script has no
+ *     native PDF text parser.
+ *   - Body-sourced (e.g. Kino Art, Ticketmaster CZ): the event data is
+ *     parsed directly from the email's plain-text body.
  *
- * ONE-EVENT-PER-PURCHASE (confirmed explicitly with the owner, matches how
- * the booking.com action already treats a multi-guest reservation as one
- * event): a purchase with multiple ticket pages for the SAME event (e.g. a
- * 2-ticket purchase) must yield exactly ONE calendar event, never one per
- * page/ticket. A portal's text parser (e.g. parseEnigooTicketText) only
- * ever reads the FIRST occurrence of its anchored fields within ONE PDF's
- * extracted text, and every ticket page in a single-purchase PDF repeats
- * the same event name/date/venue (only a trailing per-ticket number
- * differs) — this alone is sufficient when a purchase's tickets are pages
- * of ONE PDF file.
- *
- * REAL DOUBLE-BOOKING INCIDENT (live-test-driven, quick-260731-tix round
- * 8, CORRECTED in round 9 — see the CORRECTION note below before trusting
- * anything about the attachment-count claim in an earlier version of this
- * comment): the owner reported a real live bug — processing the enigoo.cz
- * email ONE time created TWO calendar events for the same purchase, and
- * manually reprocessing the SAME email added a THIRD, since there was NO
- * idempotency protection at all (unlike the ICS action's `iCalUID`-based
- * `Events.import`, or the booking.com action's
- * `extendedProperties.private.confirmationNumber` tag +
- * `findOrTagMatchingEvent` safety-net check).
- *
- * ROUND 8's ORIGINAL (WRONG) DIAGNOSIS: round 8 claimed the real enigoo.cz
- * email attaches its 2-ticket purchase as TWO SEPARATE PDF FILES, and
- * "fixed" this by having `run` process only the FIRST qualifying PDF
- * attachment per message (`selectPrimaryTicketPdfAttachment`). That claim
- * was WRONG. Round 9 independently re-parsed the REAL raw `.eml`'s actual
- * MIME structure (not a guess) and confirmed exactly ONE `application/pdf`
- * MIME part — one PDF, 2 internal pages, not two file attachments.
- * `selectPrimaryTicketPdfAttachment` has been REMOVED: it never actually
- * addressed the real single-run duplicate for this email (which only ever
- * had one attachment, so selecting "the first of one" changed nothing),
- * and it would have been a genuine correctness regression for a
- * legitimate FUTURE scenario — a portal that emails multiple DIFFERENT
- * purchases as separate PDF attachments in one message would have had
- * every attachment after the first silently dropped, never processed.
- * `resolveTicketProcessingJobs` now processes EVERY qualifying PDF
- * attachment again (restored to its original, pre-round-8 behavior — see
- * its own JSDoc for the corrected reasoning).
- *
- * THE ACTUAL ROOT CAUSE OF THE ORIGINAL SINGLE-RUN DUPLICATE REMAINS
- * UNCONFIRMED at the exact mechanism level (this session has no live
- * access to the owner's actual Gmail thread/message structure to trace it
- * further) — plausible candidates include multiple qualifying MESSAGES
- * within the same Gmail thread (`run` iterates `thread.getMessages()`,
- * and a thread carrying more than one email from the same portal sender,
- * each independently resolving to a portal and each independently
- * carrying its own single PDF, would produce one processing job PER
- * MESSAGE) or a duplicate message delivery. `isTicketPdfAttachment`/
- * `findTicketPdfAttachments` were independently re-verified via direct
- * code inspection (`Array.prototype.filter`'s OR-based predicate cannot
- * ever duplicate a single source array element into two output entries —
- * proven with a standalone script, not assumed) to rule out a
- * duplicate-detection bug at that layer.
- *
- * WHAT ACTUALLY PREVENTS THE DUPLICATE, REGARDLESS OF THE EXACT
- * MECHANISM: the DEDUP SAFETY NET (kept from round 8, unaffected by the
- * round-9 correction above, mirroring the booking.com action's own proven
- * pattern): `parseEnigooTicketText` extracts a stable `ticketIdentifier`
- * (the first per-ticket number found, e.g. `"24601"`); the created event
- * is tagged at creation time via
+ * DEDUP SAFETY NET: a portal parser extracts a stable `ticketIdentifier`
+ * where one exists; the created event is tagged at creation time via
  * `extendedProperties.private.ticketIdentifier`
  * (`processTicketPdfAttachment`), and BEFORE creating a new event,
  * `findTicketEventByIdentifier` searches the resolved calendar for an
  * existing event already carrying that same tag — if found, the run is a
  * silent no-op (temp PDF deleted, no re-upload/re-attach, no second
- * event), logged the same "already exists, not a duplicate path" style as
- * the booking.com action's own `handleConfirmation`. This layer is correct
- * regardless of WHY a second processing attempt for the same purchase
- * occurs (multiple messages in a thread, a duplicate delivery, a manual
- * re-run, a future retry mechanism, or anything else) — it checks real
- * calendar state before every write, rather than trying to guess ahead of
- * time which message/attachment to trust as "the one true source." A
- * portal parser that cannot extract any stable identifier (documented
- * per-parser limitation, not a silent gap) simply does not get this
- * protection.
+ * event). This layer checks real calendar state before every write,
+ * rather than trying to guess ahead of time which message/attachment to
+ * trust as the source. A portal parser that cannot extract any stable
+ * identifier (documented per-parser limitation, not a silent gap) simply
+ * does not get this protection.
  *
- * ALL PORTAL-SPECIFIC PARSING LOGIC LIVES IN THIS ONE FILE (owner-directed,
- * explicitly overriding an initially-proposed one-file-per-portal design
- * that would have mirrored the booking.com action's language-pack
- * architecture): for enigoo.cz now, and any future portal later, every
- * parser is a clearly-separated, well-named function/section within THIS
- * file (e.g. parseEnigooTicketText) — never a separate `07-portal-*.js`
- * file, unless the owner says otherwise for a specific future portal. A
- * portal is matched to its parser via TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL
- * (below), keyed by the SAME identifyingEmail used to resolve which
- * TICKETING_PORTALS config entry (calendarId, insertPdfIntoEvent) applies.
+ * ALL PORTAL-SPECIFIC PARSING LOGIC LIVES IN THIS ONE FILE: every parser is
+ * a clearly-separated, well-named function/section within THIS file (e.g.
+ * parseEnigooTicketText), never a separate `07-portal-*.js` file. A portal
+ * is matched to its parser via TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL /
+ * TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL (below), keyed by the SAME
+ * identifyingEmail used to resolve which TICKETING_PORTALS config entry
+ * (calendarId, insertPdfIntoEvent) applies.
  *
  * THE DRIVE/OCR PIPELINE (processTicketPdfAttachment, GAS-only —
  * DriveApp/Drive Advanced Service/DocumentApp/CalendarApp/Calendar globals
  * — not directly unit-tested, same category as every other GAS-only
- * function in this codebase), exactly as confirmed with the owner:
+ * function in this codebase):
  *   1. Get the PDF attachment Blob from the Gmail message
  *      (`attachment.copyBlob()`).
  *   2. Create the PDF as a file in a project-owned, fixed-name,
@@ -116,15 +53,13 @@
  *   3. Convert it to a Google Doc via the Drive ADVANCED Service
  *      (`Drive.Files.copy` with the target `mimeType` set to Google Docs)
  *      — this triggers Google's OCR/text-extraction pipeline. It works
- *      uniformly whether the source PDF has a real text layer (like
- *      enigoo.cz's) or is a scanned image, which is exactly why this is
- *      the right general-purpose mechanism here rather than, say, a
- *      text-layer-only shortcut.
+ *      uniformly whether the source PDF has a real text layer or is a
+ *      scanned image.
  *   4. Read the converted Doc's full text
  *      (`DocumentApp.openById(id).getBody().getText()`).
- *   5. Delete the converted Doc (a temp OCR artifact) — ALWAYS, regardless
- *      of anything else (wrapped in try/finally around the read, so a
- *      read failure still cleans up before its error propagates).
+ *   5. Delete the converted Doc (a temp OCR artifact) — ALWAYS, wrapped in
+ *      try/finally around the read, so a read failure still cleans up
+ *      before its error propagates.
  *   6. If the matched portal's `insertPdfIntoEvent` is true: MOVE (not
  *      copy — avoids a duplicate lingering in the temp folder) the
  *      ORIGINAL uploaded PDF file from the temp folder into the
@@ -138,87 +73,56 @@
  *      `{ eventName, location, year, month, day, hour, minute }`.
  *   8. Build and insert a Calendar event resource (`summary`, `location`,
  *      `start`/`end`) into the portal's configured `calendarId`. When a
- *      portal's parsed ticket has no explicit end time (enigoo.cz never
- *      does), a sensible fixed DEFAULT_EVENT_DURATION_MINUTES (2 hours) is
- *      added to the start via addMinutesToWallClockComponents — documented
- *      as a per-portal-parser concern: a FUTURE portal whose PDF DOES
- *      include an end time should use it directly instead of this
- *      default, rather than this shared default becoming implicitly
- *      mandatory for every portal. If `insertPdfIntoEvent` was true, the
- *      Drive file is included as a real Calendar attachment: the resource's
- *      `attachments` array (`[{ fileId, fileUrl, title, mimeType }]` — see
- *      the live-test-driven correction to this exact shape below), AND
+ *      portal's parsed ticket has no explicit end time, a fixed
+ *      DEFAULT_EVENT_DURATION_MINUTES (2 hours) is added to the start via
+ *      addMinutesToWallClockComponents — a per-portal-parser default to
+ *      reach for, not a rule every future portal is forced through. If
+ *      `insertPdfIntoEvent` was true, the Drive file is included as a real
+ *      Calendar attachment: the resource's `attachments` array
+ *      (`[{ fileId, fileUrl, title, mimeType }]`), AND
  *      `Calendar.Events.insert` is called with `{ supportsAttachments: true }`
- *      as its `optionalArgs` — this is a REAL, DOCUMENTED Calendar API v3
- *      requirement (the `events.insert` method's `supportsAttachments`
- *      query parameter, default `false`) for attachments to be accepted at
- *      all; omitting it would silently drop the `attachments` array rather
- *      than erroring, so it is never optional here when an attachment is
- *      present. CALENDAR API EVENTATTACHMENT SHAPE (live-test-driven fix,
- *      quick-260731-tix round 7): the original design under-specified this
- *      resource's shape as just `{ fileId, title }` — the owner hit a real
- *      live `GoogleJsonResponseException: ... Missing attachment URL.`
- *      `fileUrl` is a REQUIRED field on every `attachments[]` entry per the
- *      Calendar API v3's documented `EventAttachment` schema; `fileId` is
- *      actually READ-ONLY on that schema (the server derives/confirms it
- *      FROM `fileUrl` when the URL points to a Drive resource the caller
- *      can access) — providing `fileId` alone, without `fileUrl`, is not
- *      sufficient even though it names a real Drive file. Fixed by adding
- *      `fileUrl` (via `DriveApp`'s simple-service `File.getUrl()`, already
- *      in use elsewhere in this file for Drive operations) and `mimeType`
- *      (`'application/pdf'` — a real, optional EventAttachment field,
- *      included as a defensive completeness improvement since this action
- *      always attaches a PDF, not because it is itself required).
+ *      as its `optionalArgs`.
  *
- * TIMEZONE: enigoo.cz tickets carry no timezone indicator, same documented
- * limitation as the booking.com action — the parsed wall-clock digits are
- * treated as LOCAL time at the venue, resolved live via
+ * CALENDAR API V3 EVENTATTACHMENT FACTS: `fileUrl` is a REQUIRED field on
+ * every `attachments[]` entry per the documented `EventAttachment` schema;
+ * `fileId` is actually READ-ONLY on that schema (the server derives it
+ * FROM `fileUrl`) — providing `fileId` alone, without `fileUrl`, is not
+ * sufficient even though it names a real Drive file (`fileUrl` comes from
+ * `DriveApp`'s simple-service `File.getUrl()`). The `events.insert`
+ * method's `supportsAttachments` query parameter defaults to `false` and
+ * silently drops the `attachments` array rather than erroring when
+ * omitted, so it is never optional here when an attachment is present.
+ *
+ * TIMEZONE: a portal's parsed wall-clock digits are treated as LOCAL time
+ * at the venue, resolved live via
  * `CalendarApp.getCalendarById(calendarId).getTimeZone()` (the portal's own
  * configured calendar's timezone), never a hardcoded assumption. Formatted
  * via formatWallClockComponentsIso (deliberately no trailing `Z`/offset,
- * paired with an explicit Calendar API `timeZone` field) — the same
- * "resolve wall-clock digits, pair with a live-derived timeZone field"
- * pattern already proven by the booking.com action's formatLocalWallClockIso,
- * re-implemented locally here per this codebase's established
- * one-file-per-action self-containment convention (no cross-file require
- * for a helper this small).
+ * paired with an explicit Calendar API `timeZone` field).
  *
- * OAUTH SCOPE (see src/appsscript.json): uses the BROADER
- * `https://www.googleapis.com/auth/drive` scope rather than the narrower
- * `drive.file`, because `CONFIG.ticketAttachmentDriveFolderName` is a
- * NAME-based lookup (`DriveApp.getFoldersByName`) deliberately designed to
- * potentially match a folder the OWNER pre-created by hand — not
- * necessarily one this script itself created. `drive.file`'s documented
- * restriction (visibility limited to files/folders the app itself created
- * or the user explicitly opened) does not reliably cover that case, so the
- * broader scope was chosen deliberately, not by default. Flagged
- * explicitly for the owner in this feature's live-verification checkpoint.
+ * OAUTH SCOPES (see src/appsscript.json):
+ *   - `https://www.googleapis.com/auth/drive` (the BROADER scope, not the
+ *     narrower `drive.file`): `CONFIG.ticketAttachmentDriveFolderName` is
+ *     a NAME-based lookup (`DriveApp.getFoldersByName`) deliberately
+ *     designed to potentially match a folder the OWNER pre-created by
+ *     hand, not necessarily one this script itself created —
+ *     `drive.file`'s visibility restriction does not reliably cover that
+ *     case.
+ *   - `https://www.googleapis.com/auth/script.external_request`, required
+ *     by `UrlFetchApp` for the Entradio attachment pipeline (see this
+ *     file's "ENTRADIO ATTACHMENT PIPELINE" section). A project that calls
+ *     UrlFetchApp without it fails at RUNTIME inside the trigger rather
+ *     than at push time — which is why a test pins the manifest.
  *
- * SECOND OAUTH SCOPE, added by round 2 of debug/entradio-portal-not-supported:
- * `https://www.googleapis.com/auth/script.external_request`, required by
- * UrlFetchApp — the FIRST outbound HTTP call anywhere in this project. It
- * exists solely for the Entradio attachment pipeline (see this file's
- * "ENTRADIO ATTACHMENT PIPELINE" section). Adding a scope forces a
- * RE-AUTHORIZATION prompt on the next deployment, and a project that calls
- * UrlFetchApp without it fails at RUNTIME inside the trigger rather than at
- * push time — which is why a test pins the manifest.
- *
- * GLOBALLY-UNIQUE NAMING WARNING (see the booking.com action's own
- * class-level JSDoc for the full incident this warning originates from):
- * Apps Script concatenates every project file into ONE shared global
- * scope — `ticketingExtractEmailAddress` (not a bare `extractEmailAddress`)
- * is this file's own locally-reimplemented sender-parsing helper, per the
- * one-file-per-action self-containment pattern, deliberately namespaced to
- * avoid colliding with the ICS and booking.com actions' own same-purpose
- * helpers.
+ * GLOBALLY-UNIQUE NAMING: Apps Script concatenates every project file into
+ * ONE shared global scope — every helper in this file is locally
+ * reimplemented and namespaced to this action (e.g.
+ * `ticketingExtractEmailAddress`, not a bare `extractEmailAddress`) to
+ * avoid colliding with same-purpose helpers in other action files.
  */
 
 /**
- * ticketingExtractEmailAddress — LOCAL copy of the same underlying logic
- * already re-implemented independently in the ICS and booking.com action
- * files (see the booking.com action's own JSDoc for the real cross-file
- * naming-collision incident that established the "globally-unique name per
- * action" convention this follows). Extracts the bare, trimmed, lowercased
+ * ticketingExtractEmailAddress — extracts the bare, trimmed, lowercased
  * email address from a Gmail "From" header value, or from a bare address
  * with no display name. Pure, no GAS globals. Never throws: a
  * null/undefined/empty input returns ''.
@@ -236,11 +140,9 @@ function ticketingExtractEmailAddress(fromHeader) {
 
 /**
  * resolveTicketingPortal — finds the TICKETING_PORTALS config entry whose
- * `identifyingEmail` case-insensitively matches `fromHeader`'s sender,
- * mirroring resolveIcsCalendarId's per-sender lookup convention
- * (src/05-action-ics-import.js): list order, FIRST match wins; no match
- * (or a null/empty `portals` list) returns `null`, never throws. Pure, no
- * GAS globals.
+ * `identifyingEmail` case-insensitively matches `fromHeader`'s sender.
+ * List order, FIRST match wins; no match (or a null/empty `portals` list)
+ * returns `null`, never throws. Pure, no GAS globals.
  */
 function resolveTicketingPortal(fromHeader, portals) {
   const list = portals || [];
@@ -258,23 +160,8 @@ function resolveTicketingPortal(fromHeader, portals) {
 /**
  * resolveTicketingCalendarId — resolves which calendar ID this action's
  * Calendar API calls should target for a given `portal` (a resolved
- * TICKETING_PORTALS entry). MULTI-CALENDAR ROUTING (live-test-driven fix,
- * quick-260731-tix round 6): a REAL missing-fallback bug — the shipped
- * enigoo.cz portal entry's default `calendarId` is `null` (the safe,
- * unconfigured default, same as the other two actions' optional
- * overrides), but this action originally read `portal.calendarId`
- * DIRECTLY everywhere, with no null-safety at all. Owner hit
- * `TypeError: Cannot read properties of null (reading 'getTimeZone')`
- * live, since `CalendarApp.getCalendarById(null)` returns `null`. Both the
- * ICS action (`resolveIcsCalendarId`) and the booking.com action
- * (`resolveBookingCalendarId`) already fall back to `CONFIG.calendarId`
- * (the global default) when their own action/portal-level override is
- * null — this action was simply missing that same established fallback
- * pattern. Simple two-tier resolution, mirroring
- * `resolveBookingCalendarId`'s exact shape (no per-sender map complexity
- * needed here, since `portal` is already the single resolved entry):
- * `portal.calendarId` when truthy, else `defaultCalendarId`. Pure, no GAS
- * globals.
+ * TICKETING_PORTALS entry): `portal.calendarId` when truthy, else
+ * `defaultCalendarId`. Pure, no GAS globals.
  */
 function resolveTicketingCalendarId(portal, defaultCalendarId) {
   return (portal && portal.calendarId) || defaultCalendarId;
@@ -285,131 +172,65 @@ function resolveTicketingCalendarId(portal, defaultCalendarId) {
  * this file's class-level JSDoc for why every portal's parser lives here,
  * not in its own file).
  *
- * PATTERN-ANCHORED EXTRACTION, NOT LINE-POSITION (live-test-driven,
- * quick-260731-tix round 5 — the ACTUAL root-cause rewrite): a fixed-line-
- * position model (event name = line 1, date/time = line 2, location =
- * line 3) was this parser's ORIGINAL design and survived two earlier
- * live-test-driven fixes (a missing OAuth scope, then a paragraph-
- * separator splitting bug — see below) before the owner's THIRD live
- * failure, now armed with the round-3 full-extracted-text diagnostic,
- * finally supplied the real ground truth and disproved the model
- * entirely. Example modeled on the raw text `DocumentApp.getBody().getText()`
- * actually returned during that live failure (identifying details replaced
- * with fictional equivalents, 2 pages of the same purchase):
- *
- *   Letní hudební festival 15.08.2026 19:00
- *   Nádvoří kulturního domu Cena/price: 290 Kč Sleva/discount:
- *   24601
- *   Kulturní spolek z. s., ... DUZP 2.8.2026 Vstupenka je osvobozena...
- *   Letní hudební festival 15.08.2026 19:00
- *   Nádvoří kulturního domu Cena/price: 290 Kč Sleva/discount:
- *   24600
- *   Kulturní spolek z. s., ... DUZP 2.8.2026 Vstupenka je osvobozena...
- *
- * The event name and the date/time are packed onto the SAME real
- * paragraph ("Letní hudební festival 15.08.2026 19:00"); the location/price/
- * discount are packed onto a DIFFERENT single real paragraph. What LOOKS
- * like "each field on its own line" in the Google Docs editor's visual
- * rendering (text wrapping around the ticket's inline QR code image) does
+ * PATTERN-ANCHORED EXTRACTION, NOT LINE-POSITION: what looks like "each
+ * field on its own line" in the Google Docs editor's visual rendering does
  * NOT correspond to actual paragraph boundaries in what `Body.getText()`
- * returns — there is no reliable line position to key off of at all.
- * "Line-position-based parsing cannot work here" (confirmed live);
- * extraction is now ANCHORED to two literal patterns that are present
+ * returns, so extraction is anchored to literal patterns present
  * regardless of which paragraph/line they happen to share with other
  * fields:
  *
  *   1. DATE/TIME ANCHOR: the first `DD.MM.YYYY HH:MM`-shaped numeric
- *      match anywhere in the whole text. A multi-page purchase (like the
- *      example above) repeats this pattern once per page for the SAME
- *      event — only the FIRST occurrence is ever used, consistent with
- *      this action's established one-calendar-event-per-purchase design
- *      (see this file's class-level JSDoc).
- *   2. EVENT NAME: everything from the ABSOLUTE START of the text up to
- *      (not including) that first date/time match — the real text always
- *      begins with the event name immediately followed by the date/time,
- *      with nothing else before it. Anchored at `^` (no multiline flag),
- *      so this can only ever match the text's very first occurrence.
- *   3. LOCATION: everything strictly AFTER the date/time match's end, up
- *      to (not including) the literal label `Cena/price` — the price
- *      label always immediately follows the location on real tickets.
- *      Searched starting from the date/time match's OWN end index (not
- *      the whole text blindly), so a non-greedy capture naturally stops
- *      at the FIRST "Cena/price" reachable from there — which is always
- *      THIS ticket occurrence's own price line, never a later
- *      repetition's, even across a multi-page purchase.
- *   4. TICKET IDENTIFIER (added live-test-driven, quick-260731-tix round 8
- *      — see this file's class-level JSDoc "DEDUP" section for the full
- *      double-booking incident this resolves): the first run of digits
- *      found strictly AFTER the literal label `Sleva/discount:` (which
- *      always immediately follows the price on real tickets, right
- *      before the per-ticket number). This is the SAME per-page ticket
- *      number (e.g. `"24601"`) that differs between otherwise-identical
- *      repeated pages of a multi-ticket purchase — using the FIRST
- *      occurrence gives a real, stable, already-available identifier for
- *      the whole purchase without inventing a new field. Unlike the other
- *      three anchors, this one is OPTIONAL: if `Sleva/discount:` is not
- *      found, or no digit run follows it, `ticketIdentifier` is `null`
- *      rather than throwing — a missing dedup key should never block
- *      calendar-event creation, it only means the safety-net dedup check
- *      (see `findTicketEventByIdentifier`) cannot run for this ticket.
+ *      match anywhere in the whole text. A multi-page purchase repeats
+ *      this pattern once per page for the SAME event — only the FIRST
+ *      occurrence is ever used, per this action's one-event-per-purchase
+ *      design.
+ *   2. EVENT NAME: everything from the ABSOLUTE START of the text (`^`,
+ *      no multiline flag) up to (not including) that first date/time
+ *      match — the real text always begins with the event name
+ *      immediately followed by the date/time.
+ *   3. LOCATION: everything strictly AFTER the date/time match's own end
+ *      index, up to (not including) the literal label `Cena/price`.
+ *      Searching from that specific end index (not the whole text
+ *      blindly) keeps this scoped to THIS ticket occurrence's own price
+ *      line, even across a multi-page purchase where the same labels
+ *      repeat later.
+ *   4. TICKET IDENTIFIER (OPTIONAL — never throws): the first run of
+ *      digits found strictly AFTER the literal label `Sleva/discount:`,
+ *      searched within the same already-scoped substring used for the
+ *      location above. `null` when the label or a following digit run is
+ *      not found — a missing dedup key must never block calendar-event
+ *      creation, it only means the safety-net dedup check cannot run for
+ *      this ticket.
  *
- * None of the four anchors above ever splits the text into a line array —
- * `\s`/`[\s\S]` in each pattern already transparently absorbs whichever
- * paragraph-separator character(s) Google's OCR pipeline actually used
- * (this parser genuinely does not need to know or care), so this rewrite
- * is immune to the exact question the round-4 fix below was trying to
- * answer.
+ * `\s`/`[\s\S]` are used throughout (never a line-array split) because
+ * Apps Script's Document Service may join paragraphs with `\r`, not `\n`
+ * — these character classes absorb `\r`, `\n`, and `\r\n` identically.
  *
  * Returns `{ eventName, location, year, month, day, hour, minute,
  * ticketIdentifier }` (month zero-indexed, matching Date.UTC's convention
  * and every other date-parsing function in this codebase; `ticketIdentifier`
  * is a string or `null`). Throws a controlled Error if no date/time pattern
  * is found anywhere, if the event name or the "Cena/price"-bounded location
- * cannot be extracted, or if the matched hour/minute are out of range — a
- * malformed/unexpected ticket layout should fail visibly, not silently
- * produce a wrong event. `ticketIdentifier` alone never causes a throw (see
- * point 4 above). Pure, no GAS globals.
+ * cannot be extracted, or if the matched hour/minute are out of range.
+ * `ticketIdentifier` alone never causes a throw. Pure, no GAS globals.
  *
- * DIAGNOSTIC-ON-FAILURE (live-test-driven, quick-260731-tix round 3): every
- * throw below appends the COMPLETE raw `text` argument (the whole
- * DocumentApp-extracted OCR body text, untruncated) after the specific
- * problem description — never just the one line/segment that looked wrong
- * in isolation. This project's existing failure-notification path
- * (notifyOwnerOfFailure/composeFailureBody, src/02-main.js) already emails
- * the owner the full thrown error message on any action failure, so this
- * makes the NEXT failure notification email itself the diagnostic
- * artifact, with no extra manual step (e.g. a manual Drive "Open with
- * Google Docs" conversion) required from the owner — it was THIS exact
- * mechanism that supplied the real raw text motivating the round-5
- * rewrite above. This diagnostic is intentionally generic to ANY future
- * ticketing-portal parsing failure, not specific to any one incident.
- *
- * ROUND 4 HISTORY (superseded by round 5 above, but the underlying
- * insight remains true and is worth preserving): the owner's SECOND live
- * failure was initially attributed to a paragraph-separator splitting bug
- * — Apps Script's Document Service is long-documented to join paragraphs
- * with a CARRIAGE RETURN (`\r`), not a line feed (`\n`), and this file's
- * then-current `.split('\n')` call did not account for that. That fix
- * (matching `\r\n`, a bare `\r`, or a bare `\n`) was a REAL, VALID
- * discovery about Apps Script's actual behavior — it is NOT wrong, it was
- * simply INSUFFICIENT, since it was still built on the now-disproven
- * fixed-line-position extraction model underneath. The round-4 line-array
- * splitting code itself has been entirely removed by the round-5 rewrite
- * above (there is no line array left to split at all), but the knowledge
- * that Google's OCR pipeline may join fields with `\r` rather than `\n`
- * is exactly why every anchor above uses `\s`/`[\s\S]` (which absorb
- * `\r`, `\n`, and `\r\n` identically) rather than assuming one specific
- * separator character.
+ * DIAGNOSTIC-ON-FAILURE: every throw below appends the COMPLETE raw `text`
+ * argument (the whole DocumentApp-extracted OCR body text, untruncated)
+ * after the specific problem description. This project's existing
+ * failure-notification path (notifyOwnerOfFailure/composeFailureBody,
+ * src/02-main.js) already emails the owner the full thrown error message
+ * on any action failure, so this makes the failure notification itself
+ * the diagnostic artifact, with no extra manual step required from the
+ * owner. This diagnostic is generic to ANY future ticketing-portal parsing
+ * failure, not specific to any one incident.
  */
 function parseEnigooTicketText(text) {
   const rawText = String(text || '');
 
-  // Anchor 1: the date/time pattern, searched across the WHOLE text,
-  // FIRST occurrence only (regex .exec with no 'g' flag always returns
-  // the first match) -- a multi-page/multi-ticket PDF repeats this
-  // pattern once per page for the SAME purchase, and only the first
-  // occurrence is ever used, per this action's one-event-per-purchase
-  // design.
+  // Anchor 1: the date/time pattern, first occurrence across the whole
+  // text -- a multi-page purchase repeats it once per page for the same
+  // event, and only the first occurrence is ever used (one event per
+  // purchase).
   const dateTimeMatch = /(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})/.exec(rawText);
   if (!dateTimeMatch) {
     throw new Error('Unrecognized enigoo.cz ticket text: no date/time pattern found. Full extracted text:\n' + rawText);
@@ -429,12 +250,9 @@ function parseEnigooTicketText(text) {
   }
 
   // Anchor 2: the event name -- everything from the ABSOLUTE START of the
-  // text (`^`, no multiline flag, so this only ever matches starting at
-  // the very first character) up to (not including) the date/time
-  // pattern. `[\s\S]+?` (not a bare `.+?`) so the non-greedy capture can
-  // still traverse a real paragraph-separator character if one somehow
-  // ends up between the event name and the date/time, without depending
-  // on which separator convention Google's OCR pipeline used.
+  // text up to the date/time pattern. `[\s\S]+?` (not `.+?`) lets the
+  // non-greedy capture traverse a paragraph-separator character between
+  // the two fields, regardless of which separator Google's OCR used.
   const eventNameMatch = /^\s*([\s\S]+?)\s+\d{1,2}\.\d{1,2}\.\d{4}\s+\d{1,2}:\d{2}/.exec(rawText);
   if (!eventNameMatch) {
     throw new Error(
@@ -443,12 +261,10 @@ function parseEnigooTicketText(text) {
   }
   const eventName = eventNameMatch[1].trim();
 
-  // Anchor 3: the location -- everything strictly AFTER the date/time
-  // match's own end index, up to (not including) the literal "Cena/price"
-  // label. Slicing from that specific end index (not searching the whole
-  // text blindly) is what keeps the non-greedy capture scoped to THIS
-  // ticket occurrence's own location/price line, even when the same
-  // labels repeat later in the text for a multi-page purchase.
+  // Anchor 3: the location -- everything strictly after the date/time
+  // match's own end index, up to the literal "Cena/price" label. Slicing
+  // from that end index (not the whole text) keeps this scoped to THIS
+  // ticket occurrence, even when the same labels repeat later.
   const afterDateTime = rawText.slice(dateTimeMatch.index + dateTimeMatch[0].length);
   const locationMatch = /([\s\S]+?)\s*Cena\/price/.exec(afterDateTime);
   if (!locationMatch) {
@@ -459,14 +275,11 @@ function parseEnigooTicketText(text) {
   }
   const location = locationMatch[1].trim();
 
-  // Anchor 4 (OPTIONAL -- never throws, see this function's own class-level
-  // doc above): the ticket identifier -- the first run of digits found
-  // strictly AFTER the literal label "Sleva/discount:", searched within
-  // the SAME already-scoped `afterDateTime` substring used for the
-  // location above (so this, too, stays confined to THIS ticket
-  // occurrence, never a later repetition's). `null` when the label or a
-  // following digit run is not found, rather than throwing -- a missing
-  // dedup key must never block calendar-event creation.
+  // Anchor 4 (OPTIONAL -- never throws): the ticket identifier -- first
+  // digit run after the literal label "Sleva/discount:", searched within
+  // the same scoped `afterDateTime` substring as the location above.
+  // `null` when not found; a missing dedup key never blocks event
+  // creation.
   const ticketIdentifierMatch = /Sleva\/discount:[\s\S]*?(\d+)/.exec(afterDateTime);
   const ticketIdentifier = ticketIdentifierMatch ? ticketIdentifierMatch[1] : null;
 
@@ -483,58 +296,35 @@ function parseEnigooTicketText(text) {
 }
 
 // KINO_ART_KNOWN_VENUE — the ONLY Kino Art venue/hall string observed in
-// real data so far (a literal anchor, mirroring enigoo.cz's "Cena/price"
-// label anchor above). SCOPE LIMITATION (deliberate, matches this
-// project's established "don't guess at an unobserved variant" discipline
-// — e.g. Kino Art's PDF-attachment filename matching below is scoped the
-// same way): if Kino Art ever uses a different hall in a future
-// confirmation email, this needs generalizing THEN, with real data, not
-// guessed now.
+// real data so far. Scope limitation: if Kino Art ever uses a different
+// hall, this needs generalizing THEN, with real data, not guessed now.
 const KINO_ART_KNOWN_VENUE = 'Cihlářská - Malý sál';
 
 /**
- * parseKinoArtTicketText — the kinoart.cz-specific ticket-TEXT parser
- * (quick-260731-kar). UNLIKE parseEnigooTicketText above, this parses the
- * email BODY (`message.getPlainBody()`), never a PDF — see this file's
- * class-level JSDoc for the full BODY-SOURCED PROCESSING MODE this
- * introduces alongside the existing PDF/OCR-sourced mode. Example fixture
- * (HTML stripped to plain text, modeled on the real observed shape, a
- * single flattened line with a 2-seat/1-purchase repeating row):
- *
- *   Potvrzení objednávky Potvrzení objednávky č. 900142 Informace
- *   Zákazník: Jan Novák Úhrada: Comgate Doručení: Elektronicky
- *   Prodejní místa Kino Art Položky Název Místo Datum a čas Umístění Cena
- *   Tajný ostrov Cihlářská - Malý sál 7. 8. 2026 17:45 pátek 4 / 2
- *   150 Kč (1x Plná cena) Tajný ostrov Cihlářská - Malý sál
- *   7. 8. 2026 17:45 pátek 4 / 1 150 Kč (1x Plná cena) Cena celkem 300 Kč
- *   Tento email není vstupenka.
+ * parseKinoArtTicketText — the kinoart.cz-specific ticket-TEXT parser.
+ * UNLIKE parseEnigooTicketText above, this parses the email BODY
+ * (`message.getPlainBody()`), never a PDF.
  *
  * Extraction anchors (pattern-anchored, same philosophy as
  * parseEnigooTicketText — never a line-position/line-array approach):
  *   1. DATE/TIME: `D. M. YYYY HH:MM` — day/month WITHOUT leading zeros,
- *      dot-SPACE separated (e.g. `7. 8. 2026 17:45`) — a GENUINELY
- *      DIFFERENT numeric date format from enigoo.cz's zero-padded
- *      no-space `15.08.2026`, hence its own distinct regex rather than
- *      reusing enigoo's pattern. First occurrence only (the row repeats
- *      once per seat in a multi-seat purchase).
- *   2. VENUE: the literal `KINO_ART_KNOWN_VENUE` string (see its own doc
- *      above) — always immediately precedes the date/time in the
- *      flattened body text.
+ *      dot-SPACE separated (e.g. `7. 8. 2026 17:45`) — a different numeric
+ *      date format from enigoo.cz's zero-padded no-space `15.08.2026`,
+ *      hence its own distinct regex. First occurrence only (the row
+ *      repeats once per seat in a multi-seat purchase).
+ *   2. VENUE: the literal `KINO_ART_KNOWN_VENUE` string — always
+ *      immediately precedes the date/time in the flattened body text.
  *   3. EVENT (movie) NAME: everything between the LAST occurrence of the
  *      literal column-header word `Cena` (capital C — this
  *      case-SENSITIVE match is what distinguishes it from the lowercase
  *      "cena" inside "Plná cena" appearing later in the same text) that
- *      occurs BEFORE the venue, and the venue string itself. The real
- *      body's table header row ("Položky Název Místo Datum a čas
- *      Umístění Cena") ends with this exact word immediately before the
- *      first data row begins.
- *   4. TICKET IDENTIFIER (OPTIONAL — never throws, same philosophy as
- *      parseEnigooTicketText's own ticketIdentifier anchor): the ORDER
- *      CONFIRMATION NUMBER, `Potvrzení objednávky č. <digits>`, found
- *      near the top of the body. Unlike enigoo.cz's per-TICKET number,
- *      this is naturally scoped to the WHOLE PURCHASE already (shared
- *      across every seat in a multi-seat purchase) — a BETTER dedup key,
- *      not merely an equivalent one.
+ *      occurs BEFORE the venue, and the venue string itself.
+ *   4. TICKET IDENTIFIER (OPTIONAL — never throws): the ORDER
+ *      CONFIRMATION NUMBER, `Potvrzení objednávky č. <digits>`, found near
+ *      the top of the body. Unlike enigoo.cz's per-TICKET number, this is
+ *      naturally scoped to the WHOLE PURCHASE already (shared across
+ *      every seat in a multi-seat purchase) — a BETTER dedup key, not
+ *      merely an equivalent one.
  *
  * Returns the same `{ eventName, location, year, month, day, hour,
  * minute, ticketIdentifier }` shape as parseEnigooTicketText (month
@@ -576,21 +366,11 @@ function parseKinoArtTicketText(text) {
         rawText
     );
   }
-  // BULLET-MARKER STRIP (live-test-driven, quick-260731-kar round 3): Gmail's
-  // REAL message.getPlainBody() rendering of this email's HTML data rows
-  // prefixes each row (the event name is the row's first field) with a
-  // literal "* " bullet-list marker -- observed live (the owner's first
-  // created event came out as "* Tajný ostrov"), NOT reproduced by the
-  // hand-decoded fixture text this parser was originally built/tested
-  // against (a naive HTML-tag-strip approximation, not Gmail's actual
-  // list-rendering conversion) -- same category of surprise as the
-  // enigoo.cz Body.getText() paragraph-separator lesson (round 4-5, see
-  // parseEnigooTicketText's own class-level doc). SCOPE LIMITATION
-  // (deliberate, same "don't guess at an unobserved variant" discipline as
-  // KINO_ART_KNOWN_VENUE and findKinoArtTicketPdfAttachment above): only
-  // the literal "* " marker actually observed is stripped -- a different
-  // bullet character (e.g. "-", "•") would need handling THEN, with real
-  // data, not speculatively now.
+  // BULLET-MARKER STRIP: Gmail's real message.getPlainBody() rendering of
+  // this email's HTML data rows prefixes each row (the event name is the
+  // row's first field) with a literal "* " bullet-list marker. Only that
+  // literal marker is stripped -- a different bullet character would need
+  // handling then, with real data, not guessed now.
   const eventName = rawText
     .slice(cenaIndex + 'Cena'.length, knownVenueIndex)
     .trim()
@@ -599,24 +379,15 @@ function parseKinoArtTicketText(text) {
     throw new Error('Unrecognized Kino Art ticket text: extracted event name was empty. Full extracted text:\n' + rawText);
   }
 
-  // OPTIONAL (never throws, see this function's own class-level doc
-  // above): the order confirmation number, this portal's dedup
-  // ticketIdentifier.
+  // OPTIONAL (never throws): the order confirmation number, this portal's
+  // dedup ticketIdentifier.
   //
-  // ROW-BOUNDARY MARKER TOLERANCE (live-test-driven, quick-260731-kar
-  // round 4): a real live insertPdfIntoEvent attachment rename came out as
-  // "... - null.pdf" -- the ticketIdentifier failed to extract. Traced
-  // precisely (not a threading/scoping bug -- both call sites already pass
-  // parsedTicket.ticketIdentifier directly): the real raw .eml's HTML
-  // (D:\download\KinoArtBrno.eml) puts the "Potvrzení objednávky" headline
-  // and the "č. 900142" order number in TWO SEPARATE <tr> table rows -- the
-  // exact same row-boundary structure round 3 already proved Gmail's real
-  // getPlainBody() renders with an inserted "* " marker (see the eventName
-  // bullet-marker strip above). The original regex required "Potvrzení
-  // objednávky č." to be one contiguous, whitespace-only-separated phrase,
-  // which such a marker would break. `[\s*]*` (whitespace AND/OR a literal
-  // asterisk, any number of times) tolerates the SAME real, already-proven
-  // noise class round 3 established -- not a new, unverified guess.
+  // ROW-BOUNDARY MARKER TOLERANCE: the "Potvrzení objednávky" headline and
+  // the "č. <digits>" order number sit in TWO SEPARATE table rows, so
+  // Gmail's real plain-text rendering can insert the same "* " marker
+  // between them that the eventName bullet-marker strip above handles.
+  // `[\s*]*` (whitespace and/or a literal asterisk) tolerates that noise
+  // between "objednávky" and "č.".
   const ticketIdentifierMatch = /Potvrzení objednávky[\s*]*č\.\s*(\d+)/.exec(rawText);
   const ticketIdentifier = ticketIdentifierMatch ? ticketIdentifierMatch[1] : null;
 
@@ -632,20 +403,11 @@ function parseKinoArtTicketText(text) {
   };
 }
 
-// TICKETMASTER_CZ_MONTH_NAMES (quick-260816-ocw, D-04/D-07): a local
-// month-name-to-number lookup table, keyed by lowercased full English month
-// name, mapping to the ZERO-INDEXED month number (matching every other
-// date-components object in this file). Ticketmaster CZ confirmation
-// emails render the date with the full English month NAME (e.g.
-// "Sunday 15 November 2026 at 20:00") rather than a numeric month like
-// enigoo.cz's `DD.MM.YYYY` or Kino Art's `D. M. YYYY` — a grep across this
-// codebase confirmed no month-name-to-number helper exists anywhere else,
-// so this portal is the first to need one. Namespaced to this portal
-// (never a bare `MONTH_NAMES`) per this file's globally-unique-naming
-// convention (see the class-level "GLOBALLY-UNIQUE NAMING WARNING" doc) —
-// Apps Script's shared global scope has already been bitten by a real
-// cross-file collision once (see the booking.com action's own JSDoc for
-// that incident).
+// TICKETMASTER_CZ_MONTH_NAMES: a local month-name-to-number lookup table,
+// keyed by lowercased full English month name, mapping to the
+// ZERO-INDEXED month number (matching every other date-components object
+// in this file) -- Ticketmaster CZ confirmation emails render the date
+// with a full English month NAME rather than a numeric month.
 const TICKETMASTER_CZ_MONTH_NAMES = {
   january: 0,
   february: 1,
@@ -661,53 +423,62 @@ const TICKETMASTER_CZ_MONTH_NAMES = {
   december: 11,
 };
 
+// TICKETMASTER_CZ_ORDER_DETAILS_MARKER — the literal heading opening the
+// order-details region. Shared by parseTicketmasterCzTicketText and
+// ticketmasterCzTextHasOrderDetails so the parser and the admission detector
+// can never drift onto different strings.
+const TICKETMASTER_CZ_ORDER_DETAILS_MARKER = 'YOUR ORDER DETAILS';
+
+/**
+ * ticketmasterCzNormalizeTicketText — U+00A0 (non-breaking space) -> a regular
+ * space. The real body's separator lines are NBSP-only, so every marker search
+ * runs against the normalized copy. Shared by the parser and the detector for
+ * the same non-drift reason as the marker constant. Pure, never throws.
+ */
+function ticketmasterCzNormalizeTicketText(text) {
+  return String(text || '').replace(/\u00A0/g, ' ');
+}
+
+/**
+ * ticketmasterCzTextHasOrderDetails — the body-content admission predicate for
+ * this portal: does `text` carry an order-details region at all?
+ *
+ * THE FIDELITY PROPERTY: built on the SAME marker constant and the SAME
+ * normalization parseTicketmasterCzTicketText uses, so it returns false for
+ * EXACTLY the bodies that parser would throw its marker error on — never an
+ * independent heuristic that could drift from it.
+ *
+ * WHY THIS EXISTS (debug/ticketmaster-cz-order-confirm): Ticketmaster CZ sends
+ * at least two templates from one address — the PURCHASE CONFIRMATION (tickets
+ * follow in a separate email; carries "ORDER SUMMARY", no order-details region)
+ * and the ticket-details email this parser is built for. Config matches
+ * addresses, not templates, so only body content can separate them.
+ *
+ * Returns a literal boolean. Pure, never throws, no GAS globals.
+ */
+function ticketmasterCzTextHasOrderDetails(text) {
+  return ticketmasterCzNormalizeTicketText(text).indexOf(TICKETMASTER_CZ_ORDER_DETAILS_MARKER) !== -1;
+}
+
 /**
  * parseTicketmasterCzTicketText — the noreply@ticketmaster.cz-specific
- * ticket-BODY parser (quick-260816-ocw). UNLIKE parseEnigooTicketText, and
- * LIKE parseKinoArtTicketText, this parses the email BODY
- * (`message.getPlainBody()`), never a PDF — no Drive upload, no OCR is
- * performed here; the parsing itself never touches the real email's
- * eTicket.pdf attachment (D-01).
+ * ticket-BODY parser. UNLIKE parseEnigooTicketText, and LIKE
+ * parseKinoArtTicketText, this parses the email BODY
+ * (`message.getPlainBody()`), never a PDF — no Drive upload, no OCR.
  *
- * ROUND 2 AMENDMENT (D-01 revised): the owner asked for the real eTicket.pdf
- * to be attached to the created calendar event. This portal IS now
- * registered in TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL (via
- * findTicketmasterCzTicketPdfAttachment, below) — the SAME optional
- * find-the-PDF-and-attach-it-as-is mechanism Kino Art already proved, which
- * is NOT the OCR/PDF-TEXT pipeline (TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL
- * stays untouched — this portal still has no OCR path of any kind). With
- * `insertPdfIntoEvent` true for this portal, processTicketFromMessageBody
+ * This portal is registered in
+ * TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL (via
+ * findTicketmasterCzTicketPdfAttachment, below), the same optional
+ * find-the-PDF-and-attach-it-as-is mechanism Kino Art uses — NOT the
+ * OCR/PDF-TEXT pipeline (TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL stays
+ * untouched). With `insertPdfIntoEvent` true, processTicketFromMessageBody
  * moves the real eTicket.pdf straight into the permanent
  * CONFIG.ticketAttachmentDriveFolderName folder and attaches it — no temp
- * folder, no Drive-to-Docs conversion, exactly Kino Art's own established
- * flow.
+ * folder, no Drive-to-Docs conversion, exactly Kino Art's own flow.
  *
- * Example fixture (the real observed plain-text body shape, decoded from
- * quoted-printable — identifying details replaced with fictional
- * equivalents, per this file's established fixture convention; blank
- * separator lines are NON-BREAKING-SPACE-ONLY in the real source, not
- * truly empty):
- *
- *   YOUR ORDER DETAILS
- *   <NBSP-only line>
- *   Léto v podzámčí – Koncertní večer
- *   <NBSP-only line>
- *   Sál Radost
- *   <NBSP-only line>
- *   Sunday 15 November 2026 at 20:00
- *   <NBSP-only line>
- *   Ticket Quantity: 2
- *
- * DIFFERENT SEPARATOR MODEL FROM parseKinoArtTicketText (D-03): Kino Art's
- * parser assumes a single contiguous flattened line (Gmail's plain-text
- * rendering of an HTML table collapses everything to one line). This real
- * source does NOT collapse that way — each field sits on its OWN
- * paragraph, separated by blank-or-NBSP-only lines. Rather than depend on
- * a fixed line index (fragile, and this file's established "pattern-
- * anchored, not line-position" philosophy — see parseEnigooTicketText's
- * own class-level doc for the incident that established this discipline),
- * extraction anchors on two LITERAL markers actually present in the real
- * body:
+ * Each field sits on its OWN paragraph in the real body, separated by
+ * blank-or-NBSP-only lines (unlike Kino Art's single flattened line).
+ * Extraction anchors on two LITERAL markers:
  *   1. `YOUR ORDER DETAILS` — marks the start of the order-details
  *      region. Missing -> controlled throw.
  *   2. `Ticket Quantity:` — marks the end of the order-details region.
@@ -716,87 +487,56 @@ const TICKETMASTER_CZ_MONTH_NAMES = {
  *      alphabetic month NAME, whitespace, 4-digit year, whitespace, the
  *      literal word `at`, whitespace, `HH:MM` — anchored on the day
  *      digits, which naturally skips the leading full weekday name
- *      ("Sunday") with no need to parse it. No match -> controlled throw.
- *      The matched month name is resolved through
- *      TICKETMASTER_CZ_MONTH_NAMES case-insensitively; an unrecognized
- *      name -> controlled throw naming the bad value (D-04). This format
- *      is genuinely different from both enigoo.cz's and Kino Art's own
- *      numeric-month formats, hence its own regex and lookup table.
+ *      ("Sunday"). No match -> controlled throw. The matched month name
+ *      is resolved through TICKETMASTER_CZ_MONTH_NAMES
+ *      case-insensitively; an unrecognized name -> controlled throw
+ *      naming the bad value.
  *   4. EVENT NAME / VENUE: the region strictly BEFORE the date/time
  *      match, split on line breaks, each piece trimmed, empty pieces
  *      dropped. The FIRST surviving piece is the event name, the LAST is
- *      the venue. Fewer than two surviving pieces (event name and venue
- *      not separable) -> controlled throw.
+ *      the venue. Fewer than two surviving pieces -> controlled throw.
  *
- * `Ticket Quantity: N` (D-06) is read as the region-terminating marker AND
- * (ROUND 2 AMENDMENT) as a captured `ticketQuantity` number for the
- * description below — but it is NEVER an event multiplier, this action's
- * established ONE-EVENT-PER-PURCHASE design still holds unchanged (see this
- * file's class-level JSDoc): quantities of 1, 2 or 5 all yield the exact
- * same eventName/location/date-time/ticketIdentifier, only ticketQuantity
- * and description differ. The digits immediately following the marker are
- * captured via a small, non-throwing regex; a non-numeric or missing value
- * (a variant never observed, but not something that should ever block
- * calendar-event creation over a field this file already treats as
- * boundary-marker-only) leaves `ticketQuantity` `null` and simply omits its
- * line from `description` below.
+ * `Ticket Quantity: N` is read as the region-terminating marker AND as a
+ * captured `ticketQuantity` number for the description — but it is NEVER
+ * an event multiplier: quantities of 1, 2 or 5 all yield the exact same
+ * eventName/location/date-time/ticketIdentifier, only ticketQuantity and
+ * description differ. A non-numeric or missing value leaves
+ * `ticketQuantity` `null` and simply omits its line from `description`.
  *
- * `description` (ROUND 2, NEW): every ticketing-portal parser in this file
- * was previously silent on description — `createTicketCalendarEvent` never
- * set one for ANY portal. This parser is the first to populate it,
- * reproducing the real order-details block back to the owner as
- * `eventName + '\n\n' + location + '\n\n' + <the real weekday-prefixed
- * date/time line, e.g. "Sunday 15 November 2026 at 20:00"> [+ '\n\n' +
- * 'Ticket Quantity: N' when ticketQuantity is not null]`. The date/time
- * line reused here is the ACTUAL regionLines entry the date/time pattern
- * matched against (captured further down as `dateTimeText`), not a
- * reconstruction from the parsed numeric components — this deliberately
- * keeps the owner-facing weekday name ("Sunday") intact, even though the
- * parser itself never validates that weekday against the parsed calendar
- * date.
+ * `description` reproduces the real order-details block back to the
+ * owner as `eventName + '\n\n' + location + '\n\n' + <the real
+ * weekday-prefixed date/time line> [+ '\n\n' + 'Ticket Quantity: N' when
+ * ticketQuantity is not null]`. The date/time line reused is the ACTUAL
+ * regionLines entry the date/time pattern matched against (`dateTimeText`
+ * below), not a reconstruction from the parsed numeric components — this
+ * deliberately keeps the owner-facing weekday name intact.
  *
- * `ticketIdentifier` is ALWAYS `null` for this portal (D-05): no stable
+ * `ticketIdentifier` is ALWAYS `null` for this portal: no stable
  * per-ticket or per-order confirmation number exists anywhere in the real
- * observed body (checked directly, not assumed) — no substitute is
- * invented (no hash of the event name/date, no synthesized key), on the
- * same never-throwing terms this file's other two parsers already
- * document for their own OPTIONAL ticketIdentifier anchor. Consequence,
- * accepted and documented as a v1 limitation: the DEDUP SAFETY NET
- * (isDuplicateTicketPurchase / findTicketEventByIdentifier) cannot protect
- * this portal against reprocessing duplicates — a falsy ticketIdentifier
- * already makes isDuplicateTicketPurchase return `false` unconditionally.
- *
- * No speculative leading-bullet strip is applied here, unlike
- * parseKinoArtTicketText's own `* ` marker strip: that marker came from
- * Gmail rendering an HTML LIST to plain text, a different rendering path
- * than this email's real text/plain part (inspected directly, not
- * guessed). Per this file's established "don't guess at an unobserved
- * variant" discipline, any such marker for THIS portal would be handled
- * THEN, with real data, not speculatively now.
+ * observed body. Consequence, documented as a v1 limitation: the DEDUP
+ * SAFETY NET cannot protect this portal against reprocessing duplicates.
  *
  * Returns the same `{ eventName, location, year, month, day, hour, minute,
  * ticketIdentifier }` shape as the other two parsers (month zero-indexed)
- * PLUS two fields unique to this parser so far: `ticketQuantity`
- * (number|null) and `description` (string, see above). Adding these two
- * fields is backward-compatible for enigoo.cz and Kino Art:
- * createTicketCalendarEvent only reads `parsedTicket.description` when
- * truthy, so their own parsed-ticket objects (which never set it) leave the
- * created event's description untouched, exactly as before round 2.
- * Every controlled throw ends with the FULL raw `text` argument
- * (untruncated), same diagnostic-on-failure convention as
- * parseEnigooTicketText and parseKinoArtTicketText — the owner's failure-
- * notification email becomes the next diagnostic artifact. Pure, no GAS
+ * PLUS `ticketQuantity` (number|null) and `description` (string, see
+ * above) — backward-compatible, since createTicketCalendarEvent only
+ * reads `parsedTicket.description` when truthy. Every controlled throw
+ * ends with the FULL raw `text` argument (untruncated), same
+ * diagnostic-on-failure convention as the other parsers. Pure, no GAS
  * globals.
  */
 function parseTicketmasterCzTicketText(text) {
   const rawText = String(text || '');
-  // U+00A0 (non-breaking space) -> a regular space, since the real
-  // source's separator lines are NBSP-only -- only the NORMALIZED working
-  // copy is used for extraction; every thrown message below still reports
-  // the ORIGINAL rawText.
-  const normalizedText = rawText.replace(/\u00A0/g, ' ');
+  // Only the NORMALIZED working copy is used for extraction; every thrown
+  // message below still reports the ORIGINAL rawText. Shared with
+  // ticketmasterCzTextHasOrderDetails -- see its JSDoc's FIDELITY PROPERTY.
+  const normalizedText = ticketmasterCzNormalizeTicketText(rawText);
 
-  const orderDetailsMarker = 'YOUR ORDER DETAILS';
+  const orderDetailsMarker = TICKETMASTER_CZ_ORDER_DETAILS_MARKER;
+  // DEFENSIVE INVARIANT, not a production path: the job-admission gate
+  // (TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL) already refused any
+  // message failing this exact check, so `run` can no longer reach this throw.
+  // Kept so a DIRECT call still fails loudly rather than silently.
   const orderDetailsIndex = normalizedText.indexOf(orderDetailsMarker);
   if (orderDetailsIndex === -1) {
     throw new Error(
@@ -812,26 +552,20 @@ function parseTicketmasterCzTicketText(text) {
     );
   }
 
-  // ticketQuantity (ROUND 2, NEW): the digits immediately following the
-  // "Ticket Quantity:" marker -- OUTSIDE `region` (which stops right before
-  // this marker), so read directly from `normalizedText`. Never throws: a
-  // missing or non-numeric value (a variant never observed in the real
-  // email, but this marker's PRIMARY job is still just bounding `region`)
-  // leaves `ticketQuantity` `null` rather than blocking calendar-event
-  // creation over a field this file already treats as boundary-marker-only
-  // (D-06).
+  // ticketQuantity: the digits immediately following the "Ticket
+  // Quantity:" marker -- OUTSIDE `region` (which stops right before this
+  // marker), so read directly from `normalizedText`. Never throws: a
+  // missing or non-numeric value leaves `ticketQuantity` `null` rather
+  // than blocking calendar-event creation.
   const ticketQuantityMatch = /^\s*(\d+)/.exec(normalizedText.slice(ticketQuantityIndex + ticketQuantityMarker.length));
   const ticketQuantity = ticketQuantityMatch ? Number(ticketQuantityMatch[1]) : null;
 
   const region = normalizedText.slice(orderDetailsIndex + orderDetailsMarker.length, ticketQuantityIndex);
 
   // Each field sits on its OWN paragraph in the region, separated by
-  // blank/NBSP-only lines (already normalized to plain spaces above) --
-  // split into lines up front, trim each, and drop the empty ones. This
-  // is what both the date/time search below AND the event-name/venue
-  // extraction operate on, so the WEEKDAY-PREFIXED date/time line (e.g.
-  // "Sunday 15 November 2026 at 20:00") is always treated as ONE whole
-  // paragraph, never partially sliced mid-line.
+  // blank/NBSP-only lines -- split into lines up front, trim each, and
+  // drop the empty ones, so the WEEKDAY-PREFIXED date/time line is always
+  // treated as ONE whole paragraph, never partially sliced mid-line.
   const regionLines = region
     .split(/\r\n|\r|\n/)
     .map(function (line) {
@@ -891,16 +625,11 @@ function parseTicketmasterCzTicketText(text) {
   const eventName = candidateLines[0];
   const location = candidateLines[candidateLines.length - 1];
 
-  // dateTimeText (ROUND 2, NEW): the ACTUAL regionLines entry the date/time
-  // pattern matched against -- preserves the real weekday-prefixed line
-  // (e.g. "Sunday 15 November 2026 at 20:00") for `description` below,
-  // rather than reconstructing it from the parsed numeric components (which
-  // would lose the weekday name entirely, since it is never itself parsed
-  // or validated). dateTimeLineIndex was already resolved above and is
-  // always found here -- dateTimeMatch already succeeded against `region`,
-  // and every regionLines entry is a trimmed line drawn from that same
-  // `region` string, so the matched substring always falls within exactly
-  // one of them.
+  // dateTimeText: the ACTUAL regionLines entry the date/time pattern
+  // matched against -- preserves the real weekday-prefixed line for
+  // `description` below, rather than reconstructing it from the parsed
+  // numeric components (which would lose the weekday name, since it is
+  // never itself parsed or validated).
   const dateTimeText = dateTimeLineIndex === -1 ? dateTimeMatch[0] : regionLines[dateTimeLineIndex];
 
   // description (ROUND 2, NEW — see this function's class-level JSDoc):
@@ -926,33 +655,23 @@ function parseTicketmasterCzTicketText(text) {
   };
 }
 
-// ENTRADIO_SECTION_HEADING_PATTERNS (debug/entradio-portal-not-supported):
-// Entradio's plain-text body is SECTION-HEADED — a heading word on its own
-// line, immediately underlined by a run of dashes ("Událost" / "Místo
-// konání" / "Vstupenky" / "Platba"). Anchoring on the heading TOGETHER WITH
-// its dashes underline is not decoration, it is what makes the anchor
-// unambiguous: the bare word "Vstupenky" ALSO appears in the earlier prose
-// sentence "Vstupenky není třeba tisknout...", and the bare word "Platba"
-// in "Vaše platba byla úspěšně zaplacena" — a plain indexOf on either would
-// land in the wrong place entirely (verified directly against the real
-// decoded sample, not assumed).
+// ENTRADIO_SECTION_HEADING_PATTERNS: Entradio's plain-text body is
+// SECTION-HEADED -- a heading word on its own line, immediately underlined
+// by a run of dashes ("Událost" / "Místo konání" / "Vstupenky" / "Platba").
+// Anchoring on the heading TOGETHER WITH its dashes underline is not
+// decoration: the bare heading words also occur in ordinary prose earlier
+// in the body, so a plain substring search would land in the wrong place.
 //
-// The real underline lengths are NOT uniform (63 dashes under "Událost",
-// then 12 / 9 / 6 matching their own heading lengths), so the pattern
-// requires a minimum of three rather than an exact count. `[^\S\r\n]`
-// (horizontal whitespace only — whitespace EXCEPT a line break) is used
-// throughout instead of a bare `\s`, so a pattern can require "same line"
-// where that actually matters; `[\r\n]+` between heading and underline keeps
-// this separator-agnostic (\r, \n or \r\n alike), the same lesson
-// parseEnigooTicketText's own class-level doc records from the round-4/5
-// Apps Script paragraph-separator incident.
+// The real underline lengths are NOT uniform, so the pattern requires a
+// minimum of three dashes rather than an exact count. `[^\S\r\n]`
+// (horizontal whitespace only) is used instead of a bare `\s` so a pattern
+// can require "same line" where that matters; `[\r\n]+` between heading
+// and underline keeps this separator-agnostic.
 //
 // Written out as four SEPARATE regex literals rather than built from a
-// heading string via `new RegExp(...)`: this file's established style is
-// literal regexes, and a dynamically-built pattern must double-escape every
-// backslash, which is exactly the kind of silent corruption (`[^\\S...]`
-// arriving as `[^S...]`, quietly matching the wrong characters) that is
-// invisible on review.
+// heading string via `new RegExp(...)`: a dynamically-built pattern must
+// double-escape every backslash, which is exactly the kind of silent
+// corruption that is invisible on review.
 const ENTRADIO_SECTION_HEADING_PATTERNS = {
   event: /Událost[^\S\r\n]*[\r\n]+[^\S\r\n]*-{3,}[^\S\r\n]*(?=[\r\n]|$)/,
   venue: /Místo konání[^\S\r\n]*[\r\n]+[^\S\r\n]*-{3,}[^\S\r\n]*(?=[\r\n]|$)/,
@@ -961,12 +680,10 @@ const ENTRADIO_SECTION_HEADING_PATTERNS = {
 };
 
 // ENTRADIO_SEAT_FIELD_PATTERNS — the four per-seat labels Entradio renders
-// inside each ticket block, in the email's own display order. Each value is
-// matched on the SAME LINE as its label (`[^\S\r\n]+`, never `\s+`): the
-// real sample leaves "Poschodí" and "Sleva" with an EMPTY value, and a
-// `\s+`-based pattern would happily jump the blank lines and capture the
-// NEXT label's value instead ("Poschodí" would silently become "Sekce").
-// Every field here is optional — see extractEntradioTicketLines.
+// inside each ticket block. Each value is matched on the SAME LINE as its
+// label (`[^\S\r\n]+`, never `\s+`): a label can carry an empty value, and
+// a `\s+`-based pattern would jump the blank line and capture the NEXT
+// label's value instead. Every field here is optional.
 const ENTRADIO_SEAT_FIELD_PATTERNS = [
   { label: 'Poschodí', pattern: /Poschodí[^\S\r\n]+([^\r\n]+)/ },
   { label: 'Sekce', pattern: /Sekce[^\S\r\n]+([^\r\n]+)/ },
@@ -981,38 +698,27 @@ const ENTRADIO_SEAT_FIELD_PATTERNS = [
 const ENTRADIO_BOLD_VALUE_PATTERN = /\*([^*\r\n]+)\*/;
 
 // ENTRADIO_DATE_TIME_PATTERN — `D. M. YYYY, HH:MM` (dot-SPACE separated,
-// no leading zeros, comma before the time). Closest to Kino Art's
-// `D. M. YYYY HH:MM`, but the comma makes it its own pattern rather than a
-// reuse — and that comma does real work here.
-//
-// WHY THE COMMA MATTERS (a genuine near-miss, worth stating): the SAME
-// "Událost" section also carries a gate-opening line, "Brána na událost se
-// otevírá v 27. 9. 2026, od 17:00 hodin." — the same date, a DIFFERENT time
-// (17:00 vs the real 17:30 start). This pattern cannot match that line at
-// ANY start offset, because the literal "od " sits between the comma and the
-// digits where `,?\s*(\d{1,2})` requires digits. The correct start time is
-// therefore selected STRUCTURALLY, not merely by happening to come first —
-// proven by its own regression test, since "it works by ordering luck" and
-// "it works by construction" look identical until the layout shifts.
+// no leading zeros, comma before the time) — its own pattern rather than
+// reusing Kino Art's `D. M. YYYY HH:MM`, because the comma does real work
+// here: the same "Událost" section also carries a gate-opening line with
+// the SAME date but a DIFFERENT time ("...27. 9. 2026, od 17:00 hodin.").
+// The literal "od " between the comma and the digits means this pattern
+// cannot match that line, so the correct start time is selected
+// STRUCTURALLY rather than by ordering luck.
 const ENTRADIO_DATE_TIME_PATTERN = /(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4}),?\s*(\d{1,2}):(\d{2})/;
 
 // ENTRADIO_ORDER_NUMBER_PATTERN — the order number, this portal's
-// ticketIdentifier: the label "Číslo objednávky" followed by the bold digits
-// (`*2354152*`). `[\s*]*` (whitespace AND/OR literal asterisks) spans the
-// line break and the bold markers between them — the same tolerance idiom
-// parseKinoArtTicketText's own round-4 fix already established for its
-// order-number anchor. Deliberately NOT "Číslo platby" (the payment number,
-// a different label with a different number in the same email).
+// ticketIdentifier: the label "Číslo objednávky" followed by the bold
+// digits (`*2354152*`). `[\s*]*` spans the line break and bold markers
+// between them. Deliberately NOT "Číslo platby" (the payment number, a
+// different label with a different number in the same email).
 const ENTRADIO_ORDER_NUMBER_PATTERN = /Číslo objednávky[\s*]*(\d+)/;
 
 /**
  * findEntradioSection — locates one of Entradio's dash-underlined section
- * headings and returns BOTH boundaries a caller needs: `headingIndex` (where
- * the heading word itself starts — the END boundary for the PRECEDING
- * section's region) and `bodyIndex` (just past the underline — where that
- * section's own content begins). Returns `null` when the section is absent,
- * never throws; which absences are fatal is each caller's decision, not
- * this helper's. Pure, no GAS globals.
+ * headings. Returns `{ headingIndex, bodyIndex }` (start of the heading;
+ * just past the underline), or `null` when absent. Never throws. Pure, no
+ * GAS globals.
  */
 function findEntradioSection(text, pattern) {
   const match = pattern.exec(text);
@@ -1024,12 +730,10 @@ function findEntradioSection(text, pattern) {
 }
 
 /**
- * firstEntradioNonEmptyLine — returns the first line of `text` that is
- * non-empty after trimming, or `''` when there is none. Used for the venue
- * ADDRESS, which Entradio renders as the first real line after the bold
- * venue name, separated from it by blank lines. Splits on `\r\n`/`\r`/`\n`
- * alike, per this file's separator-agnostic convention. Pure, no GAS
- * globals.
+ * firstEntradioNonEmptyLine — the first line of `text` that is non-empty
+ * after trimming, or `''` when there is none. Used for the venue ADDRESS,
+ * the first real line after the bold venue name. Splits on `\r\n`/`\r`/`\n`
+ * alike. Pure, no GAS globals.
  */
 function firstEntradioNonEmptyLine(text) {
   const lines = String(text).split(/\r\n|\r|\n/);
@@ -1045,17 +749,12 @@ function firstEntradioNonEmptyLine(text) {
 }
 
 /**
- * dedupeEntradioVenueSegments — collapses repeated comma-separated segments
- * in Entradio's venue name, preserving first-seen order.
- *
- * The real sample's venue renders as "Kino Metropol, Kino Metropol" —
- * Entradio prints "<venue>, <hall>" and this tenant named its only hall
- * after the venue, so the value arrives duplicated. Left alone it would
- * reach the calendar event's location as a visible stutter. This is a
- * genuinely SAFE normalization rather than a guess about unobserved data:
- * it can only ever change a value whose segments actually repeat, so a
- * normal "<venue>, <hall>" pair (e.g. "Kino Metropol, Velký sál") passes
- * through completely untouched. Pure, no GAS globals.
+ * dedupeEntradioVenueSegments — collapses repeated comma-separated
+ * segments in Entradio's venue name, preserving first-seen order (some
+ * venues repeat their own name as the hall name, e.g. "Kino Metropol,
+ * Kino Metropol"). Only ever collapses segments that actually repeat, so
+ * a normal venue-and-hall pair passes through untouched. Pure, no GAS
+ * globals.
  */
 function dedupeEntradioVenueSegments(venueName) {
   const seen = {};
@@ -1077,31 +776,23 @@ function dedupeEntradioVenueSegments(venueName) {
 
 /**
  * findEntradioTicketCodeMatches — the SINGLE scan for per-seat ticket-code
- * lines inside the "Vstupenky" region, returning `[{ code, index }]` in source
- * order (`[]` when there are none). Shared by BOTH consumers of that scan:
- * extractEntradioTicketLines (which needs each match's INDEX to slice out its
- * seat block) and extractEntradioTicketCodes (which needs only the codes).
+ * lines inside the "Vstupenky" region, returning `[{ code, index }]` in
+ * source order (`[]` when there are none). Shared by BOTH
+ * extractEntradioTicketLines (needs each match's INDEX to slice out its
+ * seat block) and extractEntradioTicketCodes (needs only the codes) — one
+ * shared scan means the two views can never disagree about which seats
+ * exist.
  *
- * EXTRACTED IN ROUND 2 (debug/entradio-portal-not-supported) rather than
- * copy-pasting the pattern into a second function: the two consumers must
- * always see the SAME seats. If one scan learned about a new code shape and
- * the other did not, the calendar event's QR-code attachments would silently
- * stop matching the seats listed in its own description — a mismatch nothing
- * would throw on. One pattern, one scan, no possible drift. A test pins the
- * agreement from the outside as well.
+ * A ticket block starts at a TICKET CODE line — an uppercase alphanumeric
+ * run at the start of a line, followed by the literal U+2022 bullet that
+ * separates it from the price. The `g`-flagged pattern is declared INSIDE
+ * this function deliberately: a regex literal creates a fresh object on
+ * every evaluation, so its `lastIndex` can never leak between calls.
  *
- * A ticket block starts at a TICKET CODE line — an uppercase alphanumeric run
- * at the start of a line, followed by the literal U+2022 bullet that separates
- * it from the price ("TM5X59GM • 230 Kč"). The `g`-flagged pattern is declared
- * INSIDE this function deliberately: a regex literal creates a fresh object on
- * every evaluation, so its `lastIndex` can never leak between calls the way a
- * shared module-level global regex's would.
- *
- * SCOPE LIMITATION (deliberate, the same "don't guess at an unobserved
- * variant" discipline as KINO_ART_KNOWN_VENUE): matching is scoped to the
- * uppercase-and-digits code shape actually observed ("TM5X59GM", "2ZKN9JXVT").
- * A lowercase or punctuated code would need handling THEN, with real data.
- * Pure, no GAS globals.
+ * SCOPE LIMITATION: matching is scoped to the uppercase-and-digits code
+ * shape actually observed ("TM5X59GM", "2ZKN9JXVT"). A lowercase or
+ * punctuated code would need handling THEN, with real data. Pure, no GAS
+ * globals.
  */
 function findEntradioTicketCodeMatches(region) {
   const codePattern = /^[^\S\r\n]*([A-Z0-9]{5,})[^\S\r\n]*•/gm;
@@ -1117,25 +808,16 @@ function findEntradioTicketCodeMatches(region) {
 
 /**
  * extractEntradioTicketCodes — the RAW per-seat ticket codes (e.g.
- * `["TM5X59GM", "2ZKN9JXVT"]`) from the "Vstupenky" region, in the email's own
- * order, or `[]` when there are none.
- *
- * ADDED IN ROUND 2 (debug/entradio-portal-not-supported) as a SIBLING of
- * extractEntradioTicketLines rather than a change to it: that function returns
- * pre-formatted, human-readable DESCRIPTION LINES ("TM5X59GM • Sekce vlevo,
- * Řada 3, Místo 19") and is already covered by its own tests, so repurposing
- * its return shape to serve a new caller would have meant rewriting working
- * assertions. Both now delegate their scan to findEntradioTicketCodeMatches,
+ * `["TM5X59GM", "2ZKN9JXVT"]`) from the "Vstupenky" region, in the email's
+ * own order, or `[]` when there are none. Delegates its scan to
+ * findEntradioTicketCodeMatches (shared with extractEntradioTicketLines),
  * so the two views cannot disagree about which seats exist.
  *
- * WHAT NEEDS THE RAW CODES: fetchEntradioAttachments builds one QR-code URL
- * per code (buildEntradioQrCodeUrl) — Entradio's own confirmation email
- * renders exactly these codes as inline
- * `<img src="https://app.entradio.cz/qrcode?code=...&size=200">` tags, so the
- * codes ARE the join key between the parsed body and the real QR endpoint.
+ * WHAT NEEDS THE RAW CODES: fetchEntradioAttachments builds one QR-code
+ * URL per code — these codes ARE the join key between the parsed body and
+ * the real Entradio QR endpoint.
  *
- * ALWAYS AN ARRAY, never null — callers iterate it unconditionally without a
- * shape check. Pure, no GAS globals, never throws.
+ * ALWAYS AN ARRAY, never null. Pure, no GAS globals, never throws.
  */
 function extractEntradioTicketCodes(region) {
   return findEntradioTicketCodeMatches(region).map(function (entry) {
@@ -1148,20 +830,14 @@ function extractEntradioTicketCodes(region) {
  * "Vstupenky" section as one human-readable summary line for the calendar
  * event's description, e.g. `"TM5X59GM • Sekce vlevo, Řada 3, Místo 19"`.
  *
- * ENTIRELY OPTIONAL AND NON-THROWING, by design: this drives only
- * `description` and `ticketQuantity`, never the event's identity
- * (name/location/date-time/ticketIdentifier). An Entradio layout this
- * cannot read yields an empty array and a description without a seat block
- * — it must never be able to block calendar-event creation over a
- * presentational nicety, the same terms every parser in this file already
- * documents for its own optional anchors.
+ * ENTIRELY OPTIONAL AND NON-THROWING: this drives only `description` and
+ * `ticketQuantity`, never the event's identity. An unreadable layout
+ * yields an empty array rather than blocking calendar-event creation over
+ * a presentational nicety.
  *
- * Seat blocks are located by findEntradioTicketCodeMatches (see its own JSDoc
- * for the code-line pattern and its scope limitation); each block runs from
- * its code line to the NEXT code line, or to the end of the region. Round 2
- * moved that scan out of this function so extractEntradioTicketCodes could
- * share it verbatim rather than reimplement it — the two must always see the
- * same seats. Pure, no GAS globals.
+ * Seat blocks are located by findEntradioTicketCodeMatches (see its own
+ * JSDoc); each block runs from its code line to the NEXT code line, or to
+ * the end of the region. Pure, no GAS globals.
  */
 function extractEntradioTicketLines(region) {
   const found = findEntradioTicketCodeMatches(region);
@@ -1186,135 +862,64 @@ function extractEntradioTicketLines(region) {
 }
 
 /**
- * parseEntradioTicketText — the no-reply@app.entradio.cz ticket-BODY parser
- * (debug/entradio-portal-not-supported). The FOURTH supported portal and the
- * THIRD body-sourced one, alongside parseKinoArtTicketText and
- * parseTicketmasterCzTicketText: it reads `message.getPlainBody()`, never a
- * PDF, and never touches the Drive/OCR pipeline.
- *
- * WHY BODY-SOURCED IS THE ONLY OPTION HERE (not a preference): an Entradio
- * confirmation carries NO ticket file ON THE MESSAGE at all. Its single PDF
- * attachment is the venue's terms and conditions (VOP_Metropol.pdf), and the
- * real tickets live behind a "STÁHNOUT VSTUPENKY" download link. Everything
- * the calendar EVENT needs — name, date/time, venue, order number, seats — is
- * already in the body, which is why the event's identity never depends on
- * that link. This is also why this portal is deliberately ABSENT from
- * TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL: with no ticket PDF among
- * the message's attachments, registering a finder could only ever attach the
- * terms-and-conditions document to the owner's calendar.
- *
- * CORRECTED IN ROUND 2 (debug/entradio-portal-not-supported): round 1's
- * version of this paragraph said the download link "deliberately does not
- * follow (owner-scoped)". That is NO LONGER TRUE and the sentence has been
- * removed rather than left to contradict the code. The owner expanded the
- * scope before live verification: fetchEntradioAttachments now DOES follow
- * that link (gated by `insertPdfIntoEvent`, the same toggle every other
- * portal uses) and additionally fetches one QR-code image PER SEAT from
- * Entradio's own qrcode endpoint, UNCONDITIONALLY. See this file's
- * "ENTRADIO ATTACHMENT PIPELINE" section below. The `ticketCodes` field this
- * parser returns exists solely to feed that pipeline.
+ * parseEntradioTicketText — the no-reply@app.entradio.cz ticket-BODY
+ * parser. Reads `message.getPlainBody()`, never a PDF, and never touches
+ * the Drive/OCR pipeline: an Entradio confirmation carries NO ticket file
+ * on the message at all (its single PDF attachment is the venue's terms
+ * and conditions). Everything the calendar EVENT needs — name, date/time,
+ * venue, order number, seats — is already in the body; the real tickets
+ * live behind a "STÁHNOUT VSTUPENKY" download link, fetched separately by
+ * fetchEntradioAttachments (see the "ENTRADIO ATTACHMENT PIPELINE" section
+ * below). The `ticketCodes` field this parser returns exists solely to
+ * feed that pipeline. This portal is deliberately ABSENT from
+ * TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL: with no ticket PDF
+ * among the message's attachments, registering a finder could only ever
+ * attach the terms-and-conditions document to the owner's calendar.
  *
  * ENTRADIO IS A PLATFORM, NOT A VENUE: app.entradio.cz is a white-label
- * ticketing system (the real sample was sent by Kino Metropol Olomouc, whose
- * own name appears only in the body). The sender address is shared across
- * every venue using it, so ONE portal entry covers all of them — and every
- * anchor below is therefore on Entradio's own TEMPLATE structure (section
- * headings, bold markers, label words), never on any one venue's name. This
- * is the opposite of the KINO_ART_KNOWN_VENUE approach, and deliberately so.
+ * ticketing system used by many venues (the real sample's own venue name
+ * appears only in the body). One portal entry covers all of them, so
+ * every anchor below is on Entradio's own TEMPLATE structure (section
+ * headings, bold markers, label words), never on any one venue's name —
+ * the opposite of the KINO_ART_KNOWN_VENUE approach, deliberately so.
  *
- * Real sample (the fixture in test/ticketing-portals.test.js reproduces this
- * verbatim apart from the buyer's own contact details):
- *
- *   Číslo objednávky
- *   *2354152*
- *   ...
- *   Událost
- *   ---------------------------------------------------------------
- *
- *   *ČERNO, VÍR*
- *
- *   27. 9. 2026, 17:30
- *
- *   Brána na událost se otevírá v 27. 9. 2026, od 17:00 hodin.
- *
- *   Místo konání
- *   ------------
- *
- *   *Kino Metropol, Kino Metropol*
- *
- *    Sokolská 572/25, 77900 Olomouc, Česká republika
- *
- *   Vstupenky
- *   ---------
- *
- *   TM5X59GM • 230 Kč
- *   Poschodí
- *   Sekce vlevo
- *   Řada 3
- *   Místo 19
- *   Sleva
- *   ...
- *   Platba
- *   ------
- *
- * Extraction anchors (pattern-anchored, never line-position — this file's
- * established philosophy, see parseEnigooTicketText's own class-level doc
- * for the live incident that established it):
+ * Extraction anchors (pattern-anchored, never line-position):
  *   1. SECTIONS: each dash-underlined heading is located ONCE up front
- *      (findEntradioSection), and every subsequent extraction runs against
- *      a REGION bounded by two of them. This is what keeps the "Místo"
- *      SEAT label (inside "Vstupenky") from ever colliding with the "Místo
- *      konání" VENUE heading, and the per-seat date-shaped strings from
- *      colliding with the event's own date/time. "Událost" and "Místo
- *      konání" are REQUIRED (their regions carry the event's identity);
- *      "Vstupenky" and "Platba" are OPTIONAL bounds used only by the
- *      description.
+ *      (findEntradioSection), and every subsequent extraction runs
+ *      against a REGION bounded by two of them — this is what keeps the
+ *      "Místo" SEAT label (inside "Vstupenky") from colliding with the
+ *      "Místo konání" VENUE heading. "Událost" and "Místo konání" are
+ *      REQUIRED (their regions carry the event's identity); "Vstupenky"
+ *      and "Platba" are OPTIONAL bounds used only by the description.
  *   2. EVENT NAME: the first bold value in the "Událost" region.
- *   3. DATE/TIME: the first ENTRADIO_DATE_TIME_PATTERN match STRICTLY AFTER
- *      the event name's own match end (the same "slice from this match's
- *      end index" idiom parseEnigooTicketText uses to keep an anchor scoped
- *      to its own occurrence) — see that pattern's own comment for why the
- *      gate-opening line in the same region cannot be matched by accident.
+ *   3. DATE/TIME: the first ENTRADIO_DATE_TIME_PATTERN match strictly
+ *      after the event name's own match end (see that pattern's own
+ *      comment for why a nearby gate-opening line cannot be matched by
+ *      accident).
  *   4. LOCATION: the first bold value in the "Místo konání" region
- *      (de-stuttered via dedupeEntradioVenueSegments), joined to the first
- *      non-empty line after it, which is the street address. The address is
- *      OPTIONAL — a venue with no address line still yields a usable
- *      location rather than a throw.
- *   5. TICKET IDENTIFIER (OPTIONAL — never throws, same terms as every
- *      other parser in this file): the ORDER number. Naturally scoped to
- *      the whole PURCHASE, shared by every seat in a multi-seat order —
- *      the same "better dedup key, not merely an equivalent one" property
- *      parseKinoArtTicketText's order number has, and exactly what the
- *      owner-confirmed ONE-EVENT-PER-ORDER requirement needs. A 2-seat
- *      order yields ONE event, and reprocessing it is caught by the shared
- *      DEDUP SAFETY NET.
+ *      (de-stuttered via dedupeEntradioVenueSegments), joined to the
+ *      first non-empty line after it (the street address). The address
+ *      is OPTIONAL — a venue with no address line still yields a usable
+ *      location.
+ *   5. TICKET IDENTIFIER (OPTIONAL — never throws): the ORDER number,
+ *      naturally scoped to the whole PURCHASE and shared by every seat in
+ *      a multi-seat order — a 2-seat order still yields ONE event, and
+ *      reprocessing it is caught by the shared DEDUP SAFETY NET.
  *   6. TICKET QUANTITY / DESCRIPTION (OPTIONAL): see
- *      extractEntradioTicketLines. `ticketQuantity` is the number of seats
- *      in the order and is NEVER an event multiplier — this action's
- *      one-event-per-purchase design holds unchanged.
- *   7. TICKET CODES (OPTIONAL, ROUND 2): the RAW per-seat codes from the same
- *      region (extractEntradioTicketCodes), e.g. `["TM5X59GM", "2ZKN9JXVT"]`.
- *      ALWAYS an array, `[]` when there are no seat blocks — never null, so
- *      fetchEntradioAttachments can iterate it without a shape check. One
- *      QR-code Calendar attachment is fetched per entry.
+ *      extractEntradioTicketLines. `ticketQuantity` is the seat count and
+ *      is NEVER an event multiplier.
+ *   7. TICKET CODES (OPTIONAL): the RAW per-seat codes from the same
+ *      region (extractEntradioTicketCodes). ALWAYS an array, `[]` when
+ *      there are no seat blocks — never null.
  *
- * NO EXPLICIT NBSP NORMALIZATION, unlike parseTicketmasterCzTicketText: the
- * real Entradio body's separator lines are plain U+0020 spaces (every
- * non-ASCII code point in the real sample was enumerated directly — U+00A0
- * does not occur). Stated explicitly so this reads as a verified fact about
- * the real data rather than an oversight; and note that even if one did
- * appear, JS treats U+00A0 as whitespace for both `\s` and `String.trim()`,
- * which is all this parser relies on.
- *
- * Returns parseTicketmasterCzTicketText's extended shape PLUS round 2's
- * `ticketCodes`:
- * `{ eventName, location, year, month, day, hour, minute, ticketIdentifier,
- * ticketQuantity, ticketCodes, description }` (month zero-indexed). Throws a controlled
- * Error if a REQUIRED section, the event name, the date/time, or the venue
- * cannot be extracted, or if the matched hour/minute are out of range; every
- * throw ends with the FULL raw `text` untruncated, per this file's
- * diagnostic-on-failure convention (the owner's failure-notification email
- * becomes the next diagnostic artifact). Pure, no GAS globals.
+ * Returns parseTicketmasterCzTicketText's extended shape PLUS
+ * `ticketCodes`: `{ eventName, location, year, month, day, hour, minute,
+ * ticketIdentifier, ticketQuantity, ticketCodes, description }` (month
+ * zero-indexed). Throws a controlled Error if a REQUIRED section, the
+ * event name, the date/time, or the venue cannot be extracted, or if the
+ * matched hour/minute are out of range; every throw ends with the FULL
+ * raw `text` untruncated, per this file's diagnostic-on-failure
+ * convention. Pure, no GAS globals.
  */
 function parseEntradioTicketText(text) {
   const rawText = String(text || '');
@@ -1424,102 +1029,72 @@ function parseEntradioTicketText(text) {
 }
 
 /* ===========================================================================
- * ENTRADIO ATTACHMENT PIPELINE (debug/entradio-portal-not-supported, round 2)
+ * ENTRADIO ATTACHMENT PIPELINE
  * ===========================================================================
  *
- * WHY THIS EXISTS: round 1 registered the portal and parsed its body, which
- * fixed the reported "no event, no error" silent skip. Before live
- * verification the owner expanded the scope, and rightly so — an Entradio
- * confirmation carries NO ticket file on the message at all (its one PDF is
- * the venue's terms and conditions), so a round-1 event would have reached
- * the calendar with nothing on it to show at the door. This section fetches
- * the real artifacts over HTTP and attaches them.
- *
- * THIS IS THIS CODEBASE'S FIRST-EVER OUTBOUND HTTP CALL. Two consequences:
- *   1. src/appsscript.json now declares
- *      `https://www.googleapis.com/auth/script.external_request`. Without it
- *      UrlFetchApp fails at RUNTIME, inside the trigger, where the owner sees
- *      it only as a failed execution — which is why a test pins the manifest.
- *      Adding a scope forces a RE-AUTHORIZATION prompt on next deployment.
- *   2. Everything below is written to a NEGATIVE contract: no function in this
- *      section may ever throw. They run BEFORE the Calendar event is created,
- *      so an escaping exception would destroy the event the owner actually
- *      needs in exchange for an attachment they can fetch by hand. Every
- *      failure is caught, logged and turned into "one fewer attachment".
- *
- * WHAT GETS ATTACHED (owner-settled, not re-derived here):
+ * WHAT GETS ATTACHED:
  *   - THE TICKET FILE behind the "STÁHNOUT VSTUPENKY" button, gated by the
- *     SAME `insertPdfIntoEvent` toggle every other portal already uses. The
- *     owner's own framing: same switch as the other portals, its meaning for
- *     Entradio specifically now including "attempt the download at all".
+ *     SAME `insertPdfIntoEvent` toggle every other portal uses.
  *   - ONE QR CODE PER SEAT, fetched from Entradio's own
- *     `app.entradio.cz/qrcode` endpoint, each saved and attached as its OWN
- *     file. ALWAYS attempted, NEVER gated by `insertPdfIntoEvent` — a QR code
- *     is not a PDF, and it is the artifact that actually gets the owner
- *     through the door.
- *   - Both land in the EXISTING shared `CONFIG.ticketAttachmentDriveFolderName`
- *     folder (the one enigoo.cz / Kino Art / Ticketmaster CZ already use). No
- *     new folder, owner-confirmed.
- *   - If NOTHING could be attached at all, the Calendar event is STILL
- *     created and a separate notification email is sent instead
- *     (notifyOwnerOfTicketAttachmentFailure, src/02-main.js). The owner's own
- *     words: "Vytvořit událost i tak, jen upozornit e-mailem."
+ *     `app.entradio.cz/qrcode` endpoint, each saved and attached as its
+ *     OWN file. ALWAYS attempted, NEVER gated by `insertPdfIntoEvent` — a
+ *     QR code is not a PDF, and it is the artifact that actually gets the
+ *     owner through the door.
+ *   - Both land in the EXISTING shared
+ *     `CONFIG.ticketAttachmentDriveFolderName` folder (the one enigoo.cz /
+ *     Kino Art / Ticketmaster CZ already use). No new folder.
+ *
+ * NEGATIVE CONTRACT: every function in this section runs BEFORE the
+ * Calendar event is created, and none of them may ever throw — an
+ * escaping exception here would destroy the event the owner actually
+ * needs in exchange for an attachment they could fetch by hand. Every
+ * failure is caught, logged, and turned into "one fewer attachment". If
+ * NOTHING could be attached at all, the Calendar event is still created
+ * and a separate notification email is sent instead
+ * (notifyOwnerOfTicketAttachmentFailure, src/02-main.js).
  *
  * TESTABILITY SPLIT, following this file's established convention: the
- * decisions (which URL, which filename, is this response acceptable) are PURE
- * functions with no GAS globals, unit-tested directly. Only the three
- * functions that genuinely touch UrlFetchApp/DriveApp are I/O wrappers, and
- * they are deliberately thin.
+ * decisions (which URL, which filename, is this response acceptable) are
+ * PURE functions with no GAS globals, unit-tested directly. Only the
+ * three functions that genuinely touch UrlFetchApp/DriveApp are I/O
+ * wrappers, and they are deliberately thin.
  */
 
 // ENTRADIO_TICKET_DOWNLOAD_LINK_PATTERN — the "STÁHNOUT VSTUPENKY" button in
-// the message's HTML body. CONFIRMED against the owner's real sample .eml
-// (text/html part, decoded quoted-printable -> UTF-8, line 517):
+// the message's HTML body.
 //
-//   <a href="https://u28607140.ct.sendgrid.net/ls/click?upn=u001.…"
-//      style="background-color:#6A1B9A; …" target="_blank">STÁHNOUT VSTUPENKY</a>
-//
-// THE NEAR-MISS THIS PATTERN EXISTS TO AVOID (a real one, verified in the same
-// file 11 lines later): the very next button is
-// `…>STÁHNOUT JAKO DÁREK</a>` — "download as a gift" — an IDENTICALLY shaped
-// anchor pointing at a DIFFERENT URL. Anchoring on "STÁHNOUT" alone would
-// fetch the gift artifact, and NO response validator below could catch it:
-// that link also answers 200 with a non-HTML body. The full literal inner text
+// THE NEAR-MISS THIS PATTERN EXISTS TO AVOID: the very next button in the
+// same email is an IDENTICALLY shaped anchor
+// (`...>STÁHNOUT JAKO DÁREK</a>`, "download as a gift") pointing at a
+// DIFFERENT URL. Anchoring on "STÁHNOUT" alone would fetch the gift
+// artifact, and NO response validator downstream could catch it: that
+// link also answers 200 with a non-HTML body. The full literal inner text
 // is therefore load-bearing, exactly like the comma in
-// ENTRADIO_DATE_TIME_PATTERN. The tickets link is selected STRUCTURALLY, not
-// by document order — a test proves it still wins when the gift anchor is
-// placed first.
+// ENTRADIO_DATE_TIME_PATTERN — the tickets link is selected STRUCTURALLY,
+// not by document order.
 //
-// `[^>]*` is tag-scoped by construction (it cannot cross a `>`), so attributes
-// may appear on either side of `href` in any order; the real sample has none
-// before it and two after. The `\s` before `href` is deliberate: it stops a
-// hypothetical `data-href="…"` from being read as the href.
+// `[^>]*` is tag-scoped by construction (it cannot cross a `>`), so
+// attributes may appear on either side of `href` in any order. The `\s`
+// before `href` is deliberate: it stops a hypothetical `data-href="…"`
+// from being read as the href.
 //
-// SCOPE LIMITATION (deliberate, same "match the literal structure actually
-// observed" discipline as every other parser in this file): double-quoted
-// href only, and the inner text directly inside the anchor rather than nested
-// in a child element. Both are what the real email does. A variant would need
-// handling THEN, with real data.
+// SCOPE LIMITATION: double-quoted href only, and the inner text directly
+// inside the anchor rather than nested in a child element. A variant
+// would need handling THEN, with real data.
 const ENTRADIO_TICKET_DOWNLOAD_LINK_PATTERN = /<a[^>]*\shref="([^"]*)"[^>]*>\s*STÁHNOUT VSTUPENKY\s*<\/a>/;
 
 /**
- * findEntradioTicketDownloadUrl — returns the "STÁHNOUT VSTUPENKY" href from
- * an Entradio confirmation's HTML body, or `null` when there is none.
+ * findEntradioTicketDownloadUrl — returns the "STÁHNOUT VSTUPENKY" href
+ * from an Entradio confirmation's HTML body, or `null` when there is none.
+ * Runs against `message.getBody()` (HTML), never `getPlainBody()`.
  *
- * Runs against `message.getBody()` (HTML), never `getPlainBody()`. Note for a
- * future round: the plain-text part DOES also carry the link, rendered as
- * `STÁHNOUT VSTUPENKY ( <url> )`, so a second independent anchor exists if the
- * HTML body ever proves unreliable — it is simply not the owner-scoped source
- * for this round.
+ * `&amp;` in the captured href is decoded back to `&`: an HTML attribute
+ * value is REQUIRED to escape a bare ampersand, and an un-decoded one
+ * would produce a URL that fetches nothing — a silent failure rather than
+ * a visible one.
  *
- * `&amp;` in the captured href is decoded back to `&`. An HTML attribute value
- * is REQUIRED to escape a bare ampersand, and an un-decoded one would produce
- * a URL that fetches nothing — a silent failure rather than a visible one. The
- * real sample's SendGrid URL contains no ampersand at all (SendGrid encodes
- * its own separators as `-2B`/`-2F`), so this is provably a no-op on the
- * observed data and matters only for a variant.
- *
- * Pure, no GAS globals. Never throws: null/undefined/empty input returns null.
+ * Pure, no GAS globals. Never throws: null/undefined/empty input returns
+ * null.
  */
 function findEntradioTicketDownloadUrl(htmlBody) {
   const match = ENTRADIO_TICKET_DOWNLOAD_LINK_PATTERN.exec(String(htmlBody || ''));
@@ -1530,12 +1105,9 @@ function findEntradioTicketDownloadUrl(htmlBody) {
   return match[1].replace(/&amp;/g, '&');
 }
 
-// ENTRADIO_QR_CODE_URL_PREFIX / _SUFFIX — Entradio's own per-seat QR endpoint.
-// NOT INVENTED: the real sample's HTML renders each seat's QR inline as
-// `<img src="https://app.entradio.cz/qrcode?code=TM5X59GM&size=200">`, for
-// exactly the two codes parseEntradioTicketText already extracts into
-// `ticketCodes`. Verified by grepping the decoded HTML directly — the only two
-// app.entradio.cz URLs in the whole message are these two.
+// ENTRADIO_QR_CODE_URL_PREFIX / _SUFFIX — Entradio's own per-seat QR
+// endpoint, matching the codes parseEntradioTicketText extracts into
+// `ticketCodes`.
 const ENTRADIO_QR_CODE_URL_PREFIX = 'https://app.entradio.cz/qrcode?code=';
 const ENTRADIO_QR_CODE_URL_SUFFIX = '&size=200';
 
@@ -1569,27 +1141,20 @@ function entradioNormalizedContentType(contentType) {
 
 /**
  * isEntradioTicketFileResponseAcceptable — the ticket-file download's
- * accept/reject decision, kept pure and separate from the fetch itself so it
- * can be tested exhaustively.
+ * accept/reject decision, kept pure and separate from the fetch itself.
  *
- * ACCEPT: HTTP 200 with any content-type that is not `text/html`.
- * REJECT: anything else.
+ * ACCEPT: HTTP 200 with any content-type that is not `text/html`. REJECT:
+ * anything else.
  *
  * WHY text/html IS THE REJECTION: a SendGrid click wrapper whose token has
- * expired, or a portal that wants a login, answers 200 with an HTML PAGE. That
- * is not a ticket. Saving it to Drive and attaching it to the calendar would
- * look like a success and be worthless at the door — a silently wrong result
- * is strictly worse than a visibly missing one.
+ * expired, or a portal that wants a login, answers 200 with an HTML PAGE.
+ * Saving it to Drive and attaching it to the calendar would look like a
+ * success and be worthless at the door.
  *
- * WHY ANY non-200 IS REJECTED: the fetch runs with `muteHttpExceptions: true`
- * precisely so a 4xx/5xx arrives as a VALUE rather than a throw; this is where
- * that value is judged. `followRedirects: true` means a 3xx reaching here is a
- * redirect chain that did NOT resolve, which is a failure too.
- *
- * The content-type check is deliberately a BLOCKLIST rather than an allowlist:
- * the real format behind this link is UNVERIFIED until live-tested (it may be
- * a PDF, a zip of PDFs, or an image), so rejecting the one known-bad answer
- * beats guessing at the set of good ones. Pure, no GAS globals.
+ * The content-type check is deliberately a BLOCKLIST rather than an
+ * allowlist: the real format behind this link is unverified (it may be a
+ * PDF, a zip, or an image), so rejecting the one known-bad answer beats
+ * guessing at the set of good ones. Pure, no GAS globals.
  */
 function isEntradioTicketFileResponseAcceptable(responseCode, contentType) {
   if (responseCode !== 200) {
@@ -1601,10 +1166,10 @@ function isEntradioTicketFileResponseAcceptable(responseCode, contentType) {
 
 /**
  * isEntradioQrCodeResponseAcceptable — the QR-code fetch's accept/reject
- * decision. STRICTER than the ticket file's, and deliberately so: this
- * endpoint's output format is not a mystery — it is an image, every time.
- * ACCEPT only HTTP 200 with an `image/*` content-type; reject everything else,
- * including an HTML error page served at 200. Pure, no GAS globals.
+ * decision. STRICTER than the ticket file's: this endpoint's format is
+ * known, so it ACCEPTs only HTTP 200 with an `image/*` content-type and
+ * rejects everything else, including an HTML error page served at 200.
+ * Pure, no GAS globals.
  */
 function isEntradioQrCodeResponseAcceptable(responseCode, contentType) {
   if (responseCode !== 200) {
@@ -1628,15 +1193,11 @@ const ENTRADIO_TICKET_FILE_EXTENSIONS_BY_MIME_TYPE = {
 /**
  * entradioFileExtensionForMimeType — the filename extension for a fetched
  * blob's content-type, or `''` when the type is unknown, missing or
- * deliberately generic (`application/octet-stream`).
- *
- * WHY NOT buildTicketAttachmentFilename: that helper hardcodes `.pdf`, which
- * is correct for the three portals whose ticket really is a PDF attachment on
- * the message. The format behind Entradio's download link is UNVERIFIED until
- * the owner live-tests it, so the extension has to come from the response
- * itself. An honest missing suffix beats a confidently wrong one — a `.pdf`
- * that is actually a zip is a file the owner cannot open and cannot diagnose.
- * Pure, no GAS globals, never throws.
+ * generic (`application/octet-stream`). Unlike buildTicketAttachmentFilename
+ * (which hardcodes `.pdf` for the other three portals), Entradio's download
+ * format is not known in advance, so the extension comes from the response
+ * itself — an honest missing suffix beats a confidently wrong one. Pure, no
+ * GAS globals, never throws.
  */
 function entradioFileExtensionForMimeType(contentType) {
   const normalized = entradioNormalizedContentType(contentType);
@@ -1645,23 +1206,20 @@ function entradioFileExtensionForMimeType(contentType) {
 }
 
 /**
- * buildEntradioTicketAttachmentFilename — the downloaded ticket file's name in
- * the permanent Drive folder: `"{event name} - {YYYY-MM-DD} - {order number}"`
- * plus the extension derived from the fetched blob's own content-type, e.g.
- * `"ČERNO, VÍR - 2026-09-27 - 2354152.pdf"`.
+ * buildEntradioTicketAttachmentFilename — the downloaded ticket file's
+ * name in the permanent Drive folder:
+ * `"{event name} - {YYYY-MM-DD} - {order number}"` plus the extension
+ * derived from the fetched blob's own content-type.
  *
- * DELIBERATE DUPLICATION of buildTicketAttachmentFilename's stem rather than
- * delegation to it: that function is on the live attachment path of all three
- * already-working portals, and round 2's whole non-regression claim rests on
- * not touching their code at all. The cost is ~5 duplicated lines; the guard
- * against that cost is a test asserting the two produce the EXACT same name
- * for a PDF, so they cannot drift apart unnoticed.
+ * DELIBERATE DUPLICATION of buildTicketAttachmentFilename's stem rather
+ * than delegation to it, since that function is on the live attachment
+ * path of the three already-working portals — a test asserts the two
+ * produce the EXACT same name for a PDF, so they cannot drift apart
+ * unnoticed.
  *
  * `dateComponents` is any `{ year, month, day }`-shaped object (month
- * zero-indexed) — a full parsed-ticket object works as-is. A falsy
- * `ticketIdentifier` omits its segment entirely rather than embedding the
- * literal word "null", per the live Kino Art round-4 incident
- * buildTicketAttachmentFilename's own JSDoc records. Pure, no GAS globals.
+ * zero-indexed). A falsy `ticketIdentifier` omits its segment entirely
+ * rather than embedding the literal word "null". Pure, no GAS globals.
  */
 function buildEntradioTicketAttachmentFilename(eventName, dateComponents, ticketIdentifier, contentType) {
   const isoDate =
@@ -1684,15 +1242,11 @@ function buildEntradioTicketAttachmentFilename(eventName, dateComponents, ticket
 
 /**
  * buildEntradioQrCodeFilename — one QR image per SEAT, named
- * `"{event name} - QR - {ticket code}.png"`, e.g.
- * `"ČERNO, VÍR - QR - TM5X59GM.png"`.
- *
- * The ticket CODE is what disambiguates the seats: a multi-seat order produces
- * several of these in the same folder, and the code is the only per-seat value
- * guaranteed unique (row/seat numbers repeat across orders). Both components
- * are run through sanitizeTicketAttachmentFilenameComponent. The `.png`
- * extension is fixed rather than derived — unlike the ticket download, this
- * endpoint's format is known. Pure, no GAS globals.
+ * `"{event name} - QR - {ticket code}.png"`. The ticket CODE disambiguates
+ * the seats (the only per-seat value guaranteed unique; row/seat numbers
+ * repeat across orders). The `.png` extension is fixed rather than
+ * derived — unlike the ticket download, this endpoint's format is known.
+ * Pure, no GAS globals.
  */
 function buildEntradioQrCodeFilename(eventName, code) {
   return (
@@ -1704,19 +1258,18 @@ function buildEntradioQrCodeFilename(eventName, code) {
 }
 
 /**
- * fetchEntradioResponseBlob — the SINGLE defensive UrlFetchApp call shared by
- * both fetchers below. Fetches `url`, judges the response with the supplied
- * pure predicate, and returns the response blob or `null`.
+ * fetchEntradioResponseBlob — the SINGLE defensive UrlFetchApp call shared
+ * by both fetchers below. Fetches `url`, judges the response with the
+ * supplied pure predicate, and returns the response blob or `null`.
  *
  * `followRedirects: true` because a SendGrid click wrapper IS a redirect.
  * `muteHttpExceptions: true` because without it a 4xx/5xx THROWS, and this
  * function's entire contract is that it does not.
  *
- * NEVER THROWS. A transport failure, a rejected response, a malformed
- * response object — all become `null` plus one `console.log` line naming the
- * URL, so a failed live run is diagnosable from the Executions log without
- * re-instrumenting anything. GAS-only (UrlFetchApp), but every DECISION it
- * makes lives in the pure predicates it is handed.
+ * NEVER THROWS. A transport failure, a rejected response, or a malformed
+ * response object all become `null` plus one `console.log` line naming
+ * the URL. GAS-only (UrlFetchApp), but every DECISION it makes lives in
+ * the pure predicates it is handed.
  */
 function fetchEntradioResponseBlob(url, isAcceptableResponse, description) {
   try {
@@ -1742,10 +1295,9 @@ function fetchEntradioResponseBlob(url, isAcceptableResponse, description) {
 
 /**
  * fetchEntradioTicketFileBlob — downloads the real ticket file from the
- * "STÁHNOUT VSTUPENKY" URL. Returns the blob, or `null` on any failure or on
- * a response isEntradioTicketFileResponseAcceptable rejects (notably an HTML
- * login/error page served at 200). Never throws. GAS-only (UrlFetchApp, via
- * fetchEntradioResponseBlob).
+ * "STÁHNOUT VSTUPENKY" URL. Returns the blob, or `null` on any failure or
+ * rejected response (notably an HTML login/error page served at 200).
+ * Never throws. GAS-only (via fetchEntradioResponseBlob).
  */
 function fetchEntradioTicketFileBlob(url) {
   return fetchEntradioResponseBlob(url, isEntradioTicketFileResponseAcceptable, 'ticket file');
@@ -1763,16 +1315,14 @@ function fetchEntradioQrCodeBlob(code) {
 
 /**
  * entradioSaveBlobAsAttachment — saves one fetched blob into the EXISTING
- * shared permanent Drive folder (`CONFIG.ticketAttachmentDriveFolderName`, the
- * same folder enigoo.cz / Kino Art / Ticketmaster CZ already use — no new
- * folder, owner-confirmed), renames it, and returns the
- * `{ fileId, fileUrl, title, mimeType }` EventAttachment info for it, or
+ * shared permanent Drive folder (`CONFIG.ticketAttachmentDriveFolderName`
+ * — the same folder enigoo.cz / Kino Art / Ticketmaster CZ already use),
+ * renames it, and returns `{ fileId, fileUrl, title, mimeType }`, or
  * `null` if anything went wrong.
  *
  * The file is RENAMED BEFORE `getName()`/`getUrl()` are read, because a
- * Calendar attachment's displayed title is derived from the Drive file's name
- * AT ATTACH TIME — the same convention buildTicketAttachmentFilename's JSDoc
- * records for the other portals. `getUrl()`/`getName()` are called on the same
+ * Calendar attachment's displayed title is derived from the Drive file's
+ * name AT ATTACH TIME. `getUrl()`/`getName()` are called on the same
  * in-memory File handle rather than re-fetching it by ID.
  *
  * NEVER THROWS. GAS-only (DriveApp via getOrCreateDriveFolderByName).
@@ -1791,39 +1341,36 @@ function entradioSaveBlobAsAttachment(blob, filename, mimeType) {
 }
 
 /**
- * fetchEntradioAttachments — the Entradio-specific attachment ORCHESTRATOR,
- * registered in TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL and
- * called by processTicketFromMessageBody. Returns an ARRAY of
- * `{ fileId, fileUrl, title, mimeType }` EventAttachment infos — the ticket
- * file first (when it was fetched), then one QR code per seat in seat order,
- * which is how they render on the calendar event.
+ * fetchEntradioAttachments — the Entradio-specific attachment
+ * ORCHESTRATOR, registered in
+ * TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL and called by
+ * processTicketFromMessageBody. Returns an ARRAY of
+ * `{ fileId, fileUrl, title, mimeType }` EventAttachment infos — the
+ * ticket file first (when fetched), then one QR code per seat in seat
+ * order.
  *
  * Flow:
- *   1. IF `portal.insertPdfIntoEvent` — find the "STÁHNOUT VSTUPENKY" link in
- *      the message's HTML body, download it, save it to the shared permanent
- *      folder under a name whose extension comes from the response's own
- *      content-type. Skipped entirely when the toggle is off: the link is not
- *      even fetched.
- *   2. UNCONDITIONALLY — for EVERY code in `parsedTicket.ticketCodes`, fetch
- *      that seat's QR image and save it as its own file. Never gated by
- *      `insertPdfIntoEvent` (owner-settled): a QR code is not a PDF, and it is
+ *   1. IF `portal.insertPdfIntoEvent` — find the "STÁHNOUT VSTUPENKY" link
+ *      in the message's HTML body, download it, save it to the shared
+ *      permanent folder. Skipped entirely when the toggle is off.
+ *   2. UNCONDITIONALLY — for EVERY code in `parsedTicket.ticketCodes`,
+ *      fetch that seat's QR image and save it as its own file. Never
+ *      gated by `insertPdfIntoEvent`: a QR code is not a PDF, and it is
  *      the artifact that actually gets the owner through the door.
  *
  * THE CONTRACT IS NEGATIVE AND ABSOLUTE: this function ALWAYS returns an
- * array, possibly `[]`, and NEVER throws. Every individual failure — no link
- * in the body, a dead URL, an HTML login page, Drive unavailable, one seat's
- * QR 500ing while the other succeeds, even `message.getBody()` itself throwing
- * — is caught, logged, and costs exactly one attachment. This is load-bearing:
- * processTicketFromMessageBody calls this BEFORE creating the Calendar event,
- * so anything escaping here would trade the event the owner actually needs for
- * an attachment they can fetch by hand. The owner ruled that trade out
- * explicitly ("Vytvořit událost i tak, jen upozornit e-mailem"), and an
- * empty return is what triggers that notification instead.
+ * array, possibly `[]`, and NEVER throws. Every individual failure is
+ * caught, logged, and costs exactly one attachment. This is load-bearing:
+ * processTicketFromMessageBody calls this BEFORE creating the Calendar
+ * event, so anything escaping here would trade the event the owner
+ * actually needs for an attachment they can fetch by hand — when nothing
+ * can be attached, the event is still created and a separate notification
+ * is sent instead.
  *
- * GAS-only in its I/O (UrlFetchApp/DriveApp/CONFIG), but unit-tested under
- * Node through the same global-injection harness the transport-tickets and ICS
- * actions already use — a negative contract cannot be verified by reading the
- * happy path.
+ * GAS-only in its I/O (UrlFetchApp/DriveApp/CONFIG), but unit-tested
+ * under Node through the same global-injection harness this file's other
+ * GAS-only functions use — a negative contract cannot be verified by
+ * reading the happy path.
  */
 function fetchEntradioAttachments(message, parsedTicket, portal) {
   const attachments = [];
@@ -1898,12 +1445,11 @@ function fetchEntradioAttachments(message, parsedTicket, portal) {
 /**
  * TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL — the local (single-file)
  * registry mapping a BODY-SOURCED ticketing portal's `identifyingEmail`
- * (lowercased, via ticketingExtractEmailAddress) to its email-body parser
- * function (quick-260731-kar) — the body-sourced counterpart to
- * TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL below (PDF/OCR-sourced). Which
- * registry a matching portal's sender resolves against determines which
- * processing mode `resolveTicketProcessingJobs`/`run` route it through
- * (see this file's class-level JSDoc).
+ * (lowercased) to its email-body parser function — the body-sourced
+ * counterpart to TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL below
+ * (PDF/OCR-sourced). Which registry a portal's sender resolves against
+ * determines which processing mode `resolveTicketProcessingJobs`/`run`
+ * route it through.
  */
 const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
   'rezervace@kinoart.cz': parseKinoArtTicketText,
@@ -1913,27 +1459,22 @@ const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
 
 /**
  * TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL — the local (single-file)
- * registry mapping a ticketing portal's `identifyingEmail` (lowercased,
- * via ticketingExtractEmailAddress) to its OCR-text parser function. This
- * is the mechanism that lets ALL portal parsers live in one file (see this
- * file's class-level JSDoc) while still cleanly routing a matched
- * TICKETING_PORTALS config entry to the RIGHT parser — adding a future
- * portal means adding one new parser function plus one new entry here,
- * nothing else.
+ * registry mapping a ticketing portal's `identifyingEmail` (lowercased)
+ * to its OCR-text parser function. This is what lets ALL portal parsers
+ * live in one file while still routing a matched TICKETING_PORTALS entry
+ * to the RIGHT parser — adding a future portal means adding one new
+ * parser function plus one new entry here, nothing else.
  */
 const TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL = {
   'no-reply@enigoo.cz': parseEnigooTicketText,
 };
 
 /**
- * DEFAULT_EVENT_DURATION_MINUTES — the sensible fixed default duration (2
- * hours) added to a parsed ticket's start time when a portal's PDF carries
- * no explicit end time (enigoo.cz never does). This is a per-portal-parser
- * CONCERN, not a mandatory rule: a FUTURE portal whose PDF DOES include an
- * end time should use it directly instead of this shared default — this
- * constant exists so every portal that genuinely needs a default has one
- * consistent, documented value to reach for, not so every future portal is
- * forced through it.
+ * DEFAULT_EVENT_DURATION_MINUTES — the fixed default duration (2 hours)
+ * added to a parsed ticket's start time when a portal's PDF carries no
+ * explicit end time. A per-portal-parser default to reach for, not a rule
+ * every future portal is forced through — a FUTURE portal whose PDF DOES
+ * include an end time should use it directly instead.
  */
 const DEFAULT_EVENT_DURATION_MINUTES = 120;
 
@@ -1944,14 +1485,9 @@ const DEFAULT_EVENT_DURATION_MINUTES = 120;
  * correctly handling hour/day/month/year rollover. Implemented via
  * `Date.UTC` arithmetic purely as a NEUTRAL zero-offset calculation space
  * (never a real UTC instant — the input components carry no timezone
- * information at all, same "wall-clock digits, no real timezone" treatment
- * already established by the booking.com action's formatLocalWallClockIso/
- * buildInstantFromParsedDateLine): build a UTC-labeled millisecond
- * timestamp from the components, add the offset, then re-extract the
- * (rolled-over, if applicable) digits via the UTC getters — this exactly
- * mirrors real calendar/clock arithmetic (23:30 + 2h -> next day 01:30)
- * without ever needing to know or guess a real timezone. Pure, no GAS
- * globals.
+ * information at all): build a UTC-labeled millisecond timestamp, add the
+ * offset, then re-extract the rolled-over digits via the UTC getters.
+ * Pure, no GAS globals.
  */
 function addMinutesToWallClockComponents(components, minutes) {
   const asMs = Date.UTC(components.year, components.month, components.day, components.hour, components.minute) + minutes * 60000;
@@ -1968,10 +1504,9 @@ function addMinutesToWallClockComponents(components, minutes) {
 
 /**
  * zeroPadTicketComponent — left-pads `value` with '0' to `length` digits.
- * Pure, no GAS globals. Tiny internal formatting helper for
- * formatWallClockComponentsIso, deliberately namespaced (not a bare
- * `zeroPad`) per this file's globally-unique-naming convention (the
- * booking.com action already has its own same-purpose `zeroPad`).
+ * Pure, no GAS globals. Internal formatting helper for
+ * formatWallClockComponentsIso, namespaced per this file's
+ * globally-unique-naming convention.
  */
 function zeroPadTicketComponent(value, length) {
   return String(value).padStart(length, '0');
@@ -1983,13 +1518,8 @@ function zeroPadTicketComponent(value, length) {
  * zero-padded literal string `'YYYY-MM-DDTHH:MM:00'` — DELIBERATELY with
  * NO trailing `Z` and NO timezone offset, meant to be paired with an
  * explicit Calendar API `timeZone` field (see this file's class-level
- * "TIMEZONE" doc paragraph) so the API interprets these digits as
- * wall-clock local time in that zone, not UTC. Re-implements the same
- * shape/intent as the booking.com action's formatLocalWallClockIso
- * (which formats FROM a Date, not from already-separated components,
- * since this file's parsers never build an intermediate Date object at
- * all) locally, per this codebase's established one-file-per-action
- * self-containment convention. Pure, no GAS globals.
+ * "TIMEZONE" doc) so the API interprets these digits as wall-clock local
+ * time in that zone, not UTC. Pure, no GAS globals.
  */
 function formatWallClockComponentsIso(components) {
   return (
@@ -2008,10 +1538,9 @@ function formatWallClockComponentsIso(components) {
 
 /**
  * sanitizeTicketAttachmentFilenameComponent — replaces filesystem-unsafe
- * characters (`/ \ ? % * : | " < >`) with `-` and trims whitespace.
- * Google Drive itself doesn't strictly forbid most of these in a
- * filename, but this keeps generated filenames unambiguous and safe to
- * browse/sort regardless. Pure, no GAS globals.
+ * characters (`/ \ ? % * : | " < >`) with `-` and trims whitespace, so
+ * generated filenames stay unambiguous and safe to browse/sort. Pure, no
+ * GAS globals.
  */
 function sanitizeTicketAttachmentFilenameComponent(value) {
   return String(value)
@@ -2021,36 +1550,20 @@ function sanitizeTicketAttachmentFilenameComponent(value) {
 
 /**
  * buildTicketAttachmentFilename — the ATTACHMENT-RENAMING CONVENTION
- * (quick-260731-kar, applies to ALL portals, including a retrofit onto
- * the already-shipped enigoo.cz path — see this file's class-level JSDoc):
- * builds `"{event name} - {YYYY-MM-DD} - {ticket identifier}.pdf"` for
- * the ticket PDF moved into the permanent
- * `CONFIG.ticketAttachmentDriveFolderName` folder, e.g.
- * `"Letní hudební festival - 2026-08-15 - 24601.pdf"` (enigoo.cz) or
- * `"Tajný ostrov - 2026-08-07 - 900142.pdf"` (Kino Art). Uses
- * ISO-style `YYYY-MM-DD` (not a locale-specific date format) so files
- * sort consistently when browsing the Drive folder. Since a Calendar
- * event attachment's displayed `title` is already derived from the
- * file's name AT ATTACH TIME (`uploadedPdfFile.getName()`), renaming the
- * file before it is referenced automatically improves BOTH the Drive
- * folder's browsability AND what shows up on the calendar event — no
- * separate title-setting logic needed, just rename the actual Drive file
- * before its name/URL are read. `dateComponents` is any `{ year, month,
- * day }`-shaped object (month zero-indexed, matching every other
- * date-components object in this file) — a full parsed-ticket object
- * (which also carries `hour`/`minute`) works fine as-is, those extra
- * fields are simply ignored. Pure, no GAS globals.
- *
- * DEFENSIVE NULL-HANDLING (live-test-driven, quick-260731-kar round 4): a
- * real live attachment rename came out as "... - null.pdf" -- naive string
- * concatenation coerced a JS `null` ticketIdentifier argument into the
- * literal 4-character text "null". This is a defensive SECONDARY measure
- * (the primary fix, for THIS incident, was correcting parseKinoArtTicketText's
- * own extraction -- see its own class-level doc) so that any portal parser
- * that genuinely cannot extract a ticketIdentifier (a documented,
- * never-throwing possibility for every portal parser in this file) never
- * embeds the literal word "null" -- the segment is omitted entirely
- * instead.
+ * (applies to ALL portals): builds
+ * `"{event name} - {YYYY-MM-DD} - {ticket identifier}.pdf"` for the
+ * ticket PDF moved into the permanent
+ * `CONFIG.ticketAttachmentDriveFolderName` folder. Uses ISO-style
+ * `YYYY-MM-DD` (not a locale-specific date format) so files sort
+ * consistently when browsing the Drive folder. Since a Calendar event
+ * attachment's displayed `title` is derived from the file's name AT
+ * ATTACH TIME, renaming the file before it is referenced improves BOTH
+ * the Drive folder's browsability AND what shows up on the calendar
+ * event. `dateComponents` is any `{ year, month, day }`-shaped object
+ * (month zero-indexed) — a full parsed-ticket object works fine as-is.
+ * A falsy `ticketIdentifier` omits its segment entirely rather than
+ * embedding the literal word "null" — a naive string concatenation would
+ * otherwise coerce it into that literal text. Pure, no GAS globals.
  */
 function buildTicketAttachmentFilename(eventName, dateComponents, ticketIdentifier) {
   const isoDate =
@@ -2065,19 +1578,14 @@ function buildTicketAttachmentFilename(eventName, dateComponents, ticketIdentifi
   return sanitizeTicketAttachmentFilenameComponent(eventName) + ' - ' + isoDate + ticketIdentifierSegment + '.pdf';
 }
 
-// Node/GAS environment bridge for the Script Properties typed accessor
-// helpers this file's config getter depends on indirectly via
-// TICKETING_PORTALS_ACTION.config, and for TICKETING_PORTALS_ACTION_CONFIG
-// itself (defined in the sibling src/07-action-cfg-ticketing-portals.js —
-// see the 260724-lqi config-split refactor for the full load-order/getter
-// rationale this mirrors). Under GAS's shared global scope this is ALREADY
-// visible here by bare name — no action needed, and this `if` block never
-// executes there. Under Node, each `require()`d file is its own isolated
-// module with its own scope, so the bare `TICKETING_PORTALS_ACTION_CONFIG`
-// reference inside TICKETING_PORTALS_ACTION's `config` getter below would
-// otherwise throw ReferenceError. Same `globalThis` bridge technique
-// already established by the ICS and booking.com action files' own
-// equivalent bridges.
+// Node/GAS environment bridge for TICKETING_PORTALS_ACTION_CONFIG (defined
+// in the sibling src/07-action-cfg-ticketing-portals.js). Under GAS's
+// shared global scope this is ALREADY visible here by bare name -- no
+// action needed, and this `if` block never executes there. Under Node,
+// each `require()`d file is its own isolated module with its own scope, so
+// the bare `TICKETING_PORTALS_ACTION_CONFIG` reference inside
+// TICKETING_PORTALS_ACTION's `config` getter below would otherwise throw
+// ReferenceError.
 if (typeof module !== 'undefined' && module.exports) {
   globalThis.TICKETING_PORTALS_ACTION_CONFIG = require('./07-action-cfg-ticketing-portals.js').TICKETING_PORTALS_ACTION_CONFIG;
 }
@@ -2086,11 +1594,9 @@ if (typeof module !== 'undefined' && module.exports) {
  * getOrCreateDriveFolderByName — finds a Drive folder by NAME (not ID) via
  * `DriveApp.getFoldersByName`, returning the FIRST match if one or more
  * exist, or creating a new folder via `DriveApp.createFolder` if none
- * exist yet. Used for BOTH the fixed-name auto-managed TEMP folder and the
- * owner-configured permanent `CONFIG.ticketAttachmentDriveFolderName`
- * folder — same lookup pattern for both, per the owner's own explicit
- * design. GAS-only (DriveApp) — not unit-tested, proven only by the live
- * checkpoint.
+ * exist yet. Used for BOTH the fixed-name auto-managed TEMP folder and
+ * the permanent `CONFIG.ticketAttachmentDriveFolderName` folder. GAS-only
+ * (DriveApp).
  */
 function getOrCreateDriveFolderByName(name) {
   const existing = DriveApp.getFoldersByName(name);
@@ -2111,7 +1617,7 @@ const TICKETING_TEMP_DRIVE_FOLDER_NAME = 'GAS Email Manager - Temp';
  * isTicketPdfAttachment — true when `attachment`'s name ends in .pdf
  * (case-insensitive) or its content-type is application/pdf. Shared by
  * findTicketPdfAttachments so the matching rule lives in exactly one
- * place, mirroring the ICS action's own isIcsAttachment.
+ * place.
  */
 function isTicketPdfAttachment(attachment) {
   const name = (attachment.getName() || '').toLowerCase();
@@ -2121,8 +1627,8 @@ function isTicketPdfAttachment(attachment) {
 }
 
 /**
- * findTicketPdfAttachments — returns every GmailAttachment on `message`
- * whose name ends in .pdf (case-insensitive) or whose content-type is
+ * findTicketPdfAttachments — every GmailAttachment on `message` whose
+ * name ends in .pdf (case-insensitive) or whose content-type is
  * application/pdf (via isTicketPdfAttachment), in source order, or [] if
  * none match.
  */
@@ -2132,20 +1638,14 @@ function findTicketPdfAttachments(message) {
 
 /**
  * findKinoArtTicketPdfAttachment — Kino Art sends TWO PDF attachments per
- * confirmation email (quick-260731-kar): `Vstupenky.pdf` (the real
- * ticket, one page per seat) and `Doklad.pdf` (a separate receipt/
- * invoice, NOT ticket data — the email body itself says "Tento email
- * není vstupenka", i.e. "this email is not the ticket", confirming
- * `Vstupenky.pdf` is the authoritative ticket). Returns the FIRST
- * qualifying PDF attachment (via findTicketPdfAttachments) whose name
- * contains `"Vstupenky"`, or `null` if none match — this deliberately
- * EXCLUDES `Doklad.pdf` and anything else. SCOPE LIMITATION (deliberate,
- * same "don't guess at an unobserved variant" discipline as
- * KINO_ART_KNOWN_VENUE above): scoped narrowly to the Czech filename
- * actually observed; a hypothetical future English-language Kino Art
- * confirmation with a differently-named attachment would need handling
- * THEN, with real data, not guessed now. Pure, no GAS globals (operates
- * only on the array already produced by findTicketPdfAttachments).
+ * confirmation email: `Vstupenky.pdf` (the real ticket, one page per
+ * seat) and `Doklad.pdf` (a separate receipt/invoice, NOT ticket data —
+ * the email body itself says "Tento email není vstupenka", confirming
+ * `Vstupenky.pdf` is authoritative). Returns the FIRST qualifying PDF
+ * attachment whose name contains `"Vstupenky"`, or `null` — deliberately
+ * EXCLUDES `Doklad.pdf`. SCOPE LIMITATION: scoped narrowly to the Czech
+ * filename actually observed; a differently-named attachment would need
+ * handling THEN, with real data. Pure, no GAS globals.
  */
 function findKinoArtTicketPdfAttachment(message) {
   const pdfAttachments = findTicketPdfAttachments(message);
@@ -2162,18 +1662,12 @@ function findKinoArtTicketPdfAttachment(message) {
 
 /**
  * findTicketmasterCzTicketPdfAttachment — Ticketmaster CZ's own
- * ticket-PDF finder for the OPTIONAL `insertPdfIntoEvent` attachment path
- * (round 2, quick-260816-ocw — see parseTicketmasterCzTicketText's own
- * class-level "ROUND 2 AMENDMENT" doc). The real observed email carries
- * exactly one PDF attachment, filename `eTicket.pdf`
- * (Content-Disposition: attachment, application/pdf). Returns the FIRST
- * qualifying PDF attachment (via findTicketPdfAttachments) whose name
- * contains `"eTicket"`, or `null` if none match — same "match by the
- * literal filename substring actually observed" discipline as
- * findKinoArtTicketPdfAttachment above. SCOPE LIMITATION (deliberate, same
- * "don't guess at an unobserved variant" discipline as that function): a
- * hypothetical future Ticketmaster CZ confirmation with a differently-named
- * attachment would need handling THEN, with real data, not guessed now.
+ * ticket-PDF finder for the OPTIONAL `insertPdfIntoEvent` attachment
+ * path. The real observed email carries exactly one PDF attachment,
+ * filename `eTicket.pdf`. Returns the FIRST qualifying PDF attachment
+ * whose name contains `"eTicket"`, or `null` — same discipline as
+ * findKinoArtTicketPdfAttachment above. SCOPE LIMITATION: a
+ * differently-named attachment would need handling THEN, with real data.
  * Pure, no GAS globals.
  */
 function findTicketmasterCzTicketPdfAttachment(message) {
@@ -2192,24 +1686,21 @@ function findTicketmasterCzTicketPdfAttachment(message) {
 /**
  * TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL — the local
  * (single-file) registry mapping a BODY-SOURCED ticketing portal's
- * `identifyingEmail` to its own ticket-PDF-finder function
- * (quick-260731-kar) — mirrors TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL's
- * own per-portal keying convention exactly, kept as a SEPARATE registry
- * (rather than hardcoding Kino Art's own finder directly inside
+ * `identifyingEmail` to its own ticket-PDF-finder function, kept as a
+ * SEPARATE registry (rather than hardcoding a finder directly inside
  * processTicketFromMessageBody) so a future body-sourced portal can
  * register its own finder the same way a future PDF-sourced portal
  * registers its own text parser.
  */
-// DELIBERATE ABSENCE (debug/entradio-portal-not-supported): there is NO
-// 'no-reply@app.entradio.cz' key here, and that is a decision rather than an
-// omission -- an Entradio confirmation has no ticket PDF to find. Its only
-// attachment is the venue's terms and conditions (VOP_Metropol.pdf), so a
-// finder registered here could only ever attach the wrong document. A test
-// pins this absence. Entradio's real tickets are not ON the message at all,
-// which is exactly why round 2 gave it an entry in the SEPARATE
-// TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL registry below
-// instead -- see that registry's JSDoc for why fetching and finding are kept
-// apart.
+// DELIBERATE ABSENCE: there is NO 'no-reply@app.entradio.cz' key here, and
+// that is a decision rather than an omission -- an Entradio confirmation
+// has no ticket PDF to find. Its only attachment is the venue's terms and
+// conditions, so a finder registered here could only ever attach the
+// wrong document. A test pins this absence. Entradio's real tickets are
+// not ON the message at all, which is why it has an entry in the SEPARATE
+// TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL registry
+// instead -- see that registry's JSDoc for why fetching and finding are
+// kept apart.
 const TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL = {
   'rezervace@kinoart.cz': findKinoArtTicketPdfAttachment,
   'noreply@ticketmaster.cz': findTicketmasterCzTicketPdfAttachment,
@@ -2218,33 +1709,65 @@ const TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL = {
 /**
  * TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL — the local
  * (single-file) registry mapping a BODY-SOURCED ticketing portal's
- * `identifyingEmail` to a function that FETCHES its Calendar attachments from
- * somewhere other than the message itself (debug/entradio-portal-not-supported,
- * round 2). Signature:
+ * `identifyingEmail` to a function that FETCHES its Calendar attachments
+ * from somewhere other than the message itself. Signature:
  * `(message, parsedTicket, portal) -> [{ fileId, fileUrl, title, mimeType }]`.
  *
- * DISTINCT FROM TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL above, and
- * deliberately a second registry rather than an extension of that one. A
+ * DISTINCT FROM TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL above,
+ * deliberately a second registry rather than an extension of that one: a
  * "finder" picks the right attachment OFF THE MESSAGE — a pure, offline,
- * always-cheap operation. A "fetcher" goes out over the NETWORK. Those are
- * different enough in cost, failure modes and required OAuth scope that
- * collapsing them would hide which portals make outbound calls; keeping them
- * apart means the answer is `Object.keys` on this object.
+ * always-cheap operation — while a "fetcher" goes out over the NETWORK and
+ * needs an extra OAuth scope. Keeping them apart is what makes "which
+ * portals make outbound calls" answerable via `Object.keys` on this
+ * object. A portal may register in BOTH: processTicketFromMessageBody
+ * runs the finder path first, then CONCATENATES this fetcher's results.
  *
- * A portal may register in BOTH: processTicketFromMessageBody runs the finder
- * path first (unchanged) and then CONCATENATES this fetcher's results. Today
- * only Entradio registers here, and only Entradio makes outbound HTTP calls —
- * a test pins that this object has exactly one key, so the three pre-existing
- * portals cannot acquire network behaviour by accident.
- *
- * A fetcher registered here MUST never throw and MUST always return an array
- * (see fetchEntradioAttachments' own JSDoc for why that contract is absolute):
- * it is called BEFORE the Calendar event is created, and an attachment failure
- * must never be able to cost the owner the event.
+ * A fetcher registered here MUST never throw and MUST always return an
+ * array: it is called BEFORE the Calendar event is created, and an
+ * attachment failure must never be able to cost the owner the event.
  */
 const TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL = {
   'no-reply@app.entradio.cz': fetchEntradioAttachments,
 };
+
+/**
+ * TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL — the local registry
+ * mapping a BODY-SOURCED portal's `identifyingEmail` (lowercased) to a
+ * never-throwing predicate over `message.getPlainBody()`, keyed the same way as
+ * TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL. Consulted by BOTH job-admission
+ * gates (resolveTicketProcessingJobs and TICKETING_PORTALS_ACTION.appliesTo).
+ *
+ * WHY (debug/ticketmaster-cz-order-confirm): a sender address identifies a
+ * PORTAL, not a TEMPLATE. Ticketmaster CZ sends a purchase confirmation AND a
+ * ticket-details email from one address; admitting on sender alone meant the
+ * confirmation was parsed as a ticket and threw, emailing the owner a spurious
+ * failure notification for entirely routine mail.
+ *
+ * FAIL-OPEN BY DESIGN, and deliberately UNLIKE the fail-closed equivalent in
+ * src/10-action-meetings.js: a portal with NO entry here is admitted exactly as
+ * before. This fix is owner-scoped to Ticketmaster CZ; Kino Art and Entradio
+ * have unverified variants, and fail-closed would silently stop processing them.
+ * Registering a detector is therefore an OPT-IN per portal, pinned by tests so
+ * the default stays a decision rather than an accident.
+ */
+const TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL = {
+  'noreply@ticketmaster.cz': ticketmasterCzTextHasOrderDetails,
+};
+
+/**
+ * ticketBodyLooksProcessable — the shared body-content gate behind both
+ * admission points. Returns true when `senderKey` has no registered detector
+ * (fail-open, see the registry's JSDoc), otherwise the detector's verdict on
+ * `message.getPlainBody()`. Pure, no GAS globals.
+ */
+function ticketBodyLooksProcessable(message, senderKey) {
+  const detector = TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL[senderKey];
+  if (!detector) {
+    return true;
+  }
+
+  return detector(message.getPlainBody()) === true;
+}
 
 /**
  * resolveTicketProcessingJobs — the pure, TESTABLE extraction of `run`'s
@@ -2252,9 +1775,7 @@ const TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL = {
  * message-like objects exposing `getFrom()`/`getAttachments()` — GAS
  * `GmailMessage` objects in production, plain duck-typed fakes in tests)
  * and `portals` (the TICKETING_PORTALS config array), returns an array of
- * processing jobs, EACH TAGGED WITH A `mode` (quick-260731-kar — see this
- * file's class-level JSDoc for the full TWO-PROCESSING-MODE
- * architecture):
+ * processing jobs, EACH TAGGED WITH A `mode`:
  *   - `{ mode: 'pdf', attachment, portal }` — ONE JOB PER QUALIFYING PDF
  *     ATTACHMENT, for a portal whose sender resolves against
  *     TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL (PDF/OCR-sourced, e.g.
@@ -2263,40 +1784,22 @@ const TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL = {
  *     MESSAGE, for a portal whose sender resolves against
  *     TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL (body-sourced, e.g. Kino
  *     Art) — the ticket data comes from the body itself, once per
- *     message, never per attachment (a body-sourced portal has no
- *     "per-attachment" concept for its actual event data at all).
+ *     message, never per attachment.
  * A message whose sender does not resolve to any configured portal, or
  * whose portal resolves to neither registry, or (for a PDF-sourced
  * portal) carries no qualifying PDF attachment, contributes NO jobs.
  * Pure, no GAS globals — every GAS-shaped method call here is invoked ON
- * THE PASSED-IN objects only, never a real global service, so this is
- * fully unit-testable under Node with fake message/attachment objects.
+ * THE PASSED-IN objects only, so this is fully unit-testable under Node
+ * with fake message/attachment objects.
  *
- * CORRECTED (live-test-driven, quick-260731-tix round 9 — see this file's
- * class-level "ONE-EVENT-PER-PURCHASE" doc for the full corrected
- * incident writeup): round 8 introduced `selectPrimaryTicketPdfAttachment`
- * (processing only the FIRST qualifying PDF attachment per message), on
- * the claimed basis that the real enigoo.cz email attaches its 2-ticket
- * purchase as TWO SEPARATE PDF files. That claim was WRONG — independently
- * re-parsing the real raw `.eml`'s actual MIME structure confirmed exactly
- * ONE `application/pdf` part (a single PDF with 2 internal pages, not two
- * separate file attachments). `selectPrimaryTicketPdfAttachment` has been
- * REMOVED: restricting to "only the first attachment" was never the right
- * fix for this real email (which only ever had one attachment to begin
- * with, so it changed nothing here) and would have been a REAL
- * correctness regression for a legitimate future scenario — a portal
- * that genuinely emails multiple DIFFERENT purchases as separate PDF
- * attachments in ONE message would have silently had every attachment
- * after the first dropped entirely, never processed at all. The `mode:
- * 'pdf'` branch below processes EVERY qualifying attachment again (its
- * original, pre-round-8 behavior). The one guarantee this codebase
- * actually needs — "the SAME purchase never gets a second calendar
- * event" — is provided entirely by the DEDUP SAFETY NET (ticketIdentifier
- * tag + findTicketEventByIdentifier, shared by BOTH processing modes via
+ * The `mode: 'pdf'` branch processes EVERY qualifying PDF attachment on a
+ * message, never just the first. The one guarantee this codebase actually
+ * needs — "the SAME purchase never gets a second calendar event" — is
+ * provided entirely by the DEDUP SAFETY NET (ticketIdentifier tag +
+ * findTicketEventByIdentifier, shared by BOTH processing modes via
  * isDuplicateTicketPurchase), which checks real calendar state before
  * every write and is correct regardless of how many messages/attachments/
- * re-runs ever trigger processing — unlike trying to guess which
- * attachment(s) to trust as "primary" ahead of time.
+ * re-runs ever trigger processing.
  */
 function resolveTicketProcessingJobs(messages, portals) {
   const list = messages || [];
@@ -2316,7 +1819,7 @@ function resolveTicketProcessingJobs(messages, portals) {
       for (let j = 0; j < pdfAttachments.length; j++) {
         jobs.push({ mode: 'pdf', attachment: pdfAttachments[j], portal: portal });
       }
-    } else if (TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL[senderKey]) {
+    } else if (TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL[senderKey] && ticketBodyLooksProcessable(message, senderKey)) {
       jobs.push({ mode: 'body', message: message, portal: portal });
     }
   }
@@ -2325,27 +1828,18 @@ function resolveTicketProcessingJobs(messages, portals) {
 }
 
 /**
- * findTicketEventByIdentifier — the DEDUP SAFETY NET's lookup (live-test-
- * driven, quick-260731-tix round 8 — see this file's class-level
- * "ONE-EVENT-PER-PURCHASE" doc for the full double-booking incident this
- * resolves): searches `calendarId` for an existing event already tagged
- * with `extendedProperties.private.ticketIdentifier` equal to
- * `ticketIdentifier`, mirroring the booking.com action's own
- * findEventByConfirmationTag EXACT-match query shape
- * (src/06-action-booking-com-management.js) — self-contained per this
- * codebase's one-file-per-action convention (no cross-file reuse):
+ * findTicketEventByIdentifier — the DEDUP SAFETY NET's lookup: searches
+ * `calendarId` for an existing event already tagged with
+ * `extendedProperties.private.ticketIdentifier` equal to
+ * `ticketIdentifier`:
  * `Calendar.Events.list(calendarId, { privateExtendedProperty:
  * 'ticketIdentifier=' + ticketIdentifier, singleEvents: true })`.
- * Deliberately NOT paginated (unlike booking.com's own
- * listCalendarEventsPaginated) and NOT time-windowed (unlike booking.com's
- * date-range bounding): a `privateExtendedProperty` filter against a
- * near-certainly-unique per-purchase ticket number is already an EXACT
- * match expected to return 0 or 1 events, so neither booking.com's
- * pagination helper nor its fuzzy hotel-name+date-overlap fallback layer
- * is needed for this portal's simpler use case. Returns the first matching
- * event, or `null` if none found. GAS-only (Calendar global) — not
- * unit-tested, proven only by the live checkpoint, same category as every
- * other GAS-only function in this file.
+ * Deliberately NOT paginated and NOT time-windowed: a
+ * `privateExtendedProperty` filter against a near-certainly-unique
+ * per-purchase ticket number is already an EXACT match expected to return
+ * 0 or 1 events. Returns the first matching event, or `null` if none
+ * found. GAS-only (Calendar global) — not unit-tested, proven only by the
+ * live checkpoint.
  */
 function findTicketEventByIdentifier(ticketIdentifier, calendarId) {
   const response = Calendar.Events.list(calendarId, {
@@ -2357,20 +1851,17 @@ function findTicketEventByIdentifier(ticketIdentifier, calendarId) {
 }
 
 /**
- * isDuplicateTicketPurchase — the DEDUP SAFETY NET's SHARED decision
- * (factored out, quick-260731-kar, so BOTH processing modes — PDF-sourced
+ * isDuplicateTicketPurchase — the DEDUP SAFETY NET's SHARED decision,
+ * factored out so BOTH processing modes (PDF-sourced
  * `processTicketPdfAttachment` and body-sourced
- * `processTicketFromMessageBody` — use the EXACT same check, never
- * duplicated logic, per the coordinator's explicit "don't duplicate that
- * logic, factor it so both paths share it" instruction). Returns `true`
- * (and logs the same "already exists, not a duplicate path" message this
- * codebase has used since round 8) when `ticketIdentifier` is truthy AND
- * an event already carries that exact tag on `calendarId`. Returns
- * `false` when `ticketIdentifier` is falsy (a portal parser that could
- * not extract one simply does not get this protection — a documented
- * per-parser limitation, not a silent gap) or no matching event is
- * found. GAS-only (calls findTicketEventByIdentifier, which touches the
- * Calendar global) — not unit-tested, proven only by the live checkpoint.
+ * `processTicketFromMessageBody`) use the EXACT same check, never
+ * duplicated logic. Returns `true` (and logs "already exists, not a
+ * duplicate path") when `ticketIdentifier` is truthy AND an event already
+ * carries that exact tag on `calendarId`. Returns `false` when
+ * `ticketIdentifier` is falsy (a documented per-parser limitation, not a
+ * silent gap) or no matching event is found. GAS-only (calls
+ * findTicketEventByIdentifier) — not unit-tested, proven only by the live
+ * checkpoint.
  */
 function isDuplicateTicketPurchase(ticketIdentifier, calendarId) {
   if (!ticketIdentifier) {
@@ -2395,32 +1886,21 @@ function isDuplicateTicketPurchase(ticketIdentifier, calendarId) {
  * `{ resource, optionalArgs }` ready to hand to `Calendar.Events.insert`.
  * Touches no GAS global at all.
  *
- * EXTRACTED IN ROUND 2 (debug/entradio-portal-not-supported) for one specific
- * reason: round 2 changes createTicketCalendarEvent's third parameter from a
- * single `attachmentInfo` object to an ARRAY, which puts all three
- * already-live portals' attachment path in the blast radius. Splitting the
- * pure resource-building out makes that blast radius PROVABLE rather than
- * merely reviewable — a test pins that a ONE-ELEMENT array with
- * `mimeType: 'application/pdf'` produces byte-for-byte the resource the old
- * single-object code produced, which is exactly what enigoo.cz, Kino Art and
- * Ticketmaster CZ now pass.
- *
  * ATTACHMENTS: `[]`, `null` and `undefined` all mean "no attachments" — no
  * `attachments` key is added to the resource and `supportsAttachments` is
- * never set, i.e. the unchanged no-attachment behaviour. Each entry keeps its
- * OWN `mimeType` (round 2 stopped hardcoding `'application/pdf'` here,
- * because Entradio's QR codes are `image/png` and its downloaded ticket file's
- * real format is not known until it has been fetched). Order is preserved.
+ * never set. Each entry keeps its OWN `mimeType` (Entradio's QR codes are
+ * `image/png`, its downloaded ticket file's format is not known until
+ * fetched). Order is preserved.
  *
- * Two Calendar API v3 facts are load-bearing here, both established by a real
- * live bug (see this file's class-level "round 7" doc): `fileUrl` is REQUIRED
- * on every `attachments[]` entry (`fileId` alone is not sufficient — it is
- * read-only on the EventAttachment schema and the server derives it FROM the
- * URL), and `events.insert` must be called with `supportsAttachments: true`
- * or the whole `attachments` array is SILENTLY dropped rather than erroring.
+ * Two Calendar API v3 facts are load-bearing here: `fileUrl` is REQUIRED
+ * on every `attachments[]` entry (`fileId` alone is not sufficient — it
+ * is read-only on the EventAttachment schema and the server derives it
+ * FROM the URL), and `events.insert` must be called with
+ * `supportsAttachments: true` or the whole `attachments` array is
+ * SILENTLY dropped rather than erroring.
  *
- * TIMEZONE is passed IN rather than resolved here, which is what keeps this
- * function pure — its caller does the one `CalendarApp` round-trip.
+ * TIMEZONE is passed IN rather than resolved here, which is what keeps
+ * this function pure — its caller does the one `CalendarApp` round-trip.
  */
 function buildTicketCalendarEventResource(parsedTicket, timeZone, attachments) {
   const startComponents = {
@@ -2439,12 +1919,10 @@ function buildTicketCalendarEventResource(parsedTicket, timeZone, attachments) {
     end: { dateTime: formatWallClockComponentsIso(endComponents), timeZone: timeZone },
   };
 
-  // description (ROUND 2, quick-260816-ocw): OPTIONAL, backward-compatible.
-  // Ticketmaster CZ's and Entradio's parsers set `parsedTicket.description` —
-  // enigoo.cz's and Kino Art's own parsed-ticket objects never carry this
-  // field, so `parsedTicket.description` is `undefined` (falsy) for them
-  // and this line is a no-op, leaving their created events' description
-  // exactly as before.
+  // description: OPTIONAL, backward-compatible. Only Ticketmaster CZ's and
+  // Entradio's parsers set `parsedTicket.description` -- enigoo.cz's and
+  // Kino Art's own parsed-ticket objects never carry this field, so this
+  // line is a no-op for them, leaving their events' description untouched.
   if (parsedTicket.description) {
     resource.description = parsedTicket.description;
   }
@@ -2472,25 +1950,19 @@ function buildTicketCalendarEventResource(parsedTicket, timeZone, attachments) {
 }
 
 /**
- * createTicketCalendarEvent — the SHARED Calendar event build+insert step
- * (factored out, quick-260731-kar, so BOTH processing modes share identical
- * event-shape/tagging/attachment logic, never duplicated). Now a THIN GAS
- * wrapper around buildTicketCalendarEventResource (see its JSDoc): the only
- * two things left here are the one live timezone lookup and the insert call.
+ * createTicketCalendarEvent — the SHARED Calendar event build+insert step,
+ * factored out so BOTH processing modes share identical
+ * event-shape/tagging/attachment logic, never duplicated. A THIN GAS
+ * wrapper around buildTicketCalendarEventResource: the only two things
+ * left here are the one live timezone lookup and the insert call.
  *
- * TIMEZONE derived live from the RESOLVED target calendar, never a hardcoded
- * assumption, same principle as the booking.com action.
+ * TIMEZONE derived live from the RESOLVED target calendar, never a
+ * hardcoded assumption. `attachments` is an ARRAY — every call site
+ * passes a list of `{ fileId, fileUrl, title, mimeType }` entries.
  *
- * SIGNATURE CHANGE (round 2, debug/entradio-portal-not-supported): the third
- * parameter is now an `attachments` ARRAY, not a single `attachmentInfo`
- * object. Both pre-existing call sites pass a one-element array with
- * `mimeType: 'application/pdf'`, which buildTicketCalendarEventResource turns
- * into exactly the resource they produced before — a pinned, tested
- * equivalence, not an assumed one.
- *
- * GAS-only (CalendarApp/Calendar globals) — not unit-tested, proven only by
- * the live checkpoint; everything it decides IS unit-tested, in the pure
- * builder.
+ * GAS-only (CalendarApp/Calendar globals) — not unit-tested, proven only
+ * by the live checkpoint; everything it decides IS unit-tested, in the
+ * pure builder.
  */
 function createTicketCalendarEvent(parsedTicket, calendarId, attachments) {
   const timeZone = CalendarApp.getCalendarById(calendarId).getTimeZone();
@@ -2510,43 +1982,28 @@ function createTicketCalendarEvent(parsedTicket, calendarId, attachments) {
  * addMinutesToWallClockComponents, formatWallClockComponentsIso) IS fully
  * unit-tested.
  *
- * STEP ORDER CHANGED (live-test-driven, quick-260731-tix round 8): parsing
- * (originally step 7) now happens IMMEDIATELY after the OCR read, BEFORE
- * the move-to-permanent-folder-or-delete decision (originally step 6) —
- * necessary because the DEDUP SAFETY NET below needs `parsedTicket.
- * ticketIdentifier` to decide whether this run should even move/attach the
- * PDF at all. If a duplicate is found, the temp PDF is simply deleted
- * (never moved to the permanent folder, never re-attached) and the
- * function returns before any Calendar write — "do NOT re-upload/
- * re-attach the PDF again" for an already-existing purchase.
+ * Parsing happens IMMEDIATELY after the OCR read, BEFORE the
+ * move-to-permanent-folder-or-delete decision, because the DEDUP SAFETY
+ * NET needs `parsedTicket.ticketIdentifier` to decide whether this run
+ * should even move/attach the PDF at all. If a duplicate is found, the
+ * temp PDF is simply deleted (never moved to the permanent folder, never
+ * re-attached) and the function returns before any Calendar write.
  *
- * ORPHANED TEMP-PDF FIX (live-test-driven, quick-260731-tix round 10): the
- * owner reported ticket PDFs staying in the TEMP Drive folder forever. Root
- * cause: `uploadedPdfFile`'s fate (moved to the permanent folder, or
- * trashed via the dedup-skip / insertPdfIntoEvent-false paths) was only
- * ever decided on the explicit success paths below — unlike the
- * OCR-converted Doc (which already had a `try/finally` guaranteeing
- * cleanup regardless of outcome), nothing guaranteed `uploadedPdfFile`
- * itself got cleaned up if `parseTicketText` threw (a real, frequently-hit
- * failure mode during this feature's live testing), or if anything
- * downstream (calendar resolution, the Calendar API call) threw. Fixed
- * with a `pdfFateResolved` flag set `true` at each of the three points
- * where the PDF's fate is explicitly decided, and a `finally` block
- * wrapping everything from upload through the Calendar API call that
- * trashes the file as a FALLBACK safety net only when that flag is still
- * `false` — never touching a file whose fate (moved to the permanent
- * folder as a live Calendar attachment, or already trashed) was already
- * correctly decided. This does NOT retroactively clean up PDFs already
- * orphaned by EARLIER failed live-test runs before this fix landed — see
- * the checkpoint notes for that manual cleanup step.
+ * `uploadedPdfFile`'s fate (moved to the permanent folder, or trashed via
+ * the dedup-skip / insertPdfIntoEvent-false paths) is tracked by a
+ * `pdfFateResolved` flag set `true` at each of the three points where the
+ * PDF's fate is explicitly decided, with a `finally` block wrapping
+ * everything from upload through the Calendar API call that trashes the
+ * file as a FALLBACK safety net only when that flag is still `false` —
+ * this is what guarantees a temp PDF is never left orphaned when
+ * `parseTicketText` throws or anything downstream (calendar resolution,
+ * the Calendar API call) throws.
  */
 function processTicketPdfAttachment(attachment, portal) {
   // Resolved ONCE at the top and threaded explicitly through every
-  // downstream Calendar API call site below (mirroring the booking.com
-  // action's own established `calendarId` resolution convention) rather
-  // than each call site independently re-reading `portal.calendarId` —
-  // see resolveTicketingCalendarId's own JSDoc for the real live bug this
-  // fixes.
+  // downstream Calendar API call site below, rather than each call site
+  // independently re-reading `portal.calendarId` -- see
+  // resolveTicketingCalendarId's own JSDoc.
   const calendarId = resolveTicketingCalendarId(portal, CONFIG.calendarId);
 
   const tempFolder = getOrCreateDriveFolderByName(TICKETING_TEMP_DRIVE_FOLDER_NAME);
@@ -2557,8 +2014,7 @@ function processTicketPdfAttachment(attachment, portal) {
   // insertPdfIntoEvent move, insertPdfIntoEvent-false trash). The
   // surrounding try/finally's fallback cleanup only ever acts when this is
   // still false, i.e. something threw before any of those points were
-  // reached -- see this function's own class-level "ORPHANED TEMP-PDF FIX"
-  // doc above.
+  // reached.
   let pdfFateResolved = false;
 
   try {
@@ -2588,17 +2044,11 @@ function processTicketPdfAttachment(attachment, portal) {
     }
     const parsedTicket = parseTicketText(extractedText);
 
-    // DEDUP SAFETY NET (defense in depth, live-test-driven, quick-260731-tix
-    // round 8, kept unchanged by the round-9 correction, and factored out
-    // in quick-260731-kar so BOTH processing modes share the exact same
-    // check -- mirrors the booking.com action's own proven
-    // findOrTagMatchingEvent/handleConfirmation pattern): if this ticket's
-    // parser could extract a stable ticketIdentifier, check whether an
-    // event already carries that exact tag before doing anything else --
-    // this is the layer that actually prevents the duplicate, regardless
-    // of WHY a second processing attempt occurs (see this file's
-    // class-level "REAL DOUBLE-BOOKING INCIDENT" doc for the corrected
-    // root-cause writeup).
+    // DEDUP SAFETY NET: if this ticket's parser could extract a stable
+    // ticketIdentifier, check whether an event already carries that exact
+    // tag before doing anything else -- this is the layer that actually
+    // prevents the duplicate, regardless of WHY a second processing
+    // attempt occurs.
     if (isDuplicateTicketPurchase(parsedTicket.ticketIdentifier, calendarId)) {
       uploadedPdfFile.setTrashed(true);
       pdfFateResolved = true;
@@ -2607,13 +2057,9 @@ function processTicketPdfAttachment(attachment, portal) {
 
     // Step 6: move the original PDF to the permanent folder (keeping its
     // file ID for the Calendar attachment below) when insertPdfIntoEvent is
-    // true, or delete it from the temp folder entirely when false — nothing
-    // is left in EITHER Drive folder when this toggle is off.
-    // ROUND 2 (debug/entradio-portal-not-supported): an ARRAY now, since
-    // createTicketCalendarEvent takes a list. This path still produces AT MOST
-    // ONE entry, and it carries the same 'application/pdf' mimeType that
-    // function used to hardcode -- byte-for-byte unchanged behaviour for
-    // enigoo.cz, pinned by a test on buildTicketCalendarEventResource.
+    // true, or delete it from the temp folder entirely when false --
+    // nothing is left in EITHER Drive folder when this toggle is off.
+    // `attachments` is an array; this path produces AT MOST ONE entry.
     let attachments = [];
     if (portal.insertPdfIntoEvent) {
       const permanentFolder = getOrCreateDriveFolderByName(CONFIG.ticketAttachmentDriveFolderName);
@@ -2626,11 +2072,10 @@ function processTicketPdfAttachment(attachment, portal) {
       // the file's name AT THIS POINT.
       uploadedPdfFile.setName(buildTicketAttachmentFilename(parsedTicket.eventName, parsedTicket, parsedTicket.ticketIdentifier));
       // getUrl()/getName() are called on the SAME in-memory File object
-      // already moved (and now renamed) above (not a fresh
-      // DriveApp.getFileById lookup) -- moveTo()/setName() only change the
-      // file's parent folder/name, the object reference itself remains
-      // valid, so a second Drive round-trip to re-fetch a file we already
-      // have a live handle to is unnecessary.
+      // already moved (and now renamed) above, not a fresh
+      // DriveApp.getFileById lookup -- the object reference remains valid
+      // after moveTo()/setName(), so a second Drive round-trip is
+      // unnecessary.
       attachments = [
         {
           fileId: uploadedPdfFile.getId(),
@@ -2644,15 +2089,13 @@ function processTicketPdfAttachment(attachment, portal) {
       pdfFateResolved = true;
     }
 
-    // Step 8: build and insert the Calendar event via the SHARED helper
-    // (factored out, quick-260731-kar, so both processing modes build the
-    // identical event resource/tagging/attachment shape).
+    // Step 8: build and insert the Calendar event via the SHARED helper, so
+    // both processing modes build the identical event
+    // resource/tagging/attachment shape.
     //
-    // DIAGNOSTIC VISIBILITY (quick-260731-kar round 2 -- see
-    // processTicketFromMessageBody's own matching log for the full
-    // rationale): symmetric log line so a "no event created, no error"
-    // outcome is distinguishable in the Executions log the same way for
-    // BOTH processing modes.
+    // DIAGNOSTIC VISIBILITY: symmetric log line so a "no event created, no
+    // error" outcome is distinguishable in the Executions log the same way
+    // for BOTH processing modes.
     console.log(
       'Ticketing portal: creating calendar event for "' + parsedTicket.eventName + '" (ticketIdentifier=' +
         parsedTicket.ticketIdentifier + ') on calendar ' + calendarId + '.'
@@ -2663,10 +2106,7 @@ function processTicketPdfAttachment(attachment, portal) {
       // Best-effort fallback cleanup -- do not let a cleanup failure mask
       // whatever original exception is already propagating (parsing
       // errors, missing OAuth scopes, calendar resolution failures, the
-      // Calendar API call itself, etc. -- exactly the kind of real
-      // failures this feature hit repeatedly during live testing, each of
-      // which previously left an orphaned PDF behind in the temp folder
-      // forever).
+      // Calendar API call itself, etc.).
       try {
         uploadedPdfFile.setTrashed(true);
       } catch (cleanupError) {
@@ -2677,14 +2117,11 @@ function processTicketPdfAttachment(attachment, portal) {
 }
 
 /**
- * processTicketFromMessageBody — the BODY-SOURCED processing mode
- * (quick-260731-kar, alongside the existing PDF/OCR-sourced
- * processTicketPdfAttachment above): for a portal whose event data comes
- * entirely from the email BODY (`message.getPlainBody()` — the SAME
- * method the booking.com action already uses), never from a PDF at all.
- * The Drive/OCR pipeline built for enigoo.cz is NOT used here in any way
- * — see this file's class-level JSDoc for the full two-processing-mode
- * architecture. Flow:
+ * processTicketFromMessageBody — the BODY-SOURCED processing mode,
+ * alongside the existing PDF/OCR-sourced processTicketPdfAttachment
+ * above: for a portal whose event data comes entirely from the email BODY
+ * (`message.getPlainBody()`), never from a PDF at all. The Drive/OCR
+ * pipeline built for enigoo.cz is NOT used here in any way. Flow:
  *   1. Parse the plain body text via the matched portal's body parser
  *      (TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL).
  *   2. DEDUP SAFETY NET (shared with the PDF-sourced mode via
@@ -2692,35 +2129,30 @@ function processTicketPdfAttachment(attachment, portal) {
  *      Drive/Calendar writes at all.
  *   3. If `insertPdfIntoEvent` is true: find the portal's own ticket PDF
  *      among the message's attachments (via
- *      TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL, e.g.
- *      findKinoArtTicketPdfAttachment), and MOVE IT DIRECTLY into the
- *      PERMANENT CONFIG.ticketAttachmentDriveFolderName folder —
- *      skipping BOTH the temp-folder upload AND the Drive-to-Docs OCR
- *      conversion entirely, since this mode never needs the PDF's TEXT,
- *      only the file itself as an attachment. Renamed via
+ *      TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL), and MOVE IT
+ *      DIRECTLY into the PERMANENT CONFIG.ticketAttachmentDriveFolderName
+ *      folder — skipping BOTH the temp-folder upload AND the
+ *      Drive-to-Docs OCR conversion entirely, since this mode never needs
+ *      the PDF's TEXT, only the file itself as an attachment. Renamed via
  *      buildTicketAttachmentFilename, same convention as the PDF-sourced
  *      mode. If no matching PDF attachment is found even though the
  *      toggle is on, the event is still created, just without an
- *      attachment (a missing expected attachment should never block the
- *      calendar event itself, logged for visibility). If
- *      `insertPdfIntoEvent` is false: no PDF attachment is touched or
- *      uploaded at all — nothing to clean up, since nothing was ever
- *      created in Drive.
- *   3b. ROUND 2 (debug/entradio-portal-not-supported): if the portal has a
- *      registered attachment FETCHER
+ *      attachment. If `insertPdfIntoEvent` is false: no PDF attachment is
+ *      touched or uploaded at all.
+ *   3b. If the portal has a registered attachment FETCHER
  *      (TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL — for a
- *      portal whose real ticket does not travel with the message at all),
- *      call it and concatenate its results. That call is guaranteed not to
- *      throw and to return an array, which is what makes it safe here,
- *      BEFORE the event exists. An EMPTY result sends
- *      notifyOwnerOfTicketAttachmentFailure and then carries on — the
- *      owner's rule is explicit that an attachment failure never blocks
- *      event creation. Unlike step 3, this step is NOT gated by
+ *      portal whose real ticket does not travel with the message at
+ *      all), call it and concatenate its results. That call is
+ *      guaranteed not to throw and to return an array, which is what
+ *      makes it safe here, BEFORE the event exists. An EMPTY result sends
+ *      notifyOwnerOfTicketAttachmentFailure and then carries on creating
+ *      the event. Unlike step 3, this step is NOT gated by
  *      `insertPdfIntoEvent`: the fetcher itself decides what that toggle
- *      means for its portal (for Entradio it gates the ticket-file download
- *      only, never the per-seat QR codes).
+ *      means for its portal (for Entradio it gates the ticket-file
+ *      download only, never the per-seat QR codes).
  *   4. Build and insert the Calendar event via the SHARED
- *      createTicketCalendarEvent, passing the accumulated attachments ARRAY.
+ *      createTicketCalendarEvent, passing the accumulated attachments
+ *      ARRAY.
  * GAS-only (GmailMessage/DriveApp/CalendarApp/Calendar globals) — not
  * unit-tested, proven only by the live checkpoint; the pure logic it
  * depends on (parseKinoArtTicketText and friends) IS fully unit-tested.
@@ -2739,12 +2171,9 @@ function processTicketFromMessageBody(message, portal) {
     return;
   }
 
-  // ROUND 2 (debug/entradio-portal-not-supported): an ARRAY now, since
-  // createTicketCalendarEvent takes a list and a portal may contribute more
-  // than one attachment. The PDF-finder path below is UNCHANGED and still
-  // contributes at most one entry, with the same 'application/pdf' mimeType
-  // createTicketCalendarEvent used to hardcode -- byte-for-byte unchanged
-  // behaviour for Kino Art and Ticketmaster CZ.
+  // `attachments` is an ARRAY, since a portal may contribute more than one
+  // attachment. The PDF-finder path below still contributes at most one
+  // entry, with `mimeType: 'application/pdf'`.
   const attachments = [];
 
   if (portal.insertPdfIntoEvent) {
@@ -2768,22 +2197,17 @@ function processTicketFromMessageBody(message, portal) {
     }
   }
 
-  // PORTAL-SPECIFIC ATTACHMENT FETCHING (ROUND 2,
-  // debug/entradio-portal-not-supported): a portal whose real ticket does not
-  // travel WITH the message can register a fetcher that goes and gets it --
-  // see TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL for why
-  // that is a separate registry from the PDF finders above. Today only
-  // Entradio registers one.
+  // PORTAL-SPECIFIC ATTACHMENT FETCHING: a portal whose real ticket does
+  // not travel WITH the message can register a fetcher that goes and gets
+  // it -- see TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL
+  // for why that is a separate registry from the PDF finders above.
   //
   // The fetcher's contract guarantees this call cannot throw and always
-  // returns an array, which is what makes it safe to run HERE -- before the
-  // Calendar event exists. The owner's rule is explicit: an attachment
-  // failure NEVER blocks event creation ("Vytvořit událost i tak, jen
-  // upozornit e-mailem"). So an EMPTY result -- nothing attachable at all,
-  // neither the downloaded ticket file nor a single QR code -- sends a
-  // separate notification email and then carries straight on to create the
-  // event. A PARTIAL result is not a failure worth an email: the event
-  // carries usable artifacts either way.
+  // returns an array, which is what makes it safe to run HERE -- before
+  // the Calendar event exists. An attachment failure NEVER blocks event
+  // creation: an EMPTY result sends a separate notification email and
+  // then carries straight on to create the event. A PARTIAL result is not
+  // a failure worth an email.
   const fetchPortalAttachments = TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL[ticketingExtractEmailAddress(portal.identifyingEmail)];
   if (fetchPortalAttachments) {
     const fetchedAttachments = fetchPortalAttachments(message, parsedTicket, portal);
@@ -2801,20 +2225,12 @@ function processTicketFromMessageBody(message, portal) {
     }
   }
 
-  // DIAGNOSTIC VISIBILITY (quick-260731-kar, round 2 -- see this function's
-  // caller-side investigation for the real incident this responds to): a
-  // "no calendar event created" outcome with ZERO thrown error was, until
-  // now, indistinguishable in the Executions log between "this action's
-  // run() was never entered at all for this message" (e.g. a sender/config
-  // mismatch upstream) and "this ran all the way through and either
-  // correctly no-op'd via the dedup safety net (which already logs) or
-  // reached this exact point and called Calendar.Events.insert." This log
-  // line, paired with isDuplicateTicketPurchase's existing "already exists,
-  // skipping" log, makes those three outcomes trivially distinguishable by
-  // reading the Executions log for the run in question -- same "make the
-  // NEXT diagnostic artifact visible up front" philosophy already
-  // established by parseEnigooTicketText's own diagnostic-on-failure
-  // rewrite (quick-260731-tix round 3).
+  // DIAGNOSTIC VISIBILITY: this log line, paired with
+  // isDuplicateTicketPurchase's existing "already exists, skipping" log,
+  // makes it possible to distinguish in the Executions log between "no
+  // matching portal/mode upstream" (this code never ran), "correctly
+  // no-op'd via the dedup safety net", and "reached this point and called
+  // Calendar.Events.insert" for a run that created no visible error.
   console.log(
     'Ticketing portal: creating calendar event for "' + parsedTicket.eventName + '" (ticketIdentifier=' +
       parsedTicket.ticketIdentifier + ') on calendar ' + calendarId + '.'
@@ -2825,10 +2241,9 @@ function processTicketFromMessageBody(message, portal) {
 /**
  * TICKETING_PORTALS_ACTION — the ticketing-portals action descriptor.
  * Carries its own config block (TICKETING_PORTALS_ACTION_CONFIG),
- * independent of CONFIG and of any other action's config (except for the
- * one shared cross-cutting CONFIG.ticketAttachmentDriveFolderName field —
- * see that field's own doc comment in src/01-setup.js for why it lives
- * there rather than here).
+ * independent of CONFIG and of any other action's config, except for the
+ * one shared cross-cutting CONFIG.ticketAttachmentDriveFolderName field
+ * (see src/01-setup.js for why it lives there rather than here).
  */
 const TICKETING_PORTALS_ACTION = {
   name: 'ticketing-portals',
@@ -2843,18 +2258,24 @@ const TICKETING_PORTALS_ACTION = {
   },
 
   /**
-   * appliesTo — returns a literal boolean (quick-260731-kar: now checks
-   * BOTH processing modes). True when any message on the thread is from a
-   * sender matching a configured TICKETING_PORTALS entry
-   * (resolveTicketingPortal) AND either: (a) that portal resolves against
+   * appliesTo — returns a literal boolean. True when any message on the
+   * thread is from a sender matching a configured TICKETING_PORTALS entry
+   * AND either: (a) that portal resolves against
    * TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL (PDF/OCR-sourced) AND the
-   * message carries at least one qualifying PDF attachment
-   * (findTicketPdfAttachments), or (b) that portal resolves against
-   * TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL (body-sourced) — no
-   * attachment requirement at all, since a body-sourced portal's event
-   * data comes from the message body itself, always present. Otherwise
-   * false. dispatchActions only skips on a strict `=== false`, so a
-   * literal boolean is required.
+   * message carries at least one qualifying PDF attachment, or (b) that
+   * portal resolves against TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL
+   * (body-sourced) AND the message body passes that portal's registered
+   * content detector, if it has one (ticketBodyLooksProcessable). Otherwise
+   * false. dispatchActions only skips on a strict `=== false`, so a literal
+   * boolean is required.
+   *
+   * There is still NO attachment requirement for a body-sourced portal, but
+   * the content check is not optional: this gate previously assumed a matching
+   * sender meant the event data was "always present" in the body, which is
+   * what let a Ticketmaster CZ purchase confirmation be claimed and then fail
+   * (debug/ticketmaster-cz-order-confirm). appliesTo is a SECOND, independent
+   * gate — dispatchActions consults it before run — so it must repeat the
+   * check rather than rely on resolveTicketProcessingJobs.
    */
   appliesTo: function (thread) {
     const messages = thread.getMessages();
@@ -2870,7 +2291,7 @@ const TICKETING_PORTALS_ACTION = {
       if (TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL[senderKey] && findTicketPdfAttachments(messages[i]).length > 0) {
         return true;
       }
-      if (TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL[senderKey]) {
+      if (TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL[senderKey] && ticketBodyLooksProcessable(messages[i], senderKey)) {
         return true;
       }
     }
@@ -2880,20 +2301,15 @@ const TICKETING_PORTALS_ACTION = {
 
   /**
    * run — builds the processing job list via the pure, TESTABLE
-   * resolveTicketProcessingJobs (each job tagged with a `mode`, one of
-   * `'pdf'` or `'body'` — see that function's own JSDoc for the full
-   * two-processing-mode architecture introduced in quick-260731-kar),
-   * then runs the appropriate pipeline exactly once per job:
-   * processTicketPdfAttachment for `mode: 'pdf'` jobs (the Drive/OCR
-   * pipeline), processTicketFromMessageBody for `mode: 'body'` jobs (body
-   * text only, no Drive/OCR at all). Duplicate-event protection for the
-   * SAME purchase is provided entirely by the DEDUP SAFETY NET shared by
-   * both pipelines (isDuplicateTicketPurchase — see this file's
-   * class-level "ONE-EVENT-PER-PURCHASE" doc), not by restricting which
-   * attachments/messages get processed here. A message matching neither a
-   * configured portal nor either processing mode's requirements
-   * contributes no job at all and is skipped gracefully (never throws for
-   * a non-matching message).
+   * resolveTicketProcessingJobs (each job tagged with `mode: 'pdf'` or
+   * `'body'`), then runs the appropriate pipeline exactly once per job:
+   * processTicketPdfAttachment for `'pdf'` jobs (the Drive/OCR pipeline),
+   * processTicketFromMessageBody for `'body'` jobs (body text only, no
+   * Drive/OCR). Duplicate-event protection is provided entirely by the
+   * DEDUP SAFETY NET shared by both pipelines (isDuplicateTicketPurchase),
+   * not by restricting which attachments/messages get processed here. A
+   * message matching neither a configured portal nor either processing
+   * mode's requirements contributes no job and is skipped gracefully.
    */
   run: function (thread) {
     const messages = thread.getMessages();
@@ -2911,26 +2327,20 @@ const TICKETING_PORTALS_ACTION = {
 
 // GAS-safe Node export: `typeof module` is safely "undefined" in the Apps
 // Script runtime, so this line is inert there and only active under Node.
-// Exports every pure function (resolveTicketingPortal, parseEnigooTicketText,
-// addMinutesToWallClockComponents, formatWallClockComponentsIso) and
-// TICKETING_PORTALS_ACTION (action registry). Also exports
-// isTicketPdfAttachment/findTicketPdfAttachments/resolveTicketProcessingJobs
-// (live-test-driven, quick-260731-tix rounds 8-9): despite living alongside
-// the GAS-only Drive/OCR/Calendar pipeline, none of these three reference a
-// real GAS global directly -- they only invoke methods ON THE PASSED-IN
-// message/attachment objects, so they are fully testable under Node with
-// plain duck-typed fakes (see resolveTicketProcessingJobs's own JSDoc).
+// Exports every pure function and TICKETING_PORTALS_ACTION. Also exports
+// isTicketPdfAttachment/findTicketPdfAttachments/resolveTicketProcessingJobs:
+// despite living alongside the GAS-only Drive/OCR/Calendar pipeline, none
+// of these three reference a real GAS global directly -- they only invoke
+// methods ON THE PASSED-IN message/attachment objects, so they are fully
+// testable under Node with plain duck-typed fakes.
 // getOrCreateDriveFolderByName/processTicketPdfAttachment/
 // findTicketEventByIdentifier remain genuinely GAS-only (reference
 // DriveApp/Drive/DocumentApp/CalendarApp/Calendar globals directly) and
-// are NOT exported — they are never invoked under Node. Also exports
-// parseTicketmasterCzTicketText (quick-260816-ocw, the third supported
-// portal, pure, no GAS globals) and
-// TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL (quick-260816-ocw):
-// despite living alongside the GAS-only Drive pipeline, the registry object
-// itself references no GAS global -- it is exported so a test can prove the
-// ABSENCE of a noreply@ticketmaster.cz key in it (D-01), the same
-// absence-proving coverage pattern already used for
+// are NOT exported. TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL is
+// exported despite living alongside the GAS-only Drive pipeline, since the
+// registry object itself references no GAS global -- it is exported so a
+// test can prove the ABSENCE of a noreply@ticketmaster.cz key in it, the
+// same absence-proving coverage pattern used for
 // TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL above.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -2957,25 +2367,20 @@ if (typeof module !== 'undefined' && module.exports) {
     TICKETING_PORTALS_ACTION: TICKETING_PORTALS_ACTION,
     // processTicketFromMessageBody IS exported despite being GAS-only
     // (GmailMessage/DriveApp/CalendarApp/Calendar/UrlFetchApp), unlike its
-    // sibling processTicketPdfAttachment. Round 2's mutation pass is the
-    // reason: deleting the two lines that actually attach the fetched files
-    // and notify on total failure — this whole round's payload — left the
-    // entire suite green, because everything those lines coordinate is pure
-    // and individually covered while the coordination itself was not. It is
-    // driven under Node through the same global-injection harness the
-    // transport-tickets and ICS actions already use for their own GAS-only
-    // pipelines, which is also what lets a test prove Kino Art's attachment
-    // behaviour is byte-for-byte unchanged by round 2.
+    // sibling processTicketPdfAttachment: its coordination logic (which
+    // lines attach fetched files, which notify on total failure) is not
+    // itself covered by testing only the pure pieces it calls. It is
+    // driven under Node through the same global-injection harness this
+    // file's other GAS-only pipelines use.
     processTicketFromMessageBody: processTicketFromMessageBody,
-    // ROUND 2 (debug/entradio-portal-not-supported): the Entradio attachment
-    // pipeline. Everything here except fetchEntradioAttachments is pure.
-    // fetchEntradioAttachments IS exported despite touching UrlFetchApp/
-    // DriveApp/CONFIG, because its contract is a NEGATIVE one -- never throws,
-    // always returns an array -- and that cannot be verified by reading the
-    // happy path; it is tested through the same global-injection harness the
-    // transport-tickets and ICS actions already use. Its two thin I/O
-    // helpers (fetchEntradioResponseBlob/entradioSaveBlobAsAttachment) stay
-    // unexported: they are covered through it.
+    // The Entradio attachment pipeline. Everything here except
+    // fetchEntradioAttachments is pure. fetchEntradioAttachments IS
+    // exported despite touching UrlFetchApp/DriveApp/CONFIG, because its
+    // contract is a NEGATIVE one -- never throws, always returns an array
+    // -- and that cannot be verified by reading the happy path. Its two
+    // thin I/O helpers (fetchEntradioResponseBlob/
+    // entradioSaveBlobAsAttachment) stay unexported: they are covered
+    // through it.
     extractEntradioTicketCodes: extractEntradioTicketCodes,
     findEntradioTicketDownloadUrl: findEntradioTicketDownloadUrl,
     buildEntradioQrCodeUrl: buildEntradioQrCodeUrl,
@@ -2987,5 +2392,11 @@ if (typeof module !== 'undefined' && module.exports) {
     fetchEntradioAttachments: fetchEntradioAttachments,
     TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL: TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL,
     buildTicketCalendarEventResource: buildTicketCalendarEventResource,
+    // The body-content admission gate (debug/ticketmaster-cz-order-confirm).
+    // The registry is exported so a test can prove the ABSENCE of Kino Art and
+    // Entradio keys, the same absence-proving pattern used above -- that
+    // absence IS the owner-scoped boundary of this fix.
+    ticketmasterCzTextHasOrderDetails: ticketmasterCzTextHasOrderDetails,
+    TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL: TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL,
   };
 }

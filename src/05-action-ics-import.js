@@ -52,18 +52,15 @@ function unfoldLines(text) {
  * BEGIN:VEVENT..END:VEVENT block, preserving source order. Lines outside
  * any VEVENT block (VCALENDAR/VTIMEZONE/etc.) are ignored.
  *
- * NESTING FIX (TR-1/T-gks-02): a VEVENT may itself contain nested
- * sub-components (BEGIN:VALARM..END:VALARM being the common case, but this
- * is handled generically for any sub-component type, matched by prefix, not
- * a hardcoded name). Such a sub-component's own properties (e.g. a VALARM's
- * own DESCRIPTION:REMINDER) must NOT be collected into the VEVENT's
- * propertyLines, or they silently overwrite the VEVENT's real properties in
- * the later last-wins props map (parseVeventBlock). A skipDepth counter
- * tracks nested BEGIN:/END: pairs seen while already inside an open VEVENT;
- * lines are only pushed into `current` while skipDepth === 0. This nesting
- * logic applies only to sub-components found INSIDE an open VEVENT — the
- * VEVENT delimiters themselves are handled by the existing branches above
- * and are entirely unaffected.
+ * A VEVENT may contain nested sub-components (e.g. BEGIN:VALARM..END:VALARM),
+ * handled generically by prefix match, not a hardcoded name. A nested
+ * sub-component's own properties must NOT be collected into the VEVENT's
+ * propertyLines, or they would silently overwrite the VEVENT's real
+ * properties in the later last-wins props map (parseVeventBlock). A
+ * skipDepth counter tracks nested BEGIN:/END: pairs while already inside an
+ * open VEVENT; lines are pushed into `current` only while skipDepth === 0.
+ * This applies only to sub-components inside an open VEVENT — the VEVENT
+ * delimiters themselves are unaffected.
  */
 function extractVeventBlocks(lines) {
   const blocks = [];
@@ -106,8 +103,7 @@ function extractVeventBlocks(lines) {
  *
  * TZID wall-clock times are resolved from the .ics's OWN embedded
  * VTIMEZONE data, never from a hardcoded Windows-name mapping table or the
- * script's own appsscript.json timeZone (owner-directed fix for a live
- * timezone bug).
+ * script's own appsscript.json timeZone.
  */
 function extractVtimezoneBlocks(lines) {
   const vtimezones = {};
@@ -546,9 +542,9 @@ function formatAddress(address) {
 
 /**
  * buildOrganizerAttendeesText — renders organizer/attendee informational
- * text to append to a VEVENT's description (TR-2..TR-5). `organizer` is a
- * single { name, email } address or null; `attendees` is a (possibly empty)
- * array of { name, email } addresses. Emits an 'Organizer: ...' line only
+ * text to append to a VEVENT's description. `organizer` is a single
+ * { name, email } address or null; `attendees` is a (possibly empty) array
+ * of { name, email } addresses. Emits an 'Organizer: ...' line only
  * when organizer is non-null, and an 'Attendees: ...' line (comma-joined)
  * only when attendees is non-empty; the two lines are joined by a single
  * newline when both are present. Returns '' (a strict no-op) when organizer
@@ -590,80 +586,59 @@ function collapseBlankLines(text) {
  * any TZID-qualified DTSTART/DTEND against the .ics's own embedded timezone
  * data.
  *
- * SEQUENCE (RFC 5545 section 3.8.7.4, live-reported bug quick-260731-seq):
- * `sequence` is ALWAYS a real non-negative integer on the returned event
- * object, never `undefined`/`null` — parsed from the VEVENT's own SEQUENCE
- * property when present (`SEQUENCE:1` -> `1`), or defaulting to `0` when
- * the property is absent, exactly matching RFC 5545's documented default
- * for an absent SEQUENCE. A malformed (non-numeric) SEQUENCE value ALSO
- * falls back to `0` rather than propagating `NaN` — this is optional
- * scheduling metadata, not something a malformed value should crash the
- * parser over. This field exists because `Calendar.Events.import()`
- * previously received no `sequence` at all (see buildEventResource) and
- * therefore implicitly sent `0`; when a genuine invite sent to the
- * owner's own Gmail address had ALREADY been detected and stored by
- * Google's native Gmail-to-Calendar detection with a real, higher
- * sequence number embedded in the SAME .ics, our own import was rejected
- * as a stale/out-of-order update (`GoogleJsonResponseException: Invalid
- * sequence value...`) — the exact same family of "our own import
- * collides with Google's native detection" issue as the original iCalUID
- * dedup fix, surfacing through a different field.
+ * SEQUENCE (RFC 5545 section 3.8.7.4): `sequence` is ALWAYS a real
+ * non-negative integer on the returned event object, never
+ * `undefined`/`null` — parsed from the VEVENT's own SEQUENCE property when
+ * present (`SEQUENCE:1` -> `1`), or defaulting to `0` when the property is
+ * absent, exactly matching RFC 5545's documented default for an absent
+ * SEQUENCE. A malformed (non-numeric) SEQUENCE value ALSO falls back to `0`
+ * rather than propagating `NaN` — optional scheduling metadata must not
+ * crash the parser. The field exists because an import that sends no
+ * sequence is treated as sending `0`, and is rejected once the calendar
+ * already holds a higher one for that event.
  *
- * STATUS (RFC 5545 section 3.8.1.11, RegioJet cancellation detection, D-01/
- * D-02 of quick-260813-dq2): `status` is the VEVENT's own STATUS property
- * value, trimmed and uppercased, or `null` when the property is absent OR
- * when the trimmed value is empty (so no caller ever has to distinguish an
- * empty value from an absent property). This exists so TRANSPORT_TICKETS_ACTION
- * can detect a RegioJet cancellation purely from `event.status === 'CANCELLED'`
- * — a fixed, language-independent RFC 5545 token, deliberately never from
- * email subject/body text (which vary per RegioJet locale).
+ * STATUS (RFC 5545 section 3.8.1.11): `status` is the VEVENT's own STATUS
+ * property value, trimmed and uppercased, or `null` when the property is
+ * absent OR when the trimmed value is empty (so no caller ever has to
+ * distinguish an empty value from an absent property). This exists so
+ * TRANSPORT_TICKETS_ACTION can detect a cancellation purely from
+ * `event.status === 'CANCELLED'` — a fixed, language-independent RFC 5545
+ * token, never from email subject/body text (which varies per locale).
  * `buildEventResource` deliberately does NOT copy it onto the Calendar API
- * resource — the D-01 firewall, still intact and still load-bearing for
- * TRANSPORT_TICKETS_ACTION, which shares that pure builder.
+ * resource — a firewall shared with, and load-bearing for,
+ * TRANSPORT_TICKETS_ACTION. ICS_CALENDAR_ACTION itself also reads this
+ * field, at the write site via planIcsEventWrite, which declines to build a
+ * resource at all for a cancelled VEVENT rather than changing the resource
+ * shape — so the firewall above is unaffected.
  *
- * SECOND CONSUMER (live-reported bug regiojet-cancel-not-deleted):
- * ICS_CALENDAR_ACTION now reads this field too, via planIcsEventWrite, so a
- * STATUS:CANCELLED VEVENT can never be imported as a live event. That is a
- * WRITE-SITE decision — it reads `event.status` and declines to build a
- * resource at all — NOT a change to the resource shape, so the firewall
- * above is unaffected. The "every other caller is bit-for-bit unchanged"
- * claim this paragraph used to make was true when written and is no longer:
- * a cancelled VEVENT is now handled rather than blindly imported. Every
- * NON-cancelled VEVENT is still bit-for-bit unchanged.
+ * DTSTAMP (RFC 5545 section 3.8.7.2): `dtstamp` is the VEVENT's own DTSTAMP
+ * property, parsed through the EXISTING parseIcsDate helper (RFC 5545
+ * DTSTAMP is always UTC Z-suffixed, so no TZID is ever passed) into a real
+ * Date when present, or `null` when the property is absent OR when
+ * parseIcsDate throws on an unrecognized value — a malformed DTSTAMP must
+ * never propagate a throw out of this function, the same discipline as the
+ * SEQUENCE fallback above. This field exists so TRANSPORT_TICKETS_ACTION can
+ * detect a stale cancellation superseded by a later rebooking: SEQUENCE can
+ * be RESET across a cancel+rebook pair, but DTSTAMP — the real send time —
+ * stays monotonic. Parser-level only and purely additive; `buildEventResource`
+ * deliberately does NOT copy this field onto the Calendar API resource
+ * either.
  *
- * DTSTAMP (RFC 5545 section 3.8.7.2, RegioJet cancel/rebook staleness
- * detection, D-09/D-10/D-11 of quick-260813-dq2 Task 3): `dtstamp` is the
- * VEVENT's own DTSTAMP property, parsed through the EXISTING parseIcsDate
- * helper (RFC 5545 DTSTAMP is always UTC Z-suffixed, so no TZID is ever
- * passed) into a real Date when present, or `null` when the property is
- * absent OR when parseIcsDate throws on an unrecognized value. A malformed
- * DTSTAMP must never propagate a throw out of this function — exactly the
- * same "optional scheduling metadata must not crash an otherwise-valid
- * import" discipline the SEQUENCE fallback above already documents. This
- * field exists so TRANSPORT_TICKETS_ACTION can detect a stale cancellation
- * (one superseded by a later rebooking): RegioJet RESETS SEQUENCE across a
- * cancel+rebook pair, but DTSTAMP — real send time — stays monotonic.
- * Parser-level only and purely additive, same D-01 firewall as `status`:
- * `buildEventResource` deliberately does NOT copy this field onto the
- * Calendar API resource either.
- *
- * ENRICHMENT (TR-2..TR-5): ORGANIZER (single-valued per RFC 5545) is read
- * via the last-wins `props` map; ATTENDEE (multi-valued) is collected in a
- * SEPARATE pass over the raw `propertyLines` so multiple attendees all
- * survive (the last-wins props map would otherwise keep only the final
- * ATTENDEE line). Both are rendered as pure informational TEXT PREPENDED to
- * description (before the original description text, separated by a blank
- * line) — never surfaced as resource-level attendees/organizer fields (see
- * buildEventResource, the T-03-05 safety firewall). The Teams/meeting URL
+ * ENRICHMENT: ORGANIZER (single-valued per RFC 5545) is read via the
+ * last-wins `props` map; ATTENDEE (multi-valued) is collected in a SEPARATE
+ * pass over the raw `propertyLines` so multiple attendees all survive (the
+ * last-wins props map would otherwise keep only the final ATTENDEE line).
+ * Both are rendered as pure informational TEXT PREPENDED to description
+ * (before the original description text, separated by a blank line) — never
+ * surfaced as resource-level attendees/organizer fields (see
+ * buildEventResource's firewall). The Teams/meeting URL
  * (X-MICROSOFT-SKYPETEAMSMEETINGURL) REPLACES location entirely when
- * present (owner preference: the original LOCATION text and the meeting
- * URL together were confusing; only the URL is kept), taken RAW (never run
- * through unescapeText — a URI must not be TEXT-unescaped, same treatment
- * as UID below). When no meeting URL is present, location falls back to
- * the original LOCATION value unchanged. The final assembled description
- * is passed through collapseBlankLines so long runs of blank lines common
- * in real Exchange/Outlook DESCRIPTION values render as a single
- * blank-line separator.
+ * present, taken RAW (never run through unescapeText — a URI must not be
+ * TEXT-unescaped, same treatment as UID below). When no meeting URL is
+ * present, location falls back to the original LOCATION value unchanged.
+ * The final assembled description is passed through collapseBlankLines so
+ * long runs of blank lines common in real Exchange/Outlook DESCRIPTION
+ * values render as a single blank-line separator.
  */
 function parseVeventBlock(propertyLines, vtimezones) {
   const props = {};
@@ -756,21 +731,20 @@ function parseVeventBlock(propertyLines, vtimezones) {
 
 // --- MISLABELED CONTENT-TRANSFER-ENCODING RECOVERY -------------------------
 //
-// Live-reported bug (linkedin-ics-not-imported). LinkedIn's "You're attending
-// ..." mail attaches a genuine, well-formed LinkedInEvent.ics whose MIME part
-// declares `Content-Transfer-Encoding: 7bit` while the part body is in fact
-// base64 text. `7bit` is the identity encoding, so any spec-honouring MIME
-// parser — Gmail included — takes the sender at its word and performs NO
-// decoding. GmailAttachment#getDataAsString() therefore returns the literal
-// base64 string, which contains no `BEGIN:VEVENT` line, so parseIcs found zero
-// blocks and returned [] and the event was silently never created.
+// LinkedIn's "You're attending ..." mail attaches a genuine, well-formed
+// .ics whose MIME part declares `Content-Transfer-Encoding: 7bit` while the
+// part body is in fact base64 text. `7bit` is the identity encoding, so any
+// spec-honouring MIME parser — Gmail included — takes the sender at its word
+// and performs NO decoding. GmailAttachment#getDataAsString() therefore
+// returns the literal base64 string, which contains no `BEGIN:VEVENT` line,
+// so parseIcs finds zero blocks and returns [] — the event is silently
+// never created.
 //
 // The recovery below lives in parseIcs (the CHOKE POINT) rather than in
 // ICS_CALENDAR_ACTION, so that TRANSPORT_TICKETS_ACTION's own
 // `parseIcs(attachment.getDataAsString())` call site
 // (src/08-action-transport-tickets.js) and every future caller are fixed by
-// the same change — the same choke-point strategy used for meetings sender
-// attribution (quick-260824-hva).
+// the same change.
 
 const ICS_BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
@@ -951,8 +925,7 @@ function formatIcsUtcTimestamp(date) {
  * convention). COUNT/UNTIL/BYDAY/BYMONTH are emitted only when present.
  * BYDAY tokens are joined with commas and preserved RAW (ordinal prefixes
  * such as '-1FR' are kept — the Advanced API's native RRULE parser supports
- * ordinal BYDAY, unlike the old CalendarApp.Recurrence.onlyOnWeekdays path).
- * Pure, no GAS globals.
+ * ordinal BYDAY). Pure, no GAS globals.
  */
 function buildRRuleString(descriptor) {
   const parts = ['FREQ=' + descriptor.freq];
@@ -982,23 +955,21 @@ function buildRRuleString(descriptor) {
  * Calendar.Events.import/insert). summary/description/location are copied
  * directly. iCalUID is set only when event.uid is truthy (omitted entirely
  * otherwise — Events.insert does not need one). All-day events get
- * date-only {date:'YYYY-MM-DD'} start/end (exclusive-end, same convention
- * the old CalendarApp.createAllDayEvent used); timed events get
- * {dateTime: ISO string} start/end. recurrence is set to a one-element
- * array [buildRRuleString(event.recurrence)] only when the event recurs.
+ * date-only {date:'YYYY-MM-DD'} start/end (exclusive-end); timed events get
+ * {dateTime: ISO string} start/end. recurrence is set to a one-element array
+ * [buildRRuleString(event.recurrence)] only when the event recurs.
+ * `resource.sequence` is ALWAYS set — a real, documented field on the
+ * Calendar API v3 Event resource — from `event.sequence` when it's a real
+ * number (the normal case, coming from parseVeventBlock, which always
+ * produces one), or defensively defaulting to `0` when `event.sequence` is
+ * missing/undefined (e.g. a hand-built event object not produced by
+ * parseVeventBlock).
  *
- * SEQUENCE (live-reported bug quick-260731-seq): `resource.sequence` is
- * ALWAYS set — a real, documented field on the Calendar API v3 Event
- * resource — from `event.sequence` when it's a real number (the normal
- * case, coming from parseVeventBlock, which always produces one), or
- * defensively defaulting to `0` when `event.sequence` is missing/undefined
- * (e.g. a hand-built event object not produced by parseVeventBlock).
- * Applies identically to both the Events.import path (where a MISSING
- * sequence used to be silently treated as `0` by Google, causing a real
- * live "Invalid sequence value" rejection whenever Gmail's own native
- * detection had already stored a higher real sequence number from the
- * same invite) and the Events.insert fallback path (harmless there too,
- * since there is no existing event to conflict with on a plain insert).
+ * FIREWALL: this function copies neither `status` nor `dtstamp` nor any
+ * organizer/attendee field onto the resource — deliberately, since
+ * untrusted .ics attendee values must never become real Calendar API
+ * guests. TRANSPORT_TICKETS_ACTION (src/08-action-transport-tickets.js)
+ * shares this builder and documents itself as depending on that firewall.
  *
  * Pure, no GAS globals — references neither CalendarApp nor Calendar so it
  * stays Node-testable like the rest of the parser.
@@ -1041,23 +1012,16 @@ function buildEventResource(event) {
  *   CANCELLED + uid -> { action: 'cancel', uid, resource: null }
  *   CANCELLED + no  -> { action: 'skip',   uid: null, resource: null }
  *
- * WHY IT EXISTS (live-reported bug regiojet-cancel-not-deleted, the deferred
- * blind_spot the owner asked to close). ICS_CALENDAR_ACTION is registry
- * index 0 — it runs BEFORE TRANSPORT_TICKETS_ACTION on the same thread — and
- * `run` previously had NO branch on `event.status` whatsoever: every parsed
- * VEVENT went to Events.import or Events.insert unconditionally. A RegioJet
- * CANCELLATION .ics (METHOD:CANCEL, one VEVENT carrying STATUS:CANCELLED)
- * was therefore imported as an ordinary LIVE event. The parser has carried
- * `event.status` — trimmed, uppercased, the single normalization point —
- * since D-01/D-02 of quick-260813-dq2, but only TRANSPORT_TICKETS_ACTION
- * ever read it.
+ * WHY IT EXISTS: ICS_CALENDAR_ACTION is registry index 0 — it runs BEFORE
+ * TRANSPORT_TICKETS_ACTION on the same thread — so without a branch on
+ * `event.status`, every parsed VEVENT went to Events.import or
+ * Events.insert unconditionally, materializing a CANCELLED VEVENT
+ * (METHOD:CANCEL) as an ordinary live event.
  *
- * WHY THIS IS NOT COVERED BY excludeFrom. The only thing that made this
- * action stand down for RegioJet was the owner having set the
- * `05-action-ics-EXCLUDE_FROM` Script Property, whose CODE DEFAULT IS `[]`
- * (see ICS_ACTION_CONFIG.excludeFrom). A correctness guarantee must not rest
- * on an out-of-band, owner-side configuration step that defaults to off, so
- * the decision is made here, unconditionally, for every install.
+ * WHY THIS IS NOT COVERED BY excludeFrom: excludeFrom's CODE DEFAULT IS `[]`
+ * (see ICS_ACTION_CONFIG.excludeFrom), and a correctness guarantee must not
+ * rest on an out-of-band, owner-side configuration step that defaults to
+ * off, so the decision is made here, unconditionally, for every install.
  *
  * WHY `resource: null` ON BOTH CANCELLED BRANCHES — and why this function
  * calls buildEventResource ONLY on the live branches: no Calendar API
@@ -1067,19 +1031,16 @@ function buildEventResource(event) {
  *
  * WHY NOT `resource.status = 'cancelled'` INSTEAD (the tempting one-liner):
  * two reasons. First, `buildEventResource` is SHARED with
- * TRANSPORT_TICKETS_ACTION, and its D-01 firewall (it copies neither
- * `status` nor `dtstamp` onto the resource) is load-bearing there — that
- * action has its own, ticketIdentifier-keyed cancellation path and does not
- * route cancel entries through the write path at all. Second, and more
- * importantly, while the Calendar API documents `status: 'cancelled'` as
- * meaning "deleted" AND documents `events.import` as an upsert keyed by
- * iCalUID, it nowhere documents their COMBINATION — that importing a
- * cancelled resource over a live event cancels it. Hanging the cancellation
- * guarantee on that unverified inference would repeat the exact fault this
- * whole debug session diagnosed: a load-bearing assumption about foreign
- * behaviour that nobody here can verify. The 'cancel' plan is instead
- * executed by cancelIcsEventByUid below using only operations already proven
- * in this codebase.
+ * TRANSPORT_TICKETS_ACTION, whose own load-bearing firewall (it copies
+ * neither `status` nor `dtstamp` onto the resource) must hold — that action
+ * has its own, ticketIdentifier-keyed cancellation path and does not route
+ * cancel entries through the write path at all. Second, while the Calendar
+ * API documents `status: 'cancelled'` as meaning "deleted" AND documents
+ * `events.import` as an upsert keyed by iCalUID, it nowhere documents their
+ * COMBINATION. Hanging the cancellation guarantee on that unverified
+ * inference about foreign behaviour is exactly what this design refuses to
+ * do. The 'cancel' plan is instead executed by cancelIcsEventByUid below
+ * using only operations already proven in this codebase.
  *
  * TOTAL and defensive: an event object with no `status` key at all (a
  * hand-built one, not from parseVeventBlock) routes to the live branches
@@ -1143,8 +1104,8 @@ function isAllowedSender(fromHeader, importOnlyFrom) {
 }
 
 /**
- * isExcludedSender — quick-260803-us3 (D-03): the inverse of isAllowedSender
- * above, same shape and comparison convention exactly. Returns false when
+ * isExcludedSender — (D-03) the inverse of isAllowedSender above, same
+ * shape and comparison convention exactly. Returns false when
  * `excludeFrom` is null, undefined, or has zero length (the "exclude
  * nobody" default that preserves current behavior); otherwise returns true
  * only if the sender extracted from `fromHeader` strictly equals the sender
@@ -1239,111 +1200,101 @@ if (typeof module !== 'undefined' && module.exports) {
  * every attachment across the whole thread is parsed FIRST; only after a
  * clean parse do we begin writing ANY event, so a malformed .ics throws
  * before any calendar write (fail closed) — this still holds even though
- * writes may now target more than one calendar within a single run.
+ * writes may target more than one calendar within a single run.
  *
- * SENDER ALLOW-LIST: config.importOnlyFrom (see below) narrows which
- * senders' .ics attachments are imported via findIcsAttachments' single
- * shared filter point (isAllowedSender). Empty (the default) imports from
- * any sender, matching original behavior exactly.
+ * SENDER ALLOW-LIST: config.importOnlyFrom narrows which senders' .ics
+ * attachments are imported via findIcsAttachments' single shared filter
+ * point (isAllowedSender). Empty (the default) imports from any sender.
  *
- * MULTI-CALENDAR ROUTING (owner-requested): CONFIG.calendarId
- * (src/01-setup.js) is now a DEFAULT/fallback, not the sole target.
- * resolveIcsCalendarId (see its own JSDoc above) resolves, PER MESSAGE, a
- * 3-tier priority: a config.calendarIdBySender entry matching that
- * message's sender > config.calendarId (an action-wide override) >
- * CONFIG.calendarId (the global default). run() groups attachment text by
- * ORIGINATING MESSAGE (getIcsAttachmentTextsByMessage) specifically so
- * this resolution can happen once per message and be reused for every
- * event that message's attachment(s) produce — a thread carrying .ics
- * files from two different senders can therefore route to two different
- * calendars within the same run. With every override left at its shipped
- * default (null / []), every import targets CONFIG.calendarId exactly as
- * before this feature existed.
+ * MULTI-CALENDAR ROUTING: CONFIG.calendarId (src/01-setup.js) is a
+ * DEFAULT/fallback, not the sole target. resolveIcsCalendarId (see its own
+ * JSDoc above) resolves, PER MESSAGE, a 3-tier priority: a
+ * config.calendarIdBySender entry matching that message's sender >
+ * config.calendarId (an action-wide override) > CONFIG.calendarId (the
+ * global default). run() groups attachment text by ORIGINATING MESSAGE
+ * (getIcsAttachmentTextsByMessage) specifically so this resolution can
+ * happen once per message and be reused for every event that message's
+ * attachment(s) produce — a thread carrying .ics files from two different
+ * senders can therefore route to two different calendars within the same
+ * run. With every override left at its shipped default (null / []), every
+ * import targets CONFIG.calendarId exactly as before this feature existed.
  *
- * DEDUP FIX (iCalUID): events are written via the Advanced Calendar
- * Service's Calendar.Events.import (not a simple CalendarApp create), so
- * the .ics UID becomes the calendar event's iCalUID identity key.
- * Google Calendar's own backend treats iCalUID as canonical: whichever
- * path — this script's Events.import, or the owner's native Gmail
- * "Yes"/RSVP-accept click on the same invite — reaches a given UID FIRST
- * creates the event; the other subsequently UPDATES that same event
- * instead of creating a duplicate. This holds in both temporal orders
- * (script-then-click and click-then-script), which is what resolves the
- * original duplicate-event bug. A UID-less VEVENT (rare, non-conformant
- * .ics) has no identity key to dedup against, so it falls back to a plain
+ * DEDUP (iCalUID): events are written via the Advanced Calendar Service's
+ * Calendar.Events.import (not a simple CalendarApp create), so the .ics UID
+ * becomes the calendar event's iCalUID identity key. Google Calendar's own
+ * backend treats iCalUID as canonical: whichever path — this script's
+ * Events.import, or the owner's native Gmail RSVP-accept click on the same
+ * invite — reaches a given UID FIRST creates the event; the other
+ * subsequently UPDATES that same event instead of creating a duplicate.
+ * This holds in both temporal orders (script-then-click and
+ * click-then-script). A UID-less VEVENT (rare, non-conformant .ics) has no
+ * identity key to dedup against, so it falls back to a plain
  * Calendar.Events.insert — an ordinary create with no dedup guarantee,
  * scoped to that narrow edge case only.
  *
  * KNOWN LIMITATION: parse-then-create only protects against parse errors,
  * not partial-write errors. The Events.import/insert calls happen one at a
- * time in a loop; if event N of a multi-VEVENT .ics throws during the
- * write (e.g. a Calendar API quota/permission error), events 1..N-1 are
- * already committed to the calendar while the action as a whole is
- * recorded as failed. Since failed threads are excluded from future
- * search, this is low-frequency, but if the owner manually reprocesses the
- * thread (e.g. removes the failed label), the earlier events would be
- * re-imported — harmless for UID-bearing events (import is idempotent by
- * iCalUID) but would duplicate any UID-less event that used the insert
- * fallback. No compensating cleanup is performed today.
+ * time in a loop; if event N of a multi-VEVENT .ics throws during the write
+ * (e.g. a Calendar API quota/permission error), events 1..N-1 are already
+ * committed to the calendar while the action as a whole is recorded as
+ * failed. If the thread is later manually reprocessed (e.g. the failed
+ * label removed), the earlier events would be re-imported — harmless for
+ * UID-bearing events (import is idempotent by iCalUID) but would duplicate
+ * any UID-less event that used the insert fallback. No compensating cleanup
+ * is performed today.
  *
  * KNOWN LIMITATION (sender allow-list): isAllowedSender/findIcsAttachments
  * check the Gmail "From" header exactly as GmailApp reports it — there is
  * no SPF/DKIM/DMARC verification of the sender in-script. This is a
- * documented, accepted limitation: it is a convenience filter, not a
- * security boundary, since it only narrows what already-Gmail-delivered
- * (already-spam-filtered) mail gets processed and widens no trust boundary.
+ * convenience filter, not a security boundary: it only narrows what
+ * already-Gmail-delivered (already-spam-filtered) mail gets processed and
+ * widens no trust boundary.
  *
- * SENDER EXCLUDE-LIST (quick-260803-us3, D-03): config.excludeFrom (see
- * ICS_ACTION_CONFIG in the sibling src/05-action-cfg-ics-import.js) is
- * checked via isExcludedSender at the SAME two filter points as the
- * importOnlyFrom allow-list above (findIcsAttachments,
- * getIcsAttachmentTextsByMessage) — a sender listed there is skipped
- * entirely, silently, for this action. This is the hand-off switch that
- * lets TRANSPORT_TICKETS_ACTION (src/08-action-transport-tickets.js) own a
- * sender (e.g. jizdenky@regiojet.cz) whose confirmation email ALSO carries a
- * .ics attachment this action would otherwise import too, producing two
+ * SENDER EXCLUDE-LIST (D-03): config.excludeFrom (see ICS_ACTION_CONFIG in
+ * the sibling src/05-action-cfg-ics-import.js) is checked via
+ * isExcludedSender at the SAME two filter points as the importOnlyFrom
+ * allow-list above (findIcsAttachments, getIcsAttachmentTextsByMessage) — a
+ * sender listed there is skipped entirely, silently, for this action. This
+ * is the hand-off switch that lets TRANSPORT_TICKETS_ACTION
+ * (src/08-action-transport-tickets.js) own a sender (e.g.
+ * jizdenky@regiojet.cz) whose confirmation email ALSO carries a .ics
+ * attachment this action would otherwise import too, producing two
  * competing calendar events for the same email. Empty (the default)
- * excludes nobody, so behavior is unchanged for every existing user. The
- * owner sets the real value out-of-band via Script Properties — never
- * hardcoded into this action's shipped default.
+ * excludes nobody. The owner sets the real value out-of-band via Script
+ * Properties — never hardcoded into this action's shipped default.
  *
-
- * SEQUENCE-CONFLICT RECOVERY (live-reported bug quick-260731-seq): even
- * with buildEventResource now always setting a real `sequence` (see its
- * own doc comment), `Calendar.Events.import` can still throw
+ * SEQUENCE-CONFLICT RECOVERY: even with buildEventResource always setting a
+ * real `sequence`, `Calendar.Events.import` can still throw
  * `GoogleJsonResponseException: Invalid sequence value...` in a narrower
- * race: Gmail's native Gmail-to-Calendar detection may have ALREADY
- * updated the same event to a HIGHER sequence number than the one our
- * own parsed .ics carries, between when the invite arrived and when this
- * script processes it. `importIcsEventWithSequenceRetry` (below) handles
- * exactly this — a bounded, single-shot recovery that implements Google's
- * OWN documented remediation instruction embedded in the error message
- * itself ("Re-fetch the resource and use its sequence number on the
- * following request"), not speculative retry logic: on that specific
- * error, look up the existing event by iCalUID, copy ITS sequence number
- * onto our resource, and retry Events.import exactly once. If the retry
- * also throws, or no existing event is found by iCalUID, the error
- * propagates normally — dispatch isolation (03-action-management.js)
- * already contains an action's throw, routes the thread to the failed
- * label, and (config.notifyOnFailure) notifies the owner, so no separate
- * handling is needed here for the give-up path.
+ * race: Gmail's native Gmail-to-Calendar detection may have ALREADY updated
+ * the same event to a HIGHER sequence number than the one our own parsed
+ * .ics carries, between when the invite arrived and when this script
+ * processes it. `importIcsEventWithSequenceRetry` (below) handles exactly
+ * this — a bounded, single-shot recovery that implements Google's OWN
+ * documented remediation instruction embedded in the error message itself
+ * ("Re-fetch the resource and use its sequence number on the following
+ * request"), not speculative retry logic: on that specific error, look up
+ * the existing event by iCalUID, copy ITS sequence number onto our
+ * resource, and retry Events.import exactly once. If the retry also
+ * throws, or no existing event is found by iCalUID, the error propagates
+ * normally — dispatch isolation (03-action-management.js) already contains
+ * an action's throw, routes the thread to the failed label, and
+ * (config.notifyOnFailure) notifies the owner.
  *
- * RSVP PRESERVATION (live-reported bug ics-import-strips-rsvp): the iCalUID
- * dedup behavior described above has one destructive edge. When Gmail's own
- * native detection reaches the UID FIRST — the normal order for a real
- * Exchange/Teams invite, since Gmail acts on delivery while this script runs
- * on a periodic trigger minutes later — the event Gmail creates is a genuine
- * ATTENDEE COPY: real organizer, the owner as a NEEDS-ACTION attendee,
- * Accept/Decline UI, responses routed back to the organizer. Our subsequent
- * Events.import is a full-resource replace carrying NEITHER organizer NOR
- * attendees (buildEventResource's T-03-05 firewall), which silently demoted
- * that attendee copy to a plain self-owned private copy: guest list cleared,
- * organizer reset to the owner, RSVP gone, organizer never notified.
- * importIcsEventWithSequenceRetry now guards this by looking the UID up
- * BEFORE writing and skipping the write entirely when the event already
- * there carries guests — see its own "PRESERVE-EXISTING-INVITE GUARD" doc
- * paragraph for the full rationale, including why skipping is correct rather
- * than trying to reconstruct the attendee copy.
+ * RSVP PRESERVATION: the iCalUID dedup behavior above has one destructive
+ * edge. When Gmail's own native detection reaches the UID FIRST — the
+ * normal order for a real Exchange/Teams invite, since Gmail acts on
+ * delivery while this script runs on a periodic trigger minutes later —
+ * the event Gmail creates is a genuine ATTENDEE COPY: real organizer, the
+ * owner as a NEEDS-ACTION attendee, Accept/Decline UI, responses routed
+ * back to the organizer. Our subsequent Events.import is a full-resource
+ * replace carrying NEITHER organizer NOR attendees (buildEventResource's
+ * firewall), which would silently demote that attendee copy to a plain
+ * self-owned private copy: guest list cleared, organizer reset to the
+ * owner, RSVP gone, organizer never notified. importIcsEventWithSequenceRetry
+ * guards this by looking the UID up BEFORE writing and skipping the write
+ * entirely when the event already there carries guests — see its own
+ * "PRESERVE-EXISTING-INVITE GUARD" doc paragraph for the full rationale.
  */
 const ICS_CALENDAR_ACTION = {
   name: 'ics-calendar-import',
@@ -1400,13 +1351,10 @@ const ICS_CALENDAR_ACTION = {
    *   'skip'   — STATUS:CANCELLED VEVENT WITHOUT a UID: nothing to
    *      reference, nothing to cancel, logged and dropped.
    *
-   * The 'cancel'/'skip' plans are the fix for the live-reported bug
-   * regiojet-cancel-not-deleted: this action is registry index 0, so it
-   * reaches a RegioJet cancellation email BEFORE TRANSPORT_TICKETS_ACTION
-   * does, and it previously imported that cancellation as an ordinary LIVE
-   * event whenever the owner had not set the `05-action-ics-EXCLUDE_FROM`
-   * Script Property (code default `[]`). No cancelled VEVENT can reach
-   * Events.import or Events.insert any more, in any configuration.
+   * This action is registry index 0, so it reaches a cancellation email
+   * BEFORE TRANSPORT_TICKETS_ACTION does; the 'cancel'/'skip' plans ensure
+   * no cancelled VEVENT can ever reach Events.import or Events.insert, in
+   * any configuration.
    *
    * Throws a clear error if a resolved calendar cannot be found — dispatch
    * isolation (03-action-management.js) contains the throw, routes the
@@ -1421,17 +1369,12 @@ const ICS_CALENDAR_ACTION = {
     // though different groups may end up targeting different calendars.
     const parsedGroups = messageGroups.map(function (group) {
       const events = group.texts.reduce(function (allEvents, attachmentText) {
-        // SILENT-FAILURE GUARD (live-reported bug linkedin-ics-not-imported).
-        // This attachment was ALREADY matched as .ics by isIcsAttachment, so
-        // its content not being iCalendar — even after normalizeIcsText's
-        // mislabeled-base64 recovery — is a genuine defect, not a no-op.
-        // Before this guard, parseIcs returned [] for such an attachment and
-        // the forEach below simply iterated zero times: no calendar write, no
-        // thrown error, so dispatchActions reported success and the thread was
-        // labeled processed with no event and no owner notification. Throwing
-        // here routes the thread to the failed label and (notifyOnFailure)
-        // notifies the owner, via dispatch isolation in
-        // 03-action-management.js.
+        // SILENT-FAILURE GUARD: this attachment was ALREADY matched as .ics
+        // by isIcsAttachment, so its content not being iCalendar — even
+        // after normalizeIcsText's mislabeled-base64 recovery — is a genuine
+        // defect, not a no-op. Throwing here routes the thread to the failed
+        // label and (notifyOnFailure) notifies the owner, via dispatch
+        // isolation in 03-action-management.js.
         //
         // Keyed on "not iCalendar AT ALL", never on "parsed to zero events" —
         // a valid VCALENDAR carrying zero VEVENTs is legitimate (cancellations,
@@ -1505,16 +1448,16 @@ const ICS_CALENDAR_ACTION = {
  * null/undefined (no such event), for an event with no `attendees` key at
  * all, and for an event whose `attendees` array is empty.
  *
- * This is deliberately the SIMPLEST possible discriminator, and it is the
- * exact discriminator the bug calls for: `attendees` is precisely the field
- * whose loss destroys the Accept/Decline UI and the response path back to
- * the organizer. Notably it is correct in BOTH directions of ownership —
- * an event the owner organized has its invitees in the same array, and
- * blowing THOSE away would be just as destructive, so it is guarded too.
+ * This is deliberately the SIMPLEST possible discriminator: `attendees` is
+ * precisely the field whose loss destroys the Accept/Decline UI and the
+ * response path back to the organizer. It is correct in BOTH directions of
+ * ownership — an event the owner organized has its invitees in the same
+ * array, and blowing THOSE away would be just as destructive, so it is
+ * guarded too.
  *
  * Events this script itself created (via buildEventResource, which never
- * emits attendees — the T-03-05 firewall) always have an empty/absent
- * attendees array, so they return false and remain freely re-importable.
+ * emits attendees) always have an empty/absent attendees array, so they
+ * return false and remain freely re-importable.
  * The same is true of METHOD:PUBLISH informational .ics events (booking
  * confirmations, transport tickets), which carry no ATTENDEE properties.
  * That is what keeps this guard inert for every pre-existing flow.
@@ -1587,8 +1530,8 @@ function findExistingEventByICalUid(calendarId, uid) {
  * PRESERVE-EXISTING-INVITE, same stance and same discriminator as
  * importIcsEventWithSequenceRetry's guard: an event carrying a real guest
  * relationship is Gmail's own native attendee copy, not one this script
- * created (buildEventResource never emits attendees — the T-03-05 firewall),
- * and Gmail's native detection handles the organizer's cancellation itself
+ * created (buildEventResource never emits attendees), and Gmail's native
+ * detection handles the organizer's cancellation itself
  * at strictly higher fidelity. Deleting someone else's meeting on the
  * strength of an attachment we parsed is destructive and unnecessary, so
  * such an event is left untouched. The negative guarantee still holds
@@ -1657,33 +1600,33 @@ function cancelIcsEventByUid(calendarId, uid) {
  *      event found" case at all — both fall through to the caller
  *      unchanged). This is a single-shot recovery, never a retry loop.
  *
- * PRESERVE-EXISTING-INVITE GUARD (live-reported bug ics-import-strips-rsvp):
- * before ANY write, findExistingEventByICalUid looks the UID up on the target
- * calendar; when hasGuestRelationship says the event already there carries
- * guests, this function logs one line and returns WITHOUT writing.
+ * PRESERVE-EXISTING-INVITE GUARD: before ANY write, findExistingEventByICalUid
+ * looks the UID up on the target calendar; when hasGuestRelationship says the
+ * event already there carries guests, this function logs one line and
+ * returns WITHOUT writing.
  *
  * WHY: `Calendar.Events.import` is a full-resource, non-patch upsert keyed by
  * iCalUID, and it is the one Calendar API operation where `organizer` is
  * writable. buildEventResource deliberately emits NEITHER `organizer` NOR
- * `attendees` (the T-03-05 firewall — untrusted .ics ATTENDEE values must
- * never become real guests; parseVeventBlock does not even carry them that
- * far, folding them into description text instead). So when Gmail's own
- * native invite detection had ALREADY created the event for that UID — with
- * the real organizer and the owner as a NEEDS-ACTION attendee — our import
- * rewrote that attendee copy as a plain self-owned private copy: guest list
- * cleared, organizer reset to the calendar owner, Accept/Decline gone, and
- * the organizer never notified. Google's own guidance is explicit that an
+ * `attendees` (untrusted .ics ATTENDEE values must never become real guests;
+ * parseVeventBlock does not even carry them that far, folding them into
+ * description text instead). So when Gmail's own native invite detection
+ * had ALREADY created the event for that UID — with the real organizer and
+ * the owner as a NEEDS-ACTION attendee — our import would rewrite that
+ * attendee copy as a plain self-owned private copy: guest list cleared,
+ * organizer reset to the calendar owner, Accept/Decline gone, and the
+ * organizer never notified. Google's own guidance is explicit that an
  * attendee's copy must "specify the organizer in the attendee's copy"; an
  * organizer-less import therefore cannot BE an attendee copy.
  *
  * WHY SKIP RATHER THAN RECONSTRUCT: reconstructing the attendee copy would
  * mean sending `organizer`/`attendees` on the import — reopening exactly the
- * T-03-05 hole, and depending on unverified assumptions about whether a
- * rebuilt private copy still round-trips RSVP to a foreign organizer. Gmail's
- * native event is strictly higher fidelity than anything this script can
- * build (it is a genuine attendee copy, and Gmail keeps it current as the
- * organizer sends updates), so the correct action is to leave it alone. The
- * action's goal — "the invite is on the calendar" — is already satisfied.
+ * hole the builder's firewall closes, and depending on unverified
+ * assumptions about whether a rebuilt private copy still round-trips RSVP
+ * to a foreign organizer. Gmail's native event is strictly higher fidelity
+ * than anything this script can build, so the correct action is to leave it
+ * alone. The action's goal — "the invite is on the calendar" — is already
+ * satisfied.
  *
  * SCOPE (why this is inert for every pre-existing flow): the guard fires ONLY
  * when an event with that exact iCalUID already exists on that exact calendar
@@ -1691,32 +1634,28 @@ function cancelIcsEventByUid(calendarId, uid) {
  * have attendees; METHOD:PUBLISH informational .ics events (booking
  * confirmations, RegioJet/transport tickets) carry no ATTENDEE properties at
  * all; and a non-default calendarId route finds no event to collide with. In
- * every one of those cases the code below runs byte-for-byte as before, so
- * the iCalUID dedup guarantee (quick-260723-gmk) and the sequence-conflict
- * recovery (quick-260731-seq) are both fully preserved.
+ * every one of those cases the code below runs byte-for-byte as before.
  *
  * RETURNS a small result object — `{ action: 'skipped-existing-invite' |
  * 'imported', eventId }` — so callers and tests can observe which branch
  * was taken. Both existing call sites (run below, and
- * processTransportTicketJob in src/08-action-transport-tickets.js) ignore the
- * return value, so this is backward compatible.
+ * processTransportTicketJob in src/08-action-transport-tickets.js) ignore
+ * the return value.
  *
  * GAS-only (Calendar global); the guard's two helpers are the exception —
  * hasGuestRelationship is pure and directly unit-tested, and the guard's
  * branching is unit-tested through a faked Calendar global (see
- * test/existing-invite-guard.test.js). The SEQUENCE parsing and
- * resource-building this recovery depends on IS fully unit-tested (see
- * parseVeventBlock/buildEventResource).
+ * test/existing-invite-guard.test.js).
  *
- * `optionalArgs` (quick-260803-us3, EXTENSION): an optional trailing
- * argument, defaulting to `{}`, passed through UNCHANGED to BOTH
- * `Calendar.Events.import` calls (the initial attempt and the single-shot
- * retry). This function's own pre-existing 3-argument call site in `run`
- * below is UNCHANGED (it relies on the default). TRANSPORT_TICKETS_ACTION
- * (src/08-action-transport-tickets.js) is what actually needs this: it
- * reuses this SAME proven idempotent-by-iCalUID import path but also needs
- * to pass `{ supportsAttachments: true }` when the event carries a Drive
- * attachment — see that action's own JSDoc for the full rationale.
+ * `optionalArgs`: an optional trailing argument, defaulting to `{}`, passed
+ * through UNCHANGED to BOTH `Calendar.Events.import` calls (the initial
+ * attempt and the single-shot retry). This function's own pre-existing
+ * 3-argument call site in `run` below is UNCHANGED (it relies on the
+ * default). TRANSPORT_TICKETS_ACTION (src/08-action-transport-tickets.js) is
+ * what actually needs this: it reuses this SAME proven idempotent-by-iCalUID
+ * import path but also needs to pass `{ supportsAttachments: true }` when
+ * the event carries a Drive attachment — see that action's own JSDoc for
+ * the full rationale.
  */
 function importIcsEventWithSequenceRetry(resource, calendarId, uid, optionalArgs) {
   const args = optionalArgs || {};
@@ -1787,7 +1726,7 @@ function isIcsAttachment(attachment) {
  * label). With the default empty importOnlyFrom, every message is allowed,
  * so behavior is unchanged from before this filter existed.
  *
- * SENDER EXCLUDE-LIST (quick-260803-us3, D-03): a message's "From" header is
+ * SENDER EXCLUDE-LIST (D-03): a message's "From" header is
  * ALSO checked against config.excludeFrom via isExcludedSender — an excluded
  * sender's message is skipped the same way a disallowed sender's is. This is
  * the hand-off switch that lets another action (e.g. TRANSPORT_TICKETS_ACTION)
@@ -1875,21 +1814,10 @@ function getIcsAttachmentTextsByMessage(thread) {
 
 // GAS-safe Node export: `typeof module` is safely "undefined" in the Apps
 // Script runtime, so this line is inert there and only active under Node.
-// Single merged export carries parseIcs (parser tests), the three pure
-// mislabeled-transfer-encoding recovery helpers (decodeBase64Utf8, isIcsText,
-// normalizeIcsText — bug linkedin-ics-not-imported), the two pure
-// resource builders (buildRRuleString, buildEventResource), the two pure
-// sender-allow-list helpers (extractEmailAddress, isAllowedSender), the
-// pure multi-calendar-routing resolver (resolveIcsCalendarId), the four
-// pure organizer/attendee/formatting enrichment helpers
-// (parseAddressProperty, formatAddress, buildOrganizerAttendeesText,
-// collapseBlankLines), the preserve-existing-invite guard's two pieces
-// (hasGuestRelationship — pure; findExistingEventByICalUid and
-// importIcsEventWithSequenceRetry — GAS-only, exported so the guard's
-// branching can be exercised against a faked Calendar global), the
-// cancelled-VEVENT guard's two pieces (planIcsEventWrite — pure and
-// directly unit-tested; cancelIcsEventByUid — GAS-only, same faked-global
-// treatment), and ICS_CALENDAR_ACTION (action registry).
+// The GAS-only functions below (findExistingEventByICalUid,
+// importIcsEventWithSequenceRetry, cancelIcsEventByUid) are exported
+// specifically so their branching can be exercised against a faked
+// Calendar global.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     hasGuestRelationship: hasGuestRelationship,
