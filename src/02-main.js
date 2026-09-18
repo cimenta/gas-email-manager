@@ -1,4 +1,4 @@
-// Version: 0.16.4
+// Version: 0.16.5
 /**
  * APP_VERSION — the running application version, rendered next to the admin
  * web app's page title via webappGetVersion (src/00-webapp.js, D-01). This
@@ -10,7 +10,7 @@
  * future release -- test/app-version.test.js is the guard that fails the
  * whole suite the moment they ever drift apart.
  */
-const APP_VERSION = '0.16.4';
+const APP_VERSION = '0.16.5';
 
 /**
  * orderThreadsForProcessing — CAUSAL ORDERING GUARANTEE (live-reported bug
