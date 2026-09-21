@@ -7,6 +7,8 @@ const path = require('node:path');
 const {
   parseEnigooTicketText,
   parseKinoArtTicketText,
+  KINO_ART_KNOWN_VENUES,
+  resolveKinoArtKnownVenue,
   parseTicketmasterCzTicketText,
   parseEntradioTicketText,
   resolveTicketingPortal,
@@ -718,6 +720,275 @@ test('parseKinoArtTicketText: extracts the ticketIdentifier even when Gmail\'s r
 test('parseKinoArtTicketText: ticketIdentifier extraction is still correct with no marker present at all (regression guard for the original, unmarked fixture)', () => {
   const parsed = parseKinoArtTicketText(REAL_KINO_ART_BODY_TEXT);
   assert.equal(parsed.ticketIdentifier, '900142');
+});
+
+// --- MULTIPLE HALLS (debug/kino-art-venue-not-recognized) --------------------
+//
+// Live failure, 2026-09-21: order č. 673908 threw "Unrecognized Kino Art
+// ticket text: known venue string not found" and was labeled failed with no
+// retry. Kino Art is ONE cinema at ONE address with MULTIPLE halls ("více
+// sálů"); every order until now happened to be in Malý sál, so
+// KINO_ART_KNOWN_VENUE was written as a SINGLE string. The first order in
+// Velký sál therefore failed the recognition gate outright -- an unhandled
+// class, not a regression. The constant's own comment had already flagged
+// this exact scope limitation ("if Kino Art ever uses a different hall, this
+// needs generalizing THEN, with real data, not guessed now"); this is that
+// day, with that real data.
+//
+// FIXTURE PROVENANCE: taken from the real failing email, TWO independent
+// ways, which agree -- (a) the verbatim getPlainBody() text Gmail produced,
+// quoted back in the owner's own failure-notification email, which is what
+// fixes the line breaks and the "*bold*" markers below; and (b) a code-point
+// dump of the venue cell in the raw base64 HTML part of
+// D:\download\Potvrzení objednávky.eml, which proves the separator is a plain
+// ASCII hyphen-minus (U+002D) between ordinary U+0020 spaces -- NOT an en-dash
+// and NOT a non-breaking space. That is why a literal allowlist entry is
+// sufficient here and no Unicode/whitespace normalization is warranted.
+// Only the customer name is fictionalized (as in REAL_KINO_ART_BODY_TEXT
+// above); it is load-bearing for no anchor. The event name, hall, date,
+// order number and row layout are the real ones.
+const REAL_KINO_ART_VELKY_SAL_BODY_TEXT = [
+  'Potvrzení objednávky',
+  '',
+  'Potvrzení objednávky',
+  '*č. 673908*',
+  'Informace',
+  'Zákazník: *Jan Novák*',
+  'Úhrada: *Comgate*',
+  'Doručení: *Elektronicky*',
+  'Položky',
+  '*Název* *Místo* *Datum a čas* *Umístění* *Cena*',
+  'V srdci divočiny Cihlářská - Velký sál 25. 9. 2026 20:30',
+  'pátek 10 / 11 170 Kč',
+  '(1x Plná cena)',
+  'V srdci divočiny Cihlářská - Velký sál 25. 9. 2026 20:30',
+  'pátek 10 / 12 170 Kč',
+  '(1x Plná cena)',
+  '*Cena celkem* 340 Kč',
+  '*Tento email není vstupenka.*',
+].join('\n');
+
+// THE LOAD-BEARING TEST: the exact email that failed in production must now
+// parse completely and correctly. Asserted as a whole-object deepEqual rather
+// than field-by-field, so a fix that recognizes the hall but mis-bounds the
+// event name (the real risk, since the venue string doubles as the event
+// name's right-hand anchor) cannot pass.
+test('parseKinoArtTicketText: parses the real "Cihlářská - Velký sál" order (č. 673908) that failed in production -- a DIFFERENT hall at the same cinema', () => {
+  assert.deepEqual(parseKinoArtTicketText(REAL_KINO_ART_VELKY_SAL_BODY_TEXT), {
+    eventName: 'V srdci divočiny',
+    location: 'Cihlářská - Velký sál',
+    year: 2026,
+    month: 8,
+    day: 25,
+    hour: 20,
+    minute: 30,
+    ticketIdentifier: '673908',
+  });
+});
+
+// The anti-swap guard. The one-character "fix" for this bug is to change the
+// constant from Malý to Velký, which would parse č. 673908 and break every
+// order that came before it. Pinning BOTH halls in the same run is what makes
+// that shortcut impossible.
+test('parseKinoArtTicketText: BOTH halls are recognized -- adding Velký sál did not displace Malý sál', () => {
+  assert.equal(parseKinoArtTicketText(REAL_KINO_ART_BODY_TEXT).location, 'Cihlářská - Malý sál');
+  assert.equal(parseKinoArtTicketText(REAL_KINO_ART_VELKY_SAL_BODY_TEXT).location, 'Cihlářská - Velký sál');
+});
+
+// location must be the hall that ACTUALLY matched, never a hardcoded constant.
+// Pre-fix, `location` was assigned the single known-venue constant directly,
+// so this distinction did not exist and could be silently reintroduced.
+test('parseKinoArtTicketText: location is the hall that actually matched the text, not a fixed constant', () => {
+  const parsed = parseKinoArtTicketText(REAL_KINO_ART_VELKY_SAL_BODY_TEXT);
+  assert.equal(parsed.location, 'Cihlářská - Velký sál');
+  assert.notEqual(parsed.location, 'Cihlářská - Malý sál');
+  assert.ok(REAL_KINO_ART_VELKY_SAL_BODY_TEXT.includes(parsed.location), 'the returned location must be a literal substring of the input text');
+});
+
+// EARLIEST-OCCURRENCE, not array-order. These two tests are a matched pair and
+// only mean something together: the same two halls appear in both, in opposite
+// textual orders. A resolver written as `KNOWN_VENUES.find(v => text.includes(v))`
+// returns the array's first entry in BOTH cases and so passes one and fails the
+// other. This is what keeps the event-name boundary correct when a purchase
+// spans halls.
+test('parseKinoArtTicketText: with two known halls present, the EARLIEST one in the text bounds the event name (Malý first)', () => {
+  const twoHalls =
+    'Potvrzení objednávky č. 111111 Položky Název Místo Datum a čas Umístění Cena * Film A Cihlářská - Malý sál 7. 8. 2026 17:45 pátek 4 / 2 150 Kč * Film B Cihlářská - Velký sál 8. 8. 2026 19:00 sobota 10 / 1 170 Kč Cena celkem 320 Kč';
+  const parsed = parseKinoArtTicketText(twoHalls);
+  assert.equal(parsed.location, 'Cihlářská - Malý sál');
+  assert.equal(parsed.eventName, 'Film A');
+});
+
+test('parseKinoArtTicketText: with two known halls present, the EARLIEST one in the text bounds the event name (Velký first -- proves it is not array order)', () => {
+  const twoHalls =
+    'Potvrzení objednávky č. 222222 Položky Název Místo Datum a čas Umístění Cena * Film B Cihlářská - Velký sál 8. 8. 2026 19:00 sobota 10 / 1 170 Kč * Film A Cihlářská - Malý sál 7. 8. 2026 17:45 pátek 4 / 2 150 Kč Cena celkem 320 Kč';
+  const parsed = parseKinoArtTicketText(twoHalls);
+  assert.equal(parsed.location, 'Cihlářská - Velký sál');
+  assert.equal(parsed.eventName, 'Film B');
+});
+
+// THE GATE MUST STILL FAIL CLOSED. Widening an allowlist invites deleting it.
+// Unlike the teamio case -- where a throw was being misused to mean "not
+// applicable" -- this throw is a genuine failure: with no locatable hall there
+// is no right-hand boundary for the event name, so there is nothing safe to
+// return. An unknown hall must keep surfacing loudly rather than guessing.
+test('parseKinoArtTicketText: an UNRECOGNIZED hall still throws -- widening the allowlist did not remove the gate', () => {
+  assert.throws(
+    () =>
+      parseKinoArtTicketText(
+        'Potvrzení objednávky č. 333333 Cena * Film C Cihlářská - Neznámý sál 7. 8. 2026 17:45 pátek'
+      ),
+    /known venue string not found/
+  );
+});
+
+test('parseKinoArtTicketText: a completely foreign venue still throws (the original negative case, unchanged)', () => {
+  assert.throws(() => parseKinoArtTicketText('Potvrzení objednávky č. 900142 Cena Movie A Different Venue 7. 8. 2026 17:45'));
+});
+
+// Case sensitivity is DELIBERATE and pinned. The parser matches halls with a
+// literal indexOf; Gmail does not case-fold body text, so a lowercase variant
+// means the text did not come from where we think it did. Pinning this stops a
+// future "just make it case-insensitive" from being mistaken for a free
+// robustness win -- it would widen the event-name anchor's match surface.
+test('parseKinoArtTicketText: hall matching is case-SENSITIVE (a lowercased hall is not recognized)', () => {
+  assert.throws(
+    () => parseKinoArtTicketText('Potvrzení objednávky č. 444444 Cena * Film D cihlářská - velký sál 7. 8. 2026 17:45 pátek'),
+    /known venue string not found/
+  );
+});
+
+// Diacritics are load-bearing. "Velky sal" is how the hall appears once a
+// transport layer has stripped Czech accents -- which is exactly how the
+// failure arrived in the owner's notification. If a stripped form ever parses,
+// the fixture above is not testing the real byte sequence.
+test('parseKinoArtTicketText: a diacritic-stripped hall ("Cihlarska - Velky sal") is NOT recognized -- the allowlist entries are the real accented strings', () => {
+  assert.throws(
+    () => parseKinoArtTicketText('Potvrzení objednávky č. 555555 Cena * Film E Cihlarska - Velky sal 7. 8. 2026 17:45 pátek'),
+    /known venue string not found/
+  );
+});
+
+// Gmail's real rendering inserts "* " row markers (rounds 3 and 4 proved this
+// for Malý sál). The new hall must inherit that tolerance rather than
+// re-discover it in production.
+test('parseKinoArtTicketText: the "* " bullet-marker strip works for Velký sál too, not just the hall it was originally written against', () => {
+  const withMarkers =
+    'Potvrzení objednávky Potvrzení objednávky * č. 673908 Informace Zákazník: Jan Novák Úhrada: Comgate Doručení: Elektronicky Položky Název Místo Datum a čas Umístění Cena * V srdci divočiny Cihlářská - Velký sál 25. 9. 2026 20:30 pátek 10 / 11 170 Kč (1x Plná cena) Cena celkem 170 Kč Tento email není vstupenka.';
+  assert.deepEqual(parseKinoArtTicketText(withMarkers), {
+    eventName: 'V srdci divočiny',
+    location: 'Cihlářská - Velký sál',
+    year: 2026,
+    month: 8,
+    day: 25,
+    hour: 20,
+    minute: 30,
+    ticketIdentifier: '673908',
+  });
+});
+
+// --- KINO_ART_KNOWN_VENUES: structural guards --------------------------------
+
+test('KINO_ART_KNOWN_VENUES: is a non-empty array of strings containing both observed halls', () => {
+  assert.ok(Array.isArray(KINO_ART_KNOWN_VENUES), 'must be an array, not a scalar string (that shape WAS the bug)');
+  assert.ok(KINO_ART_KNOWN_VENUES.length >= 2);
+  KINO_ART_KNOWN_VENUES.forEach(function (venue) {
+    assert.equal(typeof venue, 'string');
+    assert.notEqual(venue.trim(), '');
+  });
+  assert.ok(KINO_ART_KNOWN_VENUES.includes('Cihlářská - Malý sál'));
+  assert.ok(KINO_ART_KNOWN_VENUES.includes('Cihlářská - Velký sál'));
+});
+
+// An empty string in the list would match at index 0 of ANY text, recognizing
+// every email and slicing the event name to nothing. A whitespace-padded entry
+// would silently never match. Both are the plausible ways a future hall gets
+// added wrong, so the list's own shape is asserted rather than trusted.
+test('KINO_ART_KNOWN_VENUES: no entry is empty or whitespace-padded (an empty entry would match every text at index 0)', () => {
+  KINO_ART_KNOWN_VENUES.forEach(function (venue) {
+    assert.notEqual(venue, '');
+    assert.equal(venue, venue.trim());
+  });
+});
+
+test('KINO_ART_KNOWN_VENUES: entries are unique', () => {
+  assert.equal(new Set(KINO_ART_KNOWN_VENUES).size, KINO_ART_KNOWN_VENUES.length);
+});
+
+// Every listed hall must actually be usable by the parser -- a list entry that
+// the parser cannot resolve is decoration. Driven through the public parser,
+// not the internal resolver, so this stays true however the lookup is written.
+test('KINO_ART_KNOWN_VENUES: EVERY listed hall is genuinely recognized by the parser and returned verbatim as the location', () => {
+  KINO_ART_KNOWN_VENUES.forEach(function (venue) {
+    const text = 'Potvrzení objednávky č. 999999 Položky Cena * Nějaký film ' + venue + ' 1. 2. 2027 10:15 pondělí 1 / 1 100 Kč';
+    const parsed = parseKinoArtTicketText(text);
+    assert.equal(parsed.location, venue, 'hall "' + venue + '" is in the list but the parser does not resolve it');
+    assert.equal(parsed.eventName, 'Nějaký film', 'hall "' + venue + '" resolves but mis-bounds the event name');
+  });
+});
+
+// Self-diagnosing failure. When hall #3 appears, the owner's notification
+// email should say which halls ARE known, so the next incident is triaged from
+// the notification alone instead of a source dive.
+test('parseKinoArtTicketText: the unknown-hall error names the halls that ARE known (so the next new hall is diagnosable from the notification alone)', () => {
+  assert.throws(
+    () => parseKinoArtTicketText('Potvrzení objednávky č. 666666 Cena * Film F Cihlářská - Neznámý sál 7. 8. 2026 17:45 pátek'),
+    (err) => {
+      KINO_ART_KNOWN_VENUES.forEach(function (venue) {
+        assert.ok(err.message.includes(venue), 'error message should name the known hall "' + venue + '"');
+      });
+      return true;
+    }
+  );
+});
+
+// --- resolveKinoArtKnownVenue: the lookup itself -----------------------------
+
+test('resolveKinoArtKnownVenue: returns {venue, index} for the hall present in the text, and null when none is', () => {
+  const text = 'Cena * Film Cihlářská - Velký sál 1. 2. 2027 10:15';
+  const found = resolveKinoArtKnownVenue(text);
+  assert.equal(found.venue, 'Cihlářská - Velký sál');
+  assert.equal(found.index, text.indexOf('Cihlářská - Velký sál'));
+  assert.equal(resolveKinoArtKnownVenue('Cena * Film Somewhere Else 1. 2. 2027 10:15'), null);
+});
+
+test('resolveKinoArtKnownVenue: defaults to KINO_ART_KNOWN_VENUES when no list is injected (production calls it with one argument)', () => {
+  KINO_ART_KNOWN_VENUES.forEach(function (venue) {
+    assert.equal(resolveKinoArtKnownVenue('... ' + venue + ' ...').venue, venue);
+  });
+});
+
+// The longest-wins tie-break cannot be reached with the real hall list
+// (neither entry is a prefix of the other), so it is exercised through the
+// injection seam with a deliberately OVERLAPPING list -- the shape the next
+// hall plausibly takes. Without this, that branch is unverifiable speculation.
+test('resolveKinoArtKnownVenue: at the SAME index the LONGEST hall wins (overlapping-name tie-break, via the injected list)', () => {
+  const overlapping = ['Cihlářská - Velký sál', 'Cihlářská - Velký sál balkon'];
+  const text = 'Cena * Film Cihlářská - Velký sál balkon 1. 2. 2027 10:15';
+  assert.equal(resolveKinoArtKnownVenue(text, overlapping).venue, 'Cihlářská - Velký sál balkon');
+  // Order in the list must not change the answer.
+  assert.equal(resolveKinoArtKnownVenue(text, overlapping.slice().reverse()).venue, 'Cihlářská - Velký sál balkon');
+});
+
+test('resolveKinoArtKnownVenue: an empty-string entry is skipped, never matched at index 0 against every text', () => {
+  assert.equal(resolveKinoArtKnownVenue('Cena * Film Somewhere Else 1. 2. 2027 10:15', ['']), null);
+  const text = 'Cena * Film Cihlářská - Malý sál 1. 2. 2027 10:15';
+  assert.equal(resolveKinoArtKnownVenue(text, ['', 'Cihlářská - Malý sál']).venue, 'Cihlářská - Malý sál');
+});
+
+test('resolveKinoArtKnownVenue: an empty injected list yields null (no hall can be resolved)', () => {
+  assert.equal(resolveKinoArtKnownVenue('Cena * Film Cihlářská - Malý sál 1. 2. 2027 10:15', []), null);
+});
+
+test('parseKinoArtTicketText: the unknown-hall error still includes the FULL raw extracted text (diagnostic-on-failure convention preserved)', () => {
+  const rawText = 'Potvrzení objednávky č. 777777 Cena * Film G Cihlářská - Neznámý sál 7. 8. 2026 17:45 pátek';
+  assert.throws(
+    () => parseKinoArtTicketText(rawText),
+    (err) => {
+      assert.ok(err.message.includes(rawText), 'error message should include the full raw extracted text');
+      return true;
+    }
+  );
 });
 
 // --- findKinoArtTicketPdfAttachment -------------------------------------------

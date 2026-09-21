@@ -295,10 +295,92 @@ function parseEnigooTicketText(text) {
   };
 }
 
-// KINO_ART_KNOWN_VENUE — the ONLY Kino Art venue/hall string observed in
-// real data so far. Scope limitation: if Kino Art ever uses a different
-// hall, this needs generalizing THEN, with real data, not guessed now.
-const KINO_ART_KNOWN_VENUE = 'Cihlářská - Malý sál';
+// KINO_ART_KNOWN_VENUES — every Kino Art venue/hall string observed in real
+// data. Kino Art is ONE cinema at ONE address (Cihlářská) with MULTIPLE
+// halls ("více sálů"), so the HALL is the part that varies between orders.
+//
+// This was a single scalar string until 2026-09-21
+// (debug/kino-art-venue-not-recognized): every order up to then happened to
+// be in Malý sál, and the first Velký sál order (č. 673908) threw
+// "known venue string not found" and was labeled failed. The scalar shape
+// was a deliberately deferred generalization — the comment here used to say
+// "if Kino Art ever uses a different hall, this needs generalizing THEN,
+// with real data, not guessed now." That is what this list is; the rule
+// still stands for hall #3.
+//
+// WHY AN ALLOWLIST AND NOT A PATTERN like /Cihlářská - .+ sál/: the venue
+// string does DOUBLE DUTY in parseKinoArtTicketText — it is both the
+// recognition gate AND the right-hand text anchor that bounds the event name
+// (anchor 3 below slices from the "Cena" column header up to the venue's
+// index). A loose pattern would move that boundary wherever it happened to
+// match and could silently truncate or pad the movie title. Literal strings
+// keep the anchor exact.
+//
+// Each entry is the real, accented, byte-verified string as it appears in
+// Gmail's rendering of the confirmation email — plain ASCII hyphen-minus
+// (U+002D) between ordinary U+0020 spaces, confirmed by a code-point dump of
+// the raw HTML part. Matching is case-sensitive and diacritic-sensitive by
+// design; see the tests pinning both.
+const KINO_ART_KNOWN_VENUES = [
+  'Cihlářská - Malý sál', // observed quick-260731-kar (order č. 900142)
+  'Cihlářská - Velký sál', // observed 2026-09-21 (order č. 673908)
+];
+
+/**
+ * resolveKinoArtKnownVenue — locates which known Kino Art hall appears in
+ * the ticket text, and where.
+ *
+ * Returns `{ venue, index }` for the hall occurring EARLIEST in the text, or
+ * `null` when no known hall is present at all.
+ *
+ * EARLIEST OCCURRENCE, NOT LIST ORDER. The naive
+ * `KINO_ART_KNOWN_VENUES.find(v => text.indexOf(v) !== -1)` would return
+ * whichever hall is listed first in the array, regardless of where it sits in
+ * the text. Since the returned index is what bounds the event name, that
+ * would mis-slice the movie title for any purchase whose text mentions two
+ * halls. Scanning for the lowest index keeps the anchor on the FIRST data row
+ * — the same row every other anchor in this parser reads.
+ *
+ * TIES BREAK LONGEST-FIRST. Neither current entry is a prefix of the other,
+ * so on today's list this branch never decides anything. It is here because
+ * the plausible next hall IS an overlapping one — a cinema that already
+ * distinguishes Malý from Velký is exactly the kind that later adds a
+ * "Cihlářská - Velký sál balkon". At a tie, the shorter entry would match
+ * first and leave the tail of the hall name (" balkon") glued onto the event
+ * name. Preferring the longest match at the same index prevents that.
+ *
+ * `knownVenues` is an INJECTION SEAM, not a caller-facing option: production
+ * never passes it (the default IS the module list). It exists so the
+ * longest-wins branch above can be exercised by a test with a deliberately
+ * overlapping list — otherwise that branch is unreachable and untestable on
+ * the real data, which is how speculative code rots into being wrong.
+ *
+ * Pure, no GAS globals.
+ */
+function resolveKinoArtKnownVenue(rawText, knownVenues) {
+  const text = String(rawText || '');
+  const venues = knownVenues || KINO_ART_KNOWN_VENUES;
+  let best = null;
+
+  for (let i = 0; i < venues.length; i++) {
+    const venue = venues[i];
+    // An empty entry would indexOf to 0 against ANY text, recognizing every
+    // email and slicing the event name to nothing. Skipped defensively here
+    // as well as asserted on the list itself in the tests.
+    if (!venue) {
+      continue;
+    }
+    const index = text.indexOf(venue);
+    if (index === -1) {
+      continue;
+    }
+    if (best === null || index < best.index || (index === best.index && venue.length > best.venue.length)) {
+      best = { venue: venue, index: index };
+    }
+  }
+
+  return best;
+}
 
 /**
  * parseKinoArtTicketText — the kinoart.cz-specific ticket-TEXT parser.
@@ -312,8 +394,11 @@ const KINO_ART_KNOWN_VENUE = 'Cihlářská - Malý sál';
  *      date format from enigoo.cz's zero-padded no-space `15.08.2026`,
  *      hence its own distinct regex. First occurrence only (the row
  *      repeats once per seat in a multi-seat purchase).
- *   2. VENUE: the literal `KINO_ART_KNOWN_VENUE` string — always
- *      immediately precedes the date/time in the flattened body text.
+ *   2. VENUE (HALL): whichever literal string from `KINO_ART_KNOWN_VENUES`
+ *      occurs EARLIEST in the text (see resolveKinoArtKnownVenue) — always
+ *      immediately precedes the date/time in the flattened body text. Kino
+ *      Art has several halls at the one address, so this is an allowlist,
+ *      not a single string.
  *   3. EVENT (movie) NAME: everything between the LAST occurrence of the
  *      literal column-header word `Cena` (capital C — this
  *      case-SENSITIVE match is what distinguishes it from the lowercase
@@ -353,11 +438,25 @@ function parseKinoArtTicketText(text) {
     throw new Error('Minute out of range (0-59) in Kino Art ticket date/time match. Full extracted text:\n' + rawText);
   }
 
-  const knownVenueIndex = rawText.indexOf(KINO_ART_KNOWN_VENUE);
-  if (knownVenueIndex === -1) {
-    throw new Error('Unrecognized Kino Art ticket text: known venue string not found. Full extracted text:\n' + rawText);
+  // The hall is resolved against KINO_ART_KNOWN_VENUES rather than a single
+  // constant (Kino Art has several halls). Fails CLOSED on an unknown hall:
+  // without a located hall there is no right-hand boundary for the event
+  // name, so there is nothing safe to return and guessing would write a
+  // wrong calendar event. The error names the halls we DO know, so the next
+  // new hall is diagnosable straight from the failure-notification email.
+  const knownVenue = resolveKinoArtKnownVenue(rawText);
+  if (!knownVenue) {
+    throw new Error(
+      'Unrecognized Kino Art ticket text: known venue string not found (known halls: ' +
+        KINO_ART_KNOWN_VENUES.join(' | ') +
+        '). Full extracted text:\n' +
+        rawText
+    );
   }
-  const location = KINO_ART_KNOWN_VENUE;
+  const knownVenueIndex = knownVenue.index;
+  // The hall that ACTUALLY matched — never a fixed constant, which is what
+  // this was before multiple halls existed.
+  const location = knownVenue.venue;
 
   const cenaIndex = rawText.indexOf('Cena');
   if (cenaIndex === -1 || cenaIndex >= knownVenueIndex) {
@@ -881,7 +980,7 @@ function extractEntradioTicketLines(region) {
  * appears only in the body). One portal entry covers all of them, so
  * every anchor below is on Entradio's own TEMPLATE structure (section
  * headings, bold markers, label words), never on any one venue's name —
- * the opposite of the KINO_ART_KNOWN_VENUE approach, deliberately so.
+ * the opposite of the KINO_ART_KNOWN_VENUES approach, deliberately so.
  *
  * Extraction anchors (pattern-anchored, never line-position):
  *   1. SECTIONS: each dash-underlined heading is located ONCE up front
@@ -2943,6 +3042,12 @@ if (typeof module !== 'undefined' && module.exports) {
     resolveTicketingCalendarId: resolveTicketingCalendarId,
     parseEnigooTicketText: parseEnigooTicketText,
     parseKinoArtTicketText: parseKinoArtTicketText,
+    // Exported so the tests can assert the hall list's SHAPE directly (array,
+    // non-empty, unique, no blank/padded entries) and drive every listed hall
+    // through the parser. The scalar-vs-list shape IS what the
+    // kino-art-venue-not-recognized bug was, so it is pinned, not trusted.
+    KINO_ART_KNOWN_VENUES: KINO_ART_KNOWN_VENUES,
+    resolveKinoArtKnownVenue: resolveKinoArtKnownVenue,
     parseTicketmasterCzTicketText: parseTicketmasterCzTicketText,
     parseEntradioTicketText: parseEntradioTicketText,
     TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL: TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL,

@@ -259,7 +259,7 @@ function buildTransportAttachmentFilename(summary, startDate, ticketIdentifier) 
  * address as an `email=` query param) is never touched by any anchor here.
  *
  * SCOPE LIMITATION (deliberate, same "don't guess at an unobserved
- * variant" discipline as KINO_ART_KNOWN_VENUE and
+ * variant" discipline as KINO_ART_KNOWN_VENUES and
  * findKinoArtTicketPdfAttachment, src/07-action-ticketing-portals.js):
  * every anchor here uses `.exec` (no `/g`), matching only the FIRST trip
  * line in the body, so an order confirmation bundling more than one
