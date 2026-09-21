@@ -50,22 +50,32 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // whether it then survives in the permanent folder + becomes a real
   // Calendar attachment, or is deleted).
   //
-  // The shipped default seeds FOUR entries: enigoo.cz (the original portal
+  // The shipped default seeds FIVE entries: enigoo.cz (the original portal
   // this feature was built from, PDF/OCR-sourced — see the sibling action
   // file's parseEnigooTicketText), Kino Art (kinoart.cz, a Czech cinema,
   // added quick-260731-kar, BODY-SOURCED — see the sibling action file's
   // parseKinoArtTicketText and its class-level "TWO PROCESSING MODES" doc
   // for the full architecture), Ticketmaster CZ (ticketmaster.cz,
   // added quick-260816-ocw, also BODY-SOURCED — see the sibling action
-  // file's parseTicketmasterCzTicketText), and Entradio
+  // file's parseTicketmasterCzTicketText), Entradio
   // (no-reply@app.entradio.cz, added debug/entradio-portal-not-supported,
   // also BODY-SOURCED — see the sibling action file's
-  // parseEntradioTicketText). All four entries ship with
+  // parseEntradioTicketText), and Fever (hello@feverup.com, added
+  // quick-260921-gj0, also BODY-SOURCED — see the sibling action file's
+  // parseFeverTicketText). All five entries ship with
   // calendarId left null and insertPdfIntoEvent left false — the owner
   // fills in the real calendar ID and decides the attachment toggle live,
   // per entry, via rebuildScriptProperties() + Script Properties, matching
   // the now-established settings workflow (never committed to git — same
   // placeholder-calendar-ID convention as CONFIG.calendarId itself).
+  //
+  // FEVER (hello@feverup.com): the sender also sends ordinary marketing
+  // mail, which is why a content detector (feverTextHasPurchaseDetails) is
+  // registered for it in the sibling action file — applied from day one
+  // rather than discovered live, per debug/ticketmaster-cz-order-confirm.
+  // Unlike Entradio, this portal DOES have a registered PDF finder
+  // (findFeverTicketPdfAttachment), so turning insertPdfIntoEvent on
+  // attaches the real ticket PDF the confirmation email carries.
   //
   // ENTRADIO IS A PLATFORM, NOT A VENUE (worth knowing before adding a
   // "missing" venue here): app.entradio.cz is a white-label ticketing system
@@ -113,7 +123,7 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // src/05-action-cfg-ics-import.js for the exact same JSON-vs-JS-object-
   // literal pitfall a real owner mistake already hit once for that other
   // JSON-typed setting):
-  // [{"identifyingEmail":"no-reply@enigoo.cz","calendarId":"abc123@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":"def456@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"noreply@ticketmaster.cz","calendarId":"ghi789@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"no-reply@app.entradio.cz","calendarId":"jkl012@group.calendar.google.com","insertPdfIntoEvent":false}]
+  // [{"identifyingEmail":"no-reply@enigoo.cz","calendarId":"abc123@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":"def456@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"noreply@ticketmaster.cz","calendarId":"ghi789@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"no-reply@app.entradio.cz","calendarId":"jkl012@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"hello@feverup.com","calendarId":"mno345@group.calendar.google.com","insertPdfIntoEvent":false}]
   get ticketingPortals() {
     return getJsonSetting(
       '07-action-ticketing-portals-TICKETING_PORTALS',
@@ -122,6 +132,7 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
         { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false },
         { identifyingEmail: 'noreply@ticketmaster.cz', calendarId: null, insertPdfIntoEvent: false },
         { identifyingEmail: 'no-reply@app.entradio.cz', calendarId: null, insertPdfIntoEvent: false },
+        { identifyingEmail: 'hello@feverup.com', calendarId: null, insertPdfIntoEvent: false },
       ],
       isValidTicketingPortalsShape
     );

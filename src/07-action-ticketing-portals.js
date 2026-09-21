@@ -1442,6 +1442,556 @@ function fetchEntradioAttachments(message, parsedTicket, portal) {
   return attachments;
 }
 
+/* ===========================================================================
+ * FEVER (hello@feverup.com) — the FIFTH supported portal, the FOURTH
+ * body-sourced one (quick-260921-gj0).
+ * ===========================================================================
+ *
+ * THE STRUCTURAL FACT THAT SHAPES EVERYTHING BELOW: the real sample .eml
+ * (269 KB, "Potvrzení nákupu na Fever_ Candlelight...") is multipart/mixed
+ * with exactly TWO parts -- one text/html and one application/pdf ticket
+ * attachment. There is NO text/plain part at all, unlike every other portal
+ * in this file. message.getPlainBody() therefore returns GMAIL'S OWN
+ * rendering of that HTML, whose exact line breaking cannot be observed from
+ * the .eml and must not be assumed. Every extraction anchor below is
+ * therefore a LITERAL MARKER, never a line position, and each of the two
+ * required markers is verified to occur exactly once in the real rendered
+ * text.
+ *
+ * The date format is Czech-ABBREVIATED with a 12-hour day-period marker
+ * ("so 19 pro - 08:00 odp.") and carries NO YEAR anywhere in the body -- the
+ * only four-digit year in the whole message is the footer copyright line.
+ * The event year is therefore INFERRED from an injected reference date (the
+ * message's own received date, see processTicketFromMessageBody below),
+ * never from a live clock read inside the parser.
+ */
+
+// FEVER_PURCHASE_DETAILS_MARKER / FEVER_MAP_LINK_MARKER — the two REQUIRED
+// literal anchors, each verified to occur exactly once in the real rendered
+// text. The greeting prefix "Děkujeme! " is deliberately EXCLUDED from the
+// purchase-details marker so a personalized greeting cannot break it.
+const FEVER_PURCHASE_DETAILS_MARKER = 'Tady jsou podrobnosti o tvém nákupu';
+const FEVER_MAP_LINK_MARKER = 'Zobrazit na mapě';
+
+// FEVER_BUY_AGAIN_LABEL — the "Koupit znova" call-to-action label that can
+// share either the event-name region or the venue region with its real
+// neighbour, depending on Gmail's unknown line breaking. Skipped by
+// feverFirstNonEmptyLine/feverLastNonEmptyLine below so it is never mistaken
+// for either field.
+const FEVER_BUY_AGAIN_LABEL = 'Koupit znova';
+
+// FEVER_IMAGE_PLACEHOLDER_PATTERN (quick-260921-gj0 round 2, D-18/D-19) —
+// Gmail renders an <img> in the plain-text view of an HTML email as a
+// bracketed placeholder line of the form "[image: <alt text>]". This was
+// OBSERVED LIVE, not assumed: on the owner's first real run, Fever's
+// hero/cover image rendered as exactly such a line, sitting between the
+// purchase-details marker and the real event-name line, and it became the
+// created event's summary verbatim. The bracket-and-prefix shape
+// ("[image:...]") is the DIRECTLY OBSERVED part; the tolerance around it --
+// case-insensitive, optional whitespace after the opening bracket and around
+// the prefix -- is the deliberate ASSUMPTION layered on that one
+// observation, so a minor rendering difference in spacing or casing cannot
+// re-open this bug. The inner class `[^\]]*` stops at the closing bracket,
+// so two placeholders on one line (e.g. a social-icon row) are two separate
+// matches rather than one greedy match swallowing the real text between
+// them. `g`-flagged and used ONLY via String.replace (feverLineIsOnlyImagePlaceholders
+// below) -- never .test/.exec -- so no `lastIndex` state can leak between
+// calls, the same discipline FEVER_TICKET_CODE_PATTERN documents for itself.
+const FEVER_IMAGE_PLACEHOLDER_PATTERN = /\[\s*image\s*:[^\]]*\]/gi;
+
+// FEVER_SUBJECT_PREFIX (quick-260921-gj0 round 2, D-24) — the fixed template
+// text Fever's confirmation-email Subject header starts with, decoded from
+// the real sample's own RFC 2047 MIME-encoded-word Subject header. Everything
+// after this prefix, verbatim, is the event name -- confirmed against the
+// real sample, where the text after the prefix matched the owner's expected
+// event name character-for-character, INCLUDING the event name's own
+// internal colon. The subject is matched as a PREFIX ONLY (indexOf === 0)
+// and NEVER split on a colon: the event name itself may contain one, so a
+// colon-split (or "take the Nth segment") read would truncate it -- exactly
+// the kind of plausible-looking bug this round exists to prevent. This exact
+// prefix is evidenced by ONE real sample -- the same epistemic footing as the
+// eleven un-observed entries in FEVER_MONTH_ABBREVIATIONS -- which is why the
+// body-sourced fallback (feverFirstNonEmptyLine over the purchase-details/
+// map-link region) still exists below rather than this becoming a hard
+// requirement.
+const FEVER_SUBJECT_PREFIX = 'Potvrzení nákupu na Fever: ';
+
+// FEVER_ORDER_SUMMARY_MARKER — the optional RIGHT bound for the per-seat
+// ticket-code scan (see parseFeverTicketText below). Its absence simply
+// widens the scan to the end of the text rather than failing the parse.
+const FEVER_ORDER_SUMMARY_MARKER = 'Shrnutí objednávky';
+
+// FEVER_DATE_TIME_PATTERN — day digits, whitespace, a month token (any run
+// of characters that is neither whitespace, a digit, nor common punctuation
+// -- this is what lets Czech diacritics through without a Unicode property
+// escape), whitespace, a hyphen/en-dash/em-dash separator, whitespace,
+// HH:MM, then an OPTIONAL day-period token restricted to the two literal
+// markers this table actually defines ("odp"/"dop", D-05) with an optional
+// trailing period. Anchoring on the day digits is what skips the leading
+// weekday abbreviation ("so") without needing to match it at all.
+const FEVER_DATE_TIME_PATTERN = /(\d{1,2})\s+([^\s\d.,;:!?()'"-]+)\s+[-–—]\s+(\d{1,2}):(\d{2})(?:\s*(odp|dop)\.?)?/i;
+
+// FEVER_TICKET_ID_PATTERN — "ID vstupenky: <digits>", this portal's dedup
+// ticketIdentifier (D-09), scoped to the whole purchase.
+const FEVER_TICKET_ID_PATTERN = /ID vstupenky:\s*(\d+)/;
+
+// FEVER_TICKET_QUANTITY_PATTERN — "<N> x <label>" (e.g. "5 x Balkon").
+// Informational only -- NEVER an event multiplier (D-10).
+const FEVER_TICKET_QUANTITY_PATTERN = /(\d+)\s+x\s+([^\r\n]+)/;
+
+// FEVER_TICKET_CODE_PATTERN — a word-bounded run of exactly twenty uppercase
+// letters/digits, the per-seat ticket code shape actually observed. `g`
+// flagged; parseFeverTicketText resets `lastIndex` to 0 before every scan so
+// no state leaks between calls (the same discipline
+// findEntradioTicketCodeMatches documents for its own locally-declared
+// pattern).
+const FEVER_TICKET_CODE_PATTERN = /\b[A-Z0-9]{20}\b/g;
+
+// FEVER_MONTH_ABBREVIATIONS — the twelve Czech abbreviated month names,
+// keyed by their DIACRITIC-FOLDED lowercase form, mapping to the
+// ZERO-INDEXED month number. Only "pro" (prosinec/December) is DIRECTLY
+// OBSERVED in the real sample; the other eleven come from the standard
+// Czech (CLDR/ICU) abbreviated-month set, which the sample's own "so"
+// weekday abbreviation and "odp." day-period abbreviation confirm Fever is
+// formatting with. An unrecognized token is a controlled throw that NAMES
+// the token and carries the full raw text, so the owner's failure email
+// makes the next fix a one-line table addition.
+const FEVER_MONTH_ABBREVIATIONS = {
+  led: 0,
+  uno: 1,
+  bre: 2,
+  dub: 3,
+  kve: 4,
+  cvn: 5,
+  cvc: 6,
+  srp: 7,
+  zar: 8,
+  rij: 9,
+  lis: 10,
+  pro: 11,
+};
+
+// FEVER_DIACRITIC_FOLDS — the small explicit character map covering exactly
+// the accented characters that occur in the twelve abbreviations above
+// (úno, bře, kvě, čvn, čvc, zář, říj). An explicit map is used rather than
+// Unicode normalization so the behavior is identical and inspectable under
+// both the Apps Script and Node runtimes.
+const FEVER_DIACRITIC_FOLDS = {
+  ú: 'u',
+  ě: 'e',
+  ř: 'r',
+  č: 'c',
+  á: 'a',
+  í: 'i',
+};
+
+/**
+ * feverNormalizeBodyText — pure; returns a copy of `text` with U+00A0
+ * (non-breaking space) folded to a plain space, and U+034F, U+00AD, U+200B,
+ * U+200C, U+200D, U+2060 and U+FEFF removed entirely. These are the
+ * characters the real sample's preheader padding actually contains (U+00A0
+ * x293, U+034F x288, U+200C x288, U+00AD x288, grep-verified). The
+ * normalized copy is used ONLY for matching inside parseFeverTicketText;
+ * every thrown message there still reports the ORIGINAL raw text. Never
+ * throws; a null/undefined input normalizes to ''.
+ */
+function feverNormalizeBodyText(text) {
+  return String(text || '')
+    .replace(/ /g, ' ')
+    .replace(/[͏­​‌‍⁠﻿]/g, '');
+}
+
+/**
+ * feverLineIsOnlyImagePlaceholders (quick-260921-gj0 round 2, D-19) — pure;
+ * `trimmedLine` is assumed ALREADY TRIMMED (the caller does that once, as
+ * part of its own loop). Returns true when the line is non-empty AND
+ * removing every FEVER_IMAGE_PLACEHOLDER_PATTERN match leaves nothing but
+ * whitespace. A line that MIXES a placeholder with real text (e.g. "[image:
+ * icon] Some Real Text") is deliberately NOT skipped (D-20) -- this is a
+ * narrow skip for lines that are placeholder-only, not a blanket bracket
+ * filter. A consequence: a region consisting only of such lines has nothing
+ * left to return, which is exactly what drives parseFeverTicketText's
+ * EXISTING full-raw-text throw below rather than a wrong summary.
+ */
+function feverLineIsOnlyImagePlaceholders(trimmedLine) {
+  if (!trimmedLine) {
+    return false;
+  }
+  return trimmedLine.replace(FEVER_IMAGE_PLACEHOLDER_PATTERN, '').trim() === '';
+}
+
+/**
+ * feverFirstNonEmptyLine / feverLastNonEmptyLine — pure; split `text` on
+ * carriage-return, newline or both, trim each line, skip empty lines, any
+ * line equal to FEVER_BUY_AGAIN_LABEL, and (quick-260921-gj0 round 2, D-19)
+ * any line that is ONLY a Gmail image-placeholder per
+ * feverLineIsOnlyImagePlaceholders, and return the first/last surviving line
+ * (or '' when there is none). These two are what make parseFeverTicketText
+ * indifferent to whether a marker shares a line with its neighbour, immune
+ * to the "Koupit znova" label landing between fields (D-02/D-03), and immune
+ * to a Gmail-rendered image placeholder landing between fields (D-18/D-19).
+ * Both still return the ORIGINAL trimmed line verbatim, which is what keeps
+ * the parser's normalizedText.indexOf(...) anchors working unchanged.
+ */
+function feverFirstNonEmptyLine(text) {
+  const lines = String(text).split(/\r\n|\r|\n/);
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed && trimmed !== FEVER_BUY_AGAIN_LABEL && !feverLineIsOnlyImagePlaceholders(trimmed)) {
+      return trimmed;
+    }
+  }
+
+  return '';
+}
+
+function feverLastNonEmptyLine(text) {
+  const lines = String(text).split(/\r\n|\r|\n/);
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim();
+    if (trimmed && trimmed !== FEVER_BUY_AGAIN_LABEL && !feverLineIsOnlyImagePlaceholders(trimmed)) {
+      return trimmed;
+    }
+  }
+
+  return '';
+}
+
+/**
+ * feverFoldMonthToken — pure; lowercases `token` and applies
+ * FEVER_DIACRITIC_FOLDS character-by-character, so both the accented and
+ * the diacritic-stripped spelling of a month abbreviation resolve to the
+ * same FEVER_MONTH_ABBREVIATIONS key.
+ */
+function feverFoldMonthToken(token) {
+  return String(token)
+    .toLowerCase()
+    .split('')
+    .map(function (ch) {
+      return FEVER_DIACRITIC_FOLDS[ch] || ch;
+    })
+    .join('');
+}
+
+/**
+ * feverResolveEventYear — pure; per D-07, the event year is the reference
+ * date's own year, UNLESS the parsed (month, day) falls strictly BEFORE the
+ * reference date's own (month, day) -- in which case it rolls to the NEXT
+ * year. Rests on the buy-before-the-event invariant: a ticket confirmation
+ * is always dated before the event it is for. DOCUMENTED LIMITATION: a
+ * ticket bought more than a year ahead of its event would resolve to the
+ * wrong year; accepted, since Fever events are weeks-to-months out.
+ */
+function feverResolveEventYear(month, day, referenceDate) {
+  const refMonth = referenceDate.getMonth();
+  const refDay = referenceDate.getDate();
+  const isBeforeReference = month < refMonth || (month === refMonth && day < refDay);
+
+  return isBeforeReference ? referenceDate.getFullYear() + 1 : referenceDate.getFullYear();
+}
+
+/**
+ * feverEventNameFromSubject (quick-260921-gj0 round 2, D-24/D-25) — pure;
+ * NEVER THROWS. Returns the trimmed remainder of `subject` after
+ * FEVER_SUBJECT_PREFIX when `subject` is a string that starts with that
+ * exact prefix (case-sensitive, matched as a PREFIX via indexOf === 0 --
+ * never split on a colon, since the event name itself may carry one) AND
+ * something non-whitespace remains after stripping it. Returns `null` for a
+ * subject that is missing, not a string, does not start with the prefix, or
+ * leaves nothing but whitespace after it -- each of those is the documented
+ * FALLBACK condition to the body-sourced read, not an error.
+ */
+function feverEventNameFromSubject(subject) {
+  if (typeof subject !== 'string' || subject.indexOf(FEVER_SUBJECT_PREFIX) !== 0) {
+    return null;
+  }
+  const remainder = subject.slice(FEVER_SUBJECT_PREFIX.length).trim();
+  return remainder || null;
+}
+
+/**
+ * parseFeverTicketText — the hello@feverup.com ticket-BODY parser.
+ *
+ * THE REAL RENDERED TEXT (fictionalized values substituted per this file's
+ * fixture convention -- see the test suite):
+ *
+ *     Zobrazit v prohlížeči
+ *     Děkujeme! Tady jsou podrobnosti o tvém nákupu
+ *     <event name>                                  <-- event name
+ *     Koupit znova
+ *     <venue> - <address>                           <-- location
+ *     Zobrazit na mapě
+ *     so 19 pro - 08:00 odp.                         <-- date/time
+ *     Změnit datum nebo čas
+ *     ...
+ *     5 x Balkon
+ *     ID vstupenky: <digits>
+ *     <20-char code> (one per seat)
+ *     ...
+ *     Shrnutí objednávky
+ *
+ * The real message has NO text/plain part at all (see this section's
+ * class-level doc), so this parser reads Gmail's own rendering of the HTML
+ * and its line breaking cannot be assumed -- precisely why every anchor
+ * below is a literal marker with first/last-non-empty-line reads on either
+ * side of it, never a line-position read.
+ *
+ * Extraction anchors, in order:
+ *   1. PURCHASE-DETAILS MARKER (required) -- FEVER_PURCHASE_DETAILS_MARKER.
+ *   2. MAP-LINK MARKER (required, strictly after #1) --
+ *      FEVER_MAP_LINK_MARKER.
+ *   3. EVENT NAME -- the first non-empty line between #1 and #2.
+ *   4. LOCATION -- the LAST non-empty line between the end of the event-name
+ *      line and #2. Bounding on both sides is what makes this correct
+ *      whether or not the venue shares a line with either neighbour.
+ *   5. DATE/TIME -- the first FEVER_DATE_TIME_PATTERN match strictly after
+ *      #1. The matched substring, whitespace-collapsed, is kept verbatim for
+ *      `description` -- the same "reproduce the real line back to the owner
+ *      rather than rebuild it from the parsed digits" choice the
+ *      Ticketmaster CZ and Entradio parsers make.
+ *   6. TICKET IDENTIFIER (optional) -- FEVER_TICKET_ID_PATTERN.
+ *   7. TICKET QUANTITY (optional) -- FEVER_TICKET_QUANTITY_PATTERN.
+ *   8. PER-SEAT CODES (optional) -- every FEVER_TICKET_CODE_PATTERN match in
+ *      the region from the ticket-ID match's end to FEVER_ORDER_SUMMARY_MARKER
+ *      (or the end of text when that marker is absent).
+ *
+ * The date format is Czech-ABBREVIATED and genuinely different from all
+ * four existing parsers' formats (enigoo.cz's DD.MM.YYYY, Kino Art's
+ * D. M. YYYY, Ticketmaster CZ's full-English-name format, Entradio's
+ * D. M. YYYY) -- it gets its OWN regex and its OWN table
+ * (FEVER_MONTH_ABBREVIATIONS); TICKETMASTER_CZ_MONTH_NAMES holds full
+ * ENGLISH names and is not reusable here (D-04).
+ *
+ * DAY-PERIOD RULES (D-05): "odp." (afternoon) adds 12 to a 1-11 hour and
+ * leaves 12 as 12; "dop." (morning) leaves a 1-11 hour and turns 12 into 0.
+ * Only the "odp." branch is directly observed in the real sample; "dop."
+ * and the noon/midnight edges follow the standard 12-hour convention and are
+ * documented as such. A missing day-period marker is read as 24-hour, never
+ * treated as an error.
+ *
+ * THE BODY CARRIES NO YEAR (D-06/D-07): the only four-digit year anywhere in
+ * the real message is the footer copyright line, which is never read as the
+ * event year. The year comes entirely from the injected `referenceDate`
+ * (the message's received date) via feverResolveEventYear. This parser
+ * deliberately never reads a live clock -- a missing or non-Date
+ * `referenceDate` is a controlled throw, not a silent fallback to the
+ * current clock, since a silently-wrong calendar year is a worse failure
+ * than a diagnostic email.
+ *
+ * `ticketIdentifier` makes the DEDUP SAFETY NET ACTIVE for this portal -- a
+ * real difference from the Ticketmaster CZ parser's documented null
+ * identifier. `ticketQuantity` is NEVER an event multiplier, per this
+ * file's class-level ONE-EVENT-PER-PURCHASE design (D-10).
+ *
+ * D-11 NEGATIVE CONTRACT: the per-seat codes go into `description` ONLY; no
+ * `ticketCodes` field is returned, no attachment fetcher is registered for
+ * this portal, no outbound HTTP call is made, and no new OAuth scope is
+ * needed.
+ *
+ * The real email carries one PDF attachment (`order_*.pdf`), which the
+ * registered findFeverTicketPdfAttachment can attach when the owner turns
+ * `insertPdfIntoEvent` on (D-12).
+ *
+ * No speculative handling of an unobserved rendering variant is applied
+ * here: any such variant is handled THEN, with real data, per this file's
+ * established discipline -- the full-raw-text throws below are what make
+ * that possible. ROUND 2 (quick-260921-gj0, live-test-driven): the owner's
+ * first live run revealed that Gmail renders an <img> in the plain-text view
+ * as a bracketed "[image: <alt text>]" line, which landed between the
+ * purchase-details marker and the real event-name line and became the
+ * created event's summary. feverFirstNonEmptyLine/feverLastNonEmptyLine now
+ * skip such a line (D-18/D-19) -- the one thing derived from that
+ * observation, applied narrowly (D-20).
+ *
+ * `subject` (quick-260921-gj0 round 2, D-25) is an OPTIONAL third parameter,
+ * NEVER validated and NEVER throws on its own. EVENT NAME resolution order
+ * (D-24):
+ *   1. SUBJECT PATH (primary) -- feverEventNameFromSubject(subject): the
+ *      real Subject header decodes to FEVER_SUBJECT_PREFIX followed by the
+ *      event name VERBATIM, including its own internal colon. Matched as a
+ *      PREFIX ONLY, never split on a colon. Evidenced by exactly ONE real
+ *      sample -- the same footing as FEVER_MONTH_ABBREVIATIONS' eleven
+ *      un-observed entries.
+ *   2. BODY PATH (fallback) -- used when the subject is missing, not a
+ *      string, does not start with the prefix, or leaves nothing after it.
+ *      This is the pre-existing feverFirstNonEmptyLine read, now hardened by
+ *      the D-19 placeholder skip.
+ *   3. Neither yields anything -> the EXISTING controlled event-name throw,
+ *      wording unchanged, carrying the full raw body text.
+ * LOCATION stays body-sourced ALWAYS (D-26): there is no venue signal in the
+ * subject, so the body's own first surviving line is what anchors the
+ * location region, regardless of which source won the event name. The
+ * content detector (feverTextHasPurchaseDetails) stays body-based too --
+ * D-08's marketing-mail admission gate is unaffected by this round.
+ *
+ * Returns `{ eventName, location, year, month, day, hour, minute,
+ * ticketIdentifier, ticketQuantity, description }` (month zero-indexed;
+ * deliberately NO `ticketCodes` field, D-11). Throws a controlled Error,
+ * always ending with the full raw `text` untruncated, if `referenceDate` is
+ * missing/invalid, if either required marker is absent, if the event name
+ * or location cannot be extracted, if no date/time pattern is found, if the
+ * month abbreviation is unrecognized, or if the matched hour/minute are out
+ * of range. Pure, no GAS globals, no clock read.
+ */
+function parseFeverTicketText(text, referenceDate, subject) {
+  const rawText = String(text || '');
+  const normalizedText = feverNormalizeBodyText(rawText);
+
+  if (!(referenceDate instanceof Date) || isNaN(referenceDate.getTime())) {
+    throw new Error(
+      'Fever ticket text carries no year of its own: a valid reference Date (the message\'s received date) is required. Full extracted text:\n' +
+        rawText
+    );
+  }
+
+  const purchaseDetailsIndex = normalizedText.indexOf(FEVER_PURCHASE_DETAILS_MARKER);
+  if (purchaseDetailsIndex === -1) {
+    throw new Error(
+      'Unrecognized Fever ticket text: "Tady jsou podrobnosti o tvém nákupu" marker not found. Full extracted text:\n' + rawText
+    );
+  }
+  const afterPurchaseDetails = purchaseDetailsIndex + FEVER_PURCHASE_DETAILS_MARKER.length;
+
+  const mapLinkIndex = normalizedText.indexOf(FEVER_MAP_LINK_MARKER, afterPurchaseDetails);
+  if (mapLinkIndex === -1 || mapLinkIndex <= purchaseDetailsIndex) {
+    throw new Error('Unrecognized Fever ticket text: "Zobrazit na mapě" marker not found. Full extracted text:\n' + rawText);
+  }
+
+  const eventNameRegion = normalizedText.slice(afterPurchaseDetails, mapLinkIndex);
+  // quick-260921-gj0 round 2, D-24: the SUBJECT is the PRIMARY event-name
+  // source; the body's own first surviving line (hardened against Gmail
+  // image-placeholder lines by feverFirstNonEmptyLine, D-19) is computed
+  // unconditionally and used as the FALLBACK -- and, per D-26, ALSO as the
+  // sole anchor for the LOCATION region below, regardless of which source
+  // won the event name.
+  const bodyEventNameLine = feverFirstNonEmptyLine(eventNameRegion);
+  const subjectEventName = feverEventNameFromSubject(subject);
+  const eventName = subjectEventName || bodyEventNameLine;
+  if (!eventName) {
+    throw new Error(
+      'Unrecognized Fever ticket text: could not extract the event name between the purchase-details marker and the map-link marker. Full extracted text:\n' +
+        rawText
+    );
+  }
+
+  // LOCATION anchors on the BODY's own first surviving line ALWAYS, never on
+  // the resolved `eventName` (D-26): a SUBJECT-sourced eventName need not
+  // appear in the body at all, in which case
+  // normalizedText.indexOf(eventName, ...) would return -1 and silently
+  // widen this region to start one character before the purchase-details
+  // marker, corrupting the location read.
+  const bodyEventNameAbsoluteIndex = normalizedText.indexOf(bodyEventNameLine, afterPurchaseDetails);
+  const bodyEventNameLineEndIndex = bodyEventNameAbsoluteIndex + bodyEventNameLine.length;
+  const locationRegion = normalizedText.slice(bodyEventNameLineEndIndex, mapLinkIndex);
+  const location = feverLastNonEmptyLine(locationRegion);
+  if (!location) {
+    throw new Error(
+      'Unrecognized Fever ticket text: could not extract the location between the event name and the map-link marker. Full extracted text:\n' +
+        rawText
+    );
+  }
+
+  const searchRegionForDateTime = normalizedText.slice(afterPurchaseDetails);
+  const dateTimeMatch = FEVER_DATE_TIME_PATTERN.exec(searchRegionForDateTime);
+  if (!dateTimeMatch) {
+    throw new Error('Unrecognized Fever ticket text: no date/time pattern found. Full extracted text:\n' + rawText);
+  }
+
+  const day = Number(dateTimeMatch[1]);
+  const monthToken = dateTimeMatch[2];
+  const foldedMonthToken = feverFoldMonthToken(monthToken);
+  if (!Object.prototype.hasOwnProperty.call(FEVER_MONTH_ABBREVIATIONS, foldedMonthToken)) {
+    throw new Error(
+      'Unrecognized Fever ticket text: unrecognized month abbreviation "' + monthToken + '". Full extracted text:\n' + rawText
+    );
+  }
+  const month = FEVER_MONTH_ABBREVIATIONS[foldedMonthToken];
+
+  let hour = Number(dateTimeMatch[3]);
+  const minute = Number(dateTimeMatch[4]);
+  const meridiem = dateTimeMatch[5] ? dateTimeMatch[5].toLowerCase() : null;
+
+  if (meridiem) {
+    if (hour < 1 || hour > 12) {
+      throw new Error('Hour out of range (1-12) in Fever ticket date/time match. Full extracted text:\n' + rawText);
+    }
+    if (meridiem === 'odp') {
+      hour = hour === 12 ? 12 : hour + 12;
+    } else {
+      hour = hour === 12 ? 0 : hour;
+    }
+  } else if (hour < 0 || hour > 23) {
+    throw new Error('Hour out of range (0-23) in Fever ticket date/time match. Full extracted text:\n' + rawText);
+  }
+
+  if (minute < 0 || minute > 59) {
+    throw new Error('Minute out of range (0-59) in Fever ticket date/time match. Full extracted text:\n' + rawText);
+  }
+
+  const year = feverResolveEventYear(month, day, referenceDate);
+  const dateTimeText = dateTimeMatch[0].replace(/\s+/g, ' ').trim();
+
+  const ticketIdentifierMatch = FEVER_TICKET_ID_PATTERN.exec(normalizedText);
+  const ticketIdentifier = ticketIdentifierMatch ? ticketIdentifierMatch[1] : null;
+
+  const quantityMatch = FEVER_TICKET_QUANTITY_PATTERN.exec(normalizedText);
+  const ticketQuantity = quantityMatch ? Number(quantityMatch[1]) : null;
+
+  let codesRegion = '';
+  if (ticketIdentifierMatch) {
+    const codesStart = ticketIdentifierMatch.index + ticketIdentifierMatch[0].length;
+    const orderSummaryIndex = normalizedText.indexOf(FEVER_ORDER_SUMMARY_MARKER, codesStart);
+    codesRegion = normalizedText.slice(codesStart, orderSummaryIndex === -1 ? normalizedText.length : orderSummaryIndex);
+  }
+
+  FEVER_TICKET_CODE_PATTERN.lastIndex = 0;
+  const ticketCodes = [];
+  let codeMatch;
+  while ((codeMatch = FEVER_TICKET_CODE_PATTERN.exec(codesRegion)) !== null) {
+    ticketCodes.push(codeMatch[0]);
+  }
+
+  const descriptionParagraphs = [eventName, location, dateTimeText];
+  if (ticketIdentifier) {
+    descriptionParagraphs.push('ID vstupenky: ' + ticketIdentifier);
+  }
+  if (quantityMatch) {
+    descriptionParagraphs.push(quantityMatch[0].replace(/\s+/g, ' ').trim());
+  }
+  if (ticketCodes.length > 0) {
+    descriptionParagraphs.push(ticketCodes.join('\n'));
+  }
+
+  return {
+    eventName: eventName,
+    location: location,
+    year: year,
+    month: month,
+    day: day,
+    hour: hour,
+    minute: minute,
+    ticketIdentifier: ticketIdentifier,
+    ticketQuantity: ticketQuantity,
+    description: descriptionParagraphs.join('\n\n'),
+  };
+}
+
+/**
+ * feverTextHasPurchaseDetails — the body-content admission predicate for
+ * this portal (D-08): hello@feverup.com also sends ordinary marketing mail,
+ * so admitting on sender alone would repeat the exact bug already fixed
+ * once for Ticketmaster CZ (debug/ticketmaster-cz-order-confirm) -- routine
+ * promotional mail gets claimed, fails to parse, and emails the owner a
+ * spurious failure notification. Returns a LITERAL boolean for whether the
+ * normalized text contains FEVER_PURCHASE_DETAILS_MARKER. Never throws,
+ * tolerates a null/undefined/empty body. Pure, no GAS globals.
+ */
+function feverTextHasPurchaseDetails(text) {
+  return feverNormalizeBodyText(text).indexOf(FEVER_PURCHASE_DETAILS_MARKER) !== -1;
+}
+
 /**
  * TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL — the local (single-file)
  * registry mapping a BODY-SOURCED ticketing portal's `identifyingEmail`
@@ -1455,6 +2005,7 @@ const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
   'rezervace@kinoart.cz': parseKinoArtTicketText,
   'noreply@ticketmaster.cz': parseTicketmasterCzTicketText,
   'no-reply@app.entradio.cz': parseEntradioTicketText,
+  'hello@feverup.com': parseFeverTicketText,
 };
 
 /**
@@ -1465,6 +2016,9 @@ const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
  * to the RIGHT parser — adding a future portal means adding one new
  * parser function plus one new entry here, nothing else.
  */
+// DELIBERATE ABSENCE: there is NO 'hello@feverup.com' key here (D-01). Fever
+// is body-sourced -- everything the calendar event needs is already in the
+// email body, so no Drive upload and no OCR conversion is needed for it.
 const TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL = {
   'no-reply@enigoo.cz': parseEnigooTicketText,
 };
@@ -1684,6 +2238,29 @@ function findTicketmasterCzTicketPdfAttachment(message) {
 }
 
 /**
+ * findFeverTicketPdfAttachment — Fever's own ticket-PDF finder for the
+ * OPTIONAL `insertPdfIntoEvent` attachment path (D-12). The real observed
+ * email carries exactly one PDF attachment, filename
+ * `order_125529770.pdf`. Returns the FIRST qualifying PDF attachment whose
+ * name contains `"order_"`, or `null` — same discipline as
+ * findKinoArtTicketPdfAttachment and findTicketmasterCzTicketPdfAttachment
+ * above. SCOPE LIMITATION: a differently-named attachment would need
+ * handling THEN, with real data. Pure, no GAS globals.
+ */
+function findFeverTicketPdfAttachment(message) {
+  const pdfAttachments = findTicketPdfAttachments(message);
+
+  for (let i = 0; i < pdfAttachments.length; i++) {
+    const name = pdfAttachments[i].getName() || '';
+    if (name.indexOf('order_') !== -1) {
+      return pdfAttachments[i];
+    }
+  }
+
+  return null;
+}
+
+/**
  * TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL — the local
  * (single-file) registry mapping a BODY-SOURCED ticketing portal's
  * `identifyingEmail` to its own ticket-PDF-finder function, kept as a
@@ -1704,6 +2281,7 @@ function findTicketmasterCzTicketPdfAttachment(message) {
 const TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL = {
   'rezervace@kinoart.cz': findKinoArtTicketPdfAttachment,
   'noreply@ticketmaster.cz': findTicketmasterCzTicketPdfAttachment,
+  'hello@feverup.com': findFeverTicketPdfAttachment,
 };
 
 /**
@@ -1726,6 +2304,9 @@ const TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL = {
  * array: it is called BEFORE the Calendar event is created, and an
  * attachment failure must never be able to cost the owner the event.
  */
+// DELIBERATE ABSENCE: there is NO 'hello@feverup.com' key here (D-11). The
+// per-seat codes fold into `description` only; this portal makes no
+// outbound HTTP call and needs no new OAuth scope.
 const TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL = {
   'no-reply@app.entradio.cz': fetchEntradioAttachments,
 };
@@ -1752,6 +2333,9 @@ const TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL = {
  */
 const TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL = {
   'noreply@ticketmaster.cz': ticketmasterCzTextHasOrderDetails,
+  // hello@feverup.com also sends ordinary marketing mail (D-08) -- applied
+  // here from day one rather than discovered live, unlike Ticketmaster CZ.
+  'hello@feverup.com': feverTextHasPurchaseDetails,
 };
 
 /**
@@ -2153,6 +2737,16 @@ function processTicketPdfAttachment(attachment, portal) {
  *   4. Build and insert the Calendar event via the SHARED
  *      createTicketCalendarEvent, passing the accumulated attachments
  *      ARRAY.
+ *
+ * BODY-PARSER CONTRACT (quick-260921-gj0): the registered body parser is
+ * always called with a SECOND argument, `message.getDate()` — the message's
+ * received date (D-07) — and, as of round 2, a THIRD argument,
+ * `message.getSubject()` — the message's subject (D-25). Both exist for
+ * portals (Fever) whose body carries no year of its own (date) or whose
+ * subject is a cleaner event-name source than the body (subject); the three
+ * pre-existing body parsers each take fewer parameters and simply ignore the
+ * extra arguments, so their behavior is unchanged.
+ *
  * GAS-only (GmailMessage/DriveApp/CalendarApp/Calendar globals) — not
  * unit-tested, proven only by the live checkpoint; the pure logic it
  * depends on (parseKinoArtTicketText and friends) IS fully unit-tested.
@@ -2165,7 +2759,7 @@ function processTicketFromMessageBody(message, portal) {
   if (!parseTicketBody) {
     throw new Error('No ticket-body parser registered for ticketing portal: ' + portal.identifyingEmail);
   }
-  const parsedTicket = parseTicketBody(bodyText);
+  const parsedTicket = parseTicketBody(bodyText, message.getDate(), message.getSubject());
 
   if (isDuplicateTicketPurchase(parsedTicket.ticketIdentifier, calendarId)) {
     return;
@@ -2398,5 +2992,10 @@ if (typeof module !== 'undefined' && module.exports) {
     // absence IS the owner-scoped boundary of this fix.
     ticketmasterCzTextHasOrderDetails: ticketmasterCzTextHasOrderDetails,
     TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL: TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL,
+    // The fifth portal, Fever (quick-260921-gj0).
+    parseFeverTicketText: parseFeverTicketText,
+    feverTextHasPurchaseDetails: feverTextHasPurchaseDetails,
+    findFeverTicketPdfAttachment: findFeverTicketPdfAttachment,
+    feverResolveEventYear: feverResolveEventYear,
   };
 }

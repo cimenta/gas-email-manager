@@ -177,13 +177,12 @@ test('buildRebuiltPropertiesMap: the real SETTINGS_REGISTRY, with no live overri
     // The new v0.6.0 string field -> its real code default, not the sentinel.
     assert.equal(map['01-setup-TICKET_ATTACHMENT_DRIVE_FOLDER_NAME'], 'GAS Email Manager - Ticket Attachments');
 
-    // The new v0.6.0 json field (four seeded portal entries as of
-    // debug/entradio-portal-not-supported: enigoo.cz, Kino Art,
-    // Ticketmaster CZ, and Entradio, non-empty) -> its real formatted value,
-    // not the sentinel.
+    // The new v0.6.0 json field (FIVE seeded portal entries as of
+    // quick-260921-gj0: enigoo.cz, Kino Art, Ticketmaster CZ, Entradio, and
+    // Fever, non-empty) -> its real formatted value, not the sentinel.
     assert.equal(
       map['07-action-ticketing-portals-TICKETING_PORTALS'],
-      '[{"identifyingEmail":"no-reply@enigoo.cz","calendarId":null,"insertPdfIntoEvent":false},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":null,"insertPdfIntoEvent":false},{"identifyingEmail":"noreply@ticketmaster.cz","calendarId":null,"insertPdfIntoEvent":false},{"identifyingEmail":"no-reply@app.entradio.cz","calendarId":null,"insertPdfIntoEvent":false}]'
+      '[{"identifyingEmail":"no-reply@enigoo.cz","calendarId":null,"insertPdfIntoEvent":false},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":null,"insertPdfIntoEvent":false},{"identifyingEmail":"noreply@ticketmaster.cz","calendarId":null,"insertPdfIntoEvent":false},{"identifyingEmail":"no-reply@app.entradio.cz","calendarId":null,"insertPdfIntoEvent":false},{"identifyingEmail":"hello@feverup.com","calendarId":null,"insertPdfIntoEvent":false}]'
     );
 
     // quick-260803-us3: ICS_ACTION_CONFIG.excludeFrom's empty-array code
@@ -520,7 +519,7 @@ test('CRITICAL: with PropertiesService absent (Node), every BOOKING_ACTION_CONFI
   assert.equal(BOOKING_ACTION_CONFIG.calendarId, null);
 });
 
-test('CRITICAL: with PropertiesService absent (Node), every TICKETING_PORTALS_ACTION_CONFIG field matches its exact pre-refactor default (quick-260731-tix, updated quick-260731-kar for the Kino Art entry, quick-260816-ocw for the Ticketmaster CZ entry, debug/entradio-portal-not-supported for the Entradio entry)', () => {
+test('CRITICAL: with PropertiesService absent (Node), every TICKETING_PORTALS_ACTION_CONFIG field matches its exact pre-refactor default (quick-260731-tix, updated quick-260731-kar for the Kino Art entry, quick-260816-ocw for the Ticketmaster CZ entry, debug/entradio-portal-not-supported for the Entradio entry, quick-260921-gj0 for the Fever entry -- five seeded entries)', () => {
   assert.equal(typeof PropertiesService, 'undefined');
   assert.equal(TICKETING_PORTALS_ACTION_CONFIG.enabled, true);
   assert.equal(TICKETING_PORTALS_ACTION_CONFIG.notifyOnFailure, true);
@@ -529,6 +528,7 @@ test('CRITICAL: with PropertiesService absent (Node), every TICKETING_PORTALS_AC
     { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false },
     { identifyingEmail: 'noreply@ticketmaster.cz', calendarId: null, insertPdfIntoEvent: false },
     { identifyingEmail: 'no-reply@app.entradio.cz', calendarId: null, insertPdfIntoEvent: false },
+    { identifyingEmail: 'hello@feverup.com', calendarId: null, insertPdfIntoEvent: false },
   ]);
 });
 

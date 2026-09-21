@@ -40,6 +40,11 @@ const {
   // debug/ticketmaster-cz-order-confirm: the body-content admission gate.
   ticketmasterCzTextHasOrderDetails,
   TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL,
+  // quick-260921-gj0: the FIFTH portal, Fever (hello@feverup.com).
+  parseFeverTicketText,
+  feverTextHasPurchaseDetails,
+  findFeverTicketPdfAttachment,
+  feverResolveEventYear,
 } = require('../src/07-action-ticketing-portals.js');
 
 // --- parseEnigooTicketText ---------------------------------------------------
@@ -465,7 +470,20 @@ function fakeAttachment(name, contentType) {
 // the envelope-only admission gate went unnoticed (see that session's "why no
 // gate caught it"). It defaults to '' rather than being required, so a portal
 // with no registered body-content detector is unaffected.
-function fakeMessage(fromHeader, attachments, plainBody) {
+//
+// `receivedDate` (quick-260921-gj0) is an OPTIONAL fourth parameter exposed
+// as `getDate()`, added because processTicketFromMessageBody now passes the
+// message's own received date through to the registered body parser (D-07,
+// Fever's year-inference source). Defaults to `undefined` -- a caller that
+// never invokes processTicketFromMessageBody through this fake is unaffected.
+//
+// `subject` (quick-260921-gj0 round 2, D-27) is an OPTIONAL fifth parameter
+// exposed as `getSubject()`, added because processTicketFromMessageBody now
+// ALSO passes the message's own subject through to the registered body
+// parser (D-25, Fever's primary event-name source). Same reasoning as
+// `receivedDate` above: defaults to `undefined`, inert for any caller that
+// never invokes processTicketFromMessageBody through this fake.
+function fakeMessage(fromHeader, attachments, plainBody, receivedDate, subject) {
   return {
     getFrom: function () {
       return fromHeader;
@@ -475,6 +493,12 @@ function fakeMessage(fromHeader, attachments, plainBody) {
     },
     getPlainBody: function () {
       return plainBody || '';
+    },
+    getDate: function () {
+      return receivedDate;
+    },
+    getSubject: function () {
+      return subject;
     },
   };
 }
@@ -1155,11 +1179,11 @@ test('TICKETING_PORTALS_ACTION_CONFIG: the shipped default seeds a THIRD entry f
   assert.equal(resolveTicketingCalendarId(thirdPortal, 'DEFAULT_CAL'), 'DEFAULT_CAL');
 });
 
-test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are still the unchanged enigoo.cz and Kino Art entries, array length is 4 (updated debug/entradio-portal-not-supported)', () => {
+test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are still the unchanged enigoo.cz and Kino Art entries, array length is 5 (updated quick-260921-gj0)', () => {
   const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
   const portals = TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals;
 
-  assert.equal(portals.length, 4);
+  assert.equal(portals.length, 5);
   assert.deepEqual(portals[0], { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[1], { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false });
 });
@@ -1529,10 +1553,10 @@ test('TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL: noreply@ticketmaster.c
   assert.strictEqual(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL['noreply@ticketmaster.cz'], ticketmasterCzTextHasOrderDetails);
 });
 
-test('TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL: has NO entry for Kino Art or Entradio -- the fix is scoped to Ticketmaster CZ only, their variants are unverified', () => {
+test('TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL: has NO entry for Kino Art or Entradio -- the fix is scoped to Ticketmaster CZ (and, since quick-260921-gj0, Fever) only, the Kino Art/Entradio variants are unverified', () => {
   assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL, 'rezervace@kinoart.cz'), false);
   assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL, 'no-reply@app.entradio.cz'), false);
-  assert.deepEqual(Object.keys(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL), ['noreply@ticketmaster.cz']);
+  assert.deepEqual(Object.keys(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL), ['noreply@ticketmaster.cz', 'hello@feverup.com']);
 });
 
 test('FAIL-OPEN on a missing detector: a Kino Art message with an EMPTY body still yields exactly one "body"-mode job -- unchanged from before the fix', () => {
@@ -3141,6 +3165,20 @@ function entradioBodyModeMessage() {
     getAttachments: function () {
       return [fakeAttachment('VOP_Metropol.pdf', 'application/pdf')];
     },
+    // quick-260921-gj0: processTicketFromMessageBody now calls
+    // message.getDate() unconditionally (D-07) -- parseEntradioTicketText
+    // takes a single parameter and ignores the extra argument, so the exact
+    // date value here is inert; it only needs to exist so the call doesn't
+    // throw.
+    getDate: function () {
+      return new Date(2026, 8, 20);
+    },
+    // quick-260921-gj0 round 2: processTicketFromMessageBody now ALSO calls
+    // message.getSubject() unconditionally (D-25/D-27) -- same reasoning as
+    // getDate() above, inert for parseEntradioTicketText.
+    getSubject: function () {
+      return 'Potvrzení objednávky Entradio';
+    },
   };
 }
 
@@ -3282,6 +3320,16 @@ function kinoArtBodyModeMessage() {
         }),
       ];
     },
+    // quick-260921-gj0: same reasoning as entradioBodyModeMessage's own
+    // getDate() above -- parseKinoArtTicketText ignores the extra argument.
+    getDate: function () {
+      return new Date(2026, 8, 20);
+    },
+    // quick-260921-gj0 round 2: same reasoning as entradioBodyModeMessage's
+    // own getSubject() above -- parseKinoArtTicketText ignores it too.
+    getSubject: function () {
+      return 'Potvrzení rezervace Kino Art';
+    },
   };
 }
 
@@ -3325,5 +3373,792 @@ test('processTicketFromMessageBody: a Kino Art message with insertPdfIntoEvent O
     assert.deepEqual(calls.inserted[0].optionalArgs, {});
     assert.deepEqual(calls.fetched, []);
     assert.equal(calls.notified.length, 0);
+  });
+});
+
+// --- parseFeverTicketText (quick-260921-gj0: the FIFTH supported portal, ---
+// --- the FOURTH body-sourced one) --------------------------------------------
+//
+// Fever (hello@feverup.com) confirmation emails carry ALL calendar-event data
+// in the BODY -- event name, venue/address, the Czech-abbreviated date/time,
+// and the per-seat ticket codes. Real sample inspected directly (269 KB
+// .eml, "Potvrzení nákupu na Fever_ Candlelight..."): the message is
+// multipart/mixed with exactly TWO parts, one text/html and one
+// application/pdf ticket attachment -- there is NO text/plain part at all,
+// unlike every other portal in this file. message.getPlainBody() therefore
+// returns GMAIL'S OWN rendering of that HTML, whose exact line breaking
+// cannot be observed from the .eml and must not be assumed. Every anchor
+// below is therefore a LITERAL MARKER (never a line position), each verified
+// to occur exactly once in the rendered text.
+//
+// The date format is Czech-ABBREVIATED ("so 19 pro - 08:00 odp.") with a
+// 12-hour day-period marker (odp./dop.) and carries NO YEAR anywhere in the
+// body -- the only four-digit year in the whole message is the footer
+// copyright line. The event year is therefore INFERRED from an injected
+// reference date (the message's own received date), never from a live
+// clock read inside the parser.
+//
+// hello@feverup.com also sends ordinary marketing mail, so a content
+// detector (feverTextHasPurchaseDetails) is registered -- the same
+// debug/ticketmaster-cz-order-confirm pattern already established for
+// Ticketmaster CZ, applied here from day one rather than discovered live.
+//
+// FIXTURE PROVENANCE: reproduces the real sample's rendered text sequence,
+// with a FICTIONAL event name, venue, ticket ID and seat codes (the real
+// values are live entry credentials and must never reach the repo -- see
+// push-public.bat's leak guard). The real character classes that matter are
+// preserved: non-ASCII Czech letters and a colon in the event name, and a
+// hyphen plus non-ASCII Czech letters in the venue string. The real
+// invisible preheader characters (U+034F, U+200C, U+00AD) and at least one
+// U+00A0 (non-breaking space) are reproduced explicitly so the fixture
+// exercises feverNormalizeBodyText, not just the visible text.
+
+const FEVER_FIXTURE_CODES = [
+  'QWERT12345ZXCVB67890',
+  'ASDFG23456HJKLM78901',
+  'POIUY34567LKJHG89012',
+  'MNBVC45678TYUIO90123',
+  'ZXCVB56789QWERT01234',
+];
+
+const FEVER_FIXTURE_EVENT_NAME = 'Vánoční trhy: Staroměstské náměstí';
+const FEVER_FIXTURE_LOCATION = 'Obecní dům - Náměstí Republiky 5, Praha-Vinohrady';
+const FEVER_FIXTURE_DATE_LINE = 'so 19 pro - 08:00 odp.';
+const FEVER_FIXTURE_TICKET_ID = '512345678';
+
+// The real sample's preheader padding, reproduced with the SAME invisible
+// characters actually present (U+034F, U+200C, U+00AD -- all removed by
+// feverNormalizeBodyText) plus a non-breaking space (U+00A0, folded to a
+// plain space).
+const FEVER_PREHEADER_PADDING = '͏͏‌‌­­ ';
+
+const FEVER_BODY_LINES = [
+  FEVER_PREHEADER_PADDING,
+  'Zobrazit v prohlížeči',
+  'Děkujeme! Tady jsou podrobnosti o tvém nákupu',
+  FEVER_FIXTURE_EVENT_NAME,
+  'Koupit znova',
+  FEVER_FIXTURE_LOCATION,
+  'Zobrazit na mapě',
+  FEVER_FIXTURE_DATE_LINE,
+  'Změnit datum nebo čas',
+  '',
+  '5 x Balkon',
+  'ID vstupenky: ' + FEVER_FIXTURE_TICKET_ID,
+].concat(FEVER_FIXTURE_CODES, ['', 'Shrnutí objednávky']);
+
+// REAL_FEVER_BODY_TEXT -- LF-joined (a separate test below proves a
+// CRLF-joined variant of this same fixture parses identically).
+const REAL_FEVER_BODY_TEXT = FEVER_BODY_LINES.join('\n');
+
+// FEVER_REFERENCE_DATE -- stands in for the message's own received date
+// (message.getDate()). Chosen so the fixture's event month/day (19
+// December) falls LATER in the SAME year as this reference date (15
+// November), so year inference resolves to the reference year with no
+// rollover (D-07).
+const FEVER_REFERENCE_DATE = new Date(2026, 10, 15);
+
+const EXPECTED_FEVER_DESCRIPTION = [
+  FEVER_FIXTURE_EVENT_NAME,
+  FEVER_FIXTURE_LOCATION,
+  '19 pro - 08:00 odp.',
+  'ID vstupenky: ' + FEVER_FIXTURE_TICKET_ID,
+  '5 x Balkon',
+  FEVER_FIXTURE_CODES.join('\n'),
+].join('\n\n');
+
+// buildFeverFixture -- a parametrized variant of REAL_FEVER_BODY_TEXT for the
+// tests below that only need to vary ONE field (the date line, the quantity
+// line, the ticket-ID line, or the seat codes) while keeping every other
+// anchor at its real-shape default.
+function buildFeverFixture(overrides) {
+  const opts = overrides || {};
+  const eventName = opts.eventName === undefined ? FEVER_FIXTURE_EVENT_NAME : opts.eventName;
+  const location = opts.location === undefined ? FEVER_FIXTURE_LOCATION : opts.location;
+  const dateLine = opts.dateLine === undefined ? FEVER_FIXTURE_DATE_LINE : opts.dateLine;
+  const quantityLine = opts.quantityLine === undefined ? '5 x Balkon' : opts.quantityLine;
+  const ticketIdLine = opts.ticketIdLine === undefined ? 'ID vstupenky: ' + FEVER_FIXTURE_TICKET_ID : opts.ticketIdLine;
+  const codes = opts.codes === undefined ? FEVER_FIXTURE_CODES : opts.codes;
+
+  const lines = [
+    'Zobrazit v prohlížeči',
+    'Děkujeme! Tady jsou podrobnosti o tvém nákupu',
+    eventName,
+    'Koupit znova',
+    location,
+    'Zobrazit na mapě',
+    dateLine,
+    'Změnit datum nebo čas',
+    '',
+  ];
+  if (quantityLine) {
+    lines.push(quantityLine);
+  }
+  if (ticketIdLine) {
+    lines.push(ticketIdLine);
+  }
+  codes.forEach(function (code) {
+    lines.push(code);
+  });
+  lines.push('');
+  lines.push('Shrnutí objednávky');
+
+  return lines.join('\n');
+}
+
+test('parseFeverTicketText: parses the real fixture into the full expected shape in one assertion -- December proving the zero-indexed month, and the afternoon marker proving the 12-hour conversion', () => {
+  assert.deepEqual(parseFeverTicketText(REAL_FEVER_BODY_TEXT, FEVER_REFERENCE_DATE), {
+    eventName: FEVER_FIXTURE_EVENT_NAME,
+    location: FEVER_FIXTURE_LOCATION,
+    year: 2026,
+    month: 11,
+    day: 19,
+    hour: 20,
+    minute: 0,
+    ticketIdentifier: FEVER_FIXTURE_TICKET_ID,
+    ticketQuantity: 5,
+    description: EXPECTED_FEVER_DESCRIPTION,
+  });
+});
+
+const FEVER_MONTH_TABLE_ORDER = [
+  ['led', 0],
+  ['úno', 1],
+  ['bře', 2],
+  ['dub', 3],
+  ['kvě', 4],
+  ['čvn', 5],
+  ['čvc', 6],
+  ['srp', 7],
+  ['zář', 8],
+  ['říj', 9],
+  ['lis', 10],
+  ['pro', 11],
+];
+
+test('parseFeverTicketText: all twelve Czech abbreviated month names resolve to the correct zero-indexed month number (D-04)', () => {
+  FEVER_MONTH_TABLE_ORDER.forEach(function (entry) {
+    const token = entry[0];
+    const expectedMonth = entry[1];
+    const parsed = parseFeverTicketText(buildFeverFixture({ dateLine: 'so 19 ' + token + ' - 08:00 odp.' }), FEVER_REFERENCE_DATE);
+    assert.equal(parsed.month, expectedMonth, 'month abbreviation "' + token + '" should resolve to ' + expectedMonth);
+  });
+});
+
+const FEVER_DIACRITIC_MONTH_PAIRS = [
+  ['úno', 'uno', 1],
+  ['bře', 'bre', 2],
+  ['kvě', 'kve', 4],
+  ['čvn', 'cvn', 5],
+  ['čvc', 'cvc', 6],
+  ['zář', 'zar', 8],
+  ['říj', 'rij', 9],
+];
+
+test('parseFeverTicketText: each of the seven diacritic-bearing month abbreviations also resolves in its diacritic-stripped form, to the SAME month number (D-04)', () => {
+  FEVER_DIACRITIC_MONTH_PAIRS.forEach(function (pair) {
+    const withDiacritics = parseFeverTicketText(buildFeverFixture({ dateLine: 'so 19 ' + pair[0] + ' - 08:00 odp.' }), FEVER_REFERENCE_DATE);
+    const withoutDiacritics = parseFeverTicketText(buildFeverFixture({ dateLine: 'so 19 ' + pair[1] + ' - 08:00 odp.' }), FEVER_REFERENCE_DATE);
+    assert.equal(withDiacritics.month, pair[2]);
+    assert.equal(withoutDiacritics.month, pair[2]);
+  });
+});
+
+test('parseFeverTicketText: invisible preheader characters and non-breaking spaces used as literal separators do not disrupt extraction (D-03)', () => {
+  const separator = '͏‌­ ';
+  const body = [
+    'Zobrazit v prohlížeči',
+    'Tady jsou podrobnosti o tvém nákupu' + separator + FEVER_FIXTURE_EVENT_NAME,
+    'Koupit znova',
+    FEVER_FIXTURE_LOCATION + separator + 'Zobrazit na mapě',
+    FEVER_FIXTURE_DATE_LINE,
+    '5 x Balkon',
+    'ID vstupenky: ' + FEVER_FIXTURE_TICKET_ID,
+  ].join('\n');
+
+  const parsed = parseFeverTicketText(body, FEVER_REFERENCE_DATE);
+  assert.equal(parsed.eventName, FEVER_FIXTURE_EVENT_NAME);
+  assert.equal(parsed.location, FEVER_FIXTURE_LOCATION);
+});
+
+test('parseFeverTicketText: a CRLF-joined variant of the real fixture parses identically to the default LF-joined fixture -- separator-agnostic', () => {
+  const crlfBody = FEVER_BODY_LINES.join('\r\n');
+  assert.deepEqual(
+    parseFeverTicketText(crlfBody, FEVER_REFERENCE_DATE),
+    parseFeverTicketText(REAL_FEVER_BODY_TEXT, FEVER_REFERENCE_DATE)
+  );
+});
+
+test('parseFeverTicketText: THE LINE-LAYOUT PROOF -- the purchase-details marker sharing a line with the event name, and the venue sharing a line with the map-link marker, still parses to the SAME eventName and location (D-02/D-03)', () => {
+  const sharedLineBody = [
+    'Zobrazit v prohlížeči',
+    'Děkujeme! Tady jsou podrobnosti o tvém nákupu ' + FEVER_FIXTURE_EVENT_NAME,
+    'Koupit znova',
+    FEVER_FIXTURE_LOCATION + ' Zobrazit na mapě',
+    FEVER_FIXTURE_DATE_LINE,
+    '5 x Balkon',
+    'ID vstupenky: ' + FEVER_FIXTURE_TICKET_ID,
+  ].join('\n');
+
+  const parsed = parseFeverTicketText(sharedLineBody, FEVER_REFERENCE_DATE);
+  assert.equal(parsed.eventName, FEVER_FIXTURE_EVENT_NAME);
+  assert.equal(parsed.location, FEVER_FIXTURE_LOCATION);
+});
+
+test('parseFeverTicketText: the "Koupit znova" buy-again label is never mistaken for the event name or the venue, whether present between them or absent entirely', () => {
+  const withLabel = parseFeverTicketText(buildFeverFixture({}), FEVER_REFERENCE_DATE);
+  assert.equal(withLabel.eventName, FEVER_FIXTURE_EVENT_NAME);
+  assert.equal(withLabel.location, FEVER_FIXTURE_LOCATION);
+
+  const withoutLabelBody = [
+    'Zobrazit v prohlížeči',
+    'Tady jsou podrobnosti o tvém nákupu',
+    FEVER_FIXTURE_EVENT_NAME,
+    FEVER_FIXTURE_LOCATION,
+    'Zobrazit na mapě',
+    FEVER_FIXTURE_DATE_LINE,
+    '5 x Balkon',
+    'ID vstupenky: ' + FEVER_FIXTURE_TICKET_ID,
+  ].join('\n');
+  const withoutLabel = parseFeverTicketText(withoutLabelBody, FEVER_REFERENCE_DATE);
+  assert.equal(withoutLabel.eventName, FEVER_FIXTURE_EVENT_NAME);
+  assert.equal(withoutLabel.location, FEVER_FIXTURE_LOCATION);
+});
+
+test('parseFeverTicketText: "odp." adds 12 to a 1-11 hour and leaves 12 as 12; "dop." leaves a 1-11 hour and turns 12 into 0; no marker at all is read as 24-hour (D-05)', () => {
+  assert.equal(parseFeverTicketText(buildFeverFixture({ dateLine: 'so 19 pro - 08:00 odp.' }), FEVER_REFERENCE_DATE).hour, 20);
+  assert.equal(parseFeverTicketText(buildFeverFixture({ dateLine: 'so 19 pro - 12:00 odp.' }), FEVER_REFERENCE_DATE).hour, 12);
+  assert.equal(parseFeverTicketText(buildFeverFixture({ dateLine: 'so 19 pro - 08:00 dop.' }), FEVER_REFERENCE_DATE).hour, 8);
+  assert.equal(parseFeverTicketText(buildFeverFixture({ dateLine: 'so 19 pro - 12:00 dop.' }), FEVER_REFERENCE_DATE).hour, 0);
+  assert.equal(parseFeverTicketText(buildFeverFixture({ dateLine: 'so 19 pro - 20:00' }), FEVER_REFERENCE_DATE).hour, 20);
+});
+
+test('parseFeverTicketText: year inference -- an earlier reference month/day keeps the reference year, a later one rolls forward, an equal month/day keeps the reference year (D-07)', () => {
+  const body = buildFeverFixture({ dateLine: 'so 19 pro - 08:00 odp.' }); // 19 December
+
+  // Reference EARLIER in the year (15 November) -- event still ahead, same year.
+  assert.equal(parseFeverTicketText(body, new Date(2026, 10, 15)).year, 2026);
+
+  // Reference LATER in the year (31 December) -- event already passed, rolls forward.
+  assert.equal(parseFeverTicketText(body, new Date(2026, 11, 31)).year, 2027);
+
+  // Reference on the SAME month/day (19 December) -- bought on the day of the event.
+  assert.equal(parseFeverTicketText(body, new Date(2026, 11, 19)).year, 2026);
+});
+
+test('parseFeverTicketText: a missing reference date, or a non-Date second argument, throws with the full raw text -- never a silent fallback to the current clock (D-07)', () => {
+  const body = buildFeverFixture({});
+
+  assert.throws(
+    () => parseFeverTicketText(body),
+    (err) => {
+      assert.match(err.message, /reference date|received date/i);
+      assert.ok(err.message.includes(body), 'error message should include the full raw text');
+      return true;
+    }
+  );
+
+  assert.throws(
+    () => parseFeverTicketText(body, '2026-12-19'),
+    (err) => {
+      assert.match(err.message, /reference date|received date/i);
+      assert.ok(err.message.includes(body), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseFeverTicketText: ticketIdentifier is the "ID vstupenky:" number; a body with no such label parses successfully with ticketIdentifier null and a truthy eventName (D-09)', () => {
+  const parsed = parseFeverTicketText(REAL_FEVER_BODY_TEXT, FEVER_REFERENCE_DATE);
+  assert.equal(parsed.ticketIdentifier, FEVER_FIXTURE_TICKET_ID);
+
+  const noIdBody = buildFeverFixture({ ticketIdLine: '', codes: [] });
+  const noIdParsed = parseFeverTicketText(noIdBody, FEVER_REFERENCE_DATE);
+  assert.equal(noIdParsed.ticketIdentifier, null);
+  assert.ok(noIdParsed.eventName);
+});
+
+test('parseFeverTicketText: ONE-EVENT-PER-PURCHASE -- quantities of 1, 2 and 5 all produce identical eventName/location/date fields, differing only in ticketQuantity and description (D-10)', () => {
+  const q1 = parseFeverTicketText(buildFeverFixture({ quantityLine: '1 x Balkon' }), FEVER_REFERENCE_DATE);
+  const q2 = parseFeverTicketText(buildFeverFixture({ quantityLine: '2 x Balkon' }), FEVER_REFERENCE_DATE);
+  const q5 = parseFeverTicketText(buildFeverFixture({ quantityLine: '5 x Balkon' }), FEVER_REFERENCE_DATE);
+
+  [q1, q2, q5].forEach(function (parsed) {
+    assert.equal(parsed.eventName, FEVER_FIXTURE_EVENT_NAME);
+    assert.equal(parsed.location, FEVER_FIXTURE_LOCATION);
+    assert.equal(parsed.year, 2026);
+    assert.equal(parsed.month, 11);
+    assert.equal(parsed.day, 19);
+    assert.equal(parsed.hour, 20);
+    assert.equal(parsed.minute, 0);
+  });
+
+  assert.equal(q1.ticketQuantity, 1);
+  assert.equal(q2.ticketQuantity, 2);
+  assert.equal(q5.ticketQuantity, 5);
+  assert.notEqual(q1.description, q5.description);
+});
+
+test('parseFeverTicketText: description contains the event name, location, raw date line, ticket ID and every per-seat code; no ticketCodes property is returned at all (D-11)', () => {
+  const parsed = parseFeverTicketText(REAL_FEVER_BODY_TEXT, FEVER_REFERENCE_DATE);
+
+  assert.ok(parsed.description.includes(FEVER_FIXTURE_EVENT_NAME));
+  assert.ok(parsed.description.includes(FEVER_FIXTURE_LOCATION));
+  assert.ok(parsed.description.includes('19 pro - 08:00 odp.'));
+  assert.ok(parsed.description.includes(FEVER_FIXTURE_TICKET_ID));
+  FEVER_FIXTURE_CODES.forEach(function (code) {
+    assert.ok(parsed.description.includes(code));
+  });
+
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, 'ticketCodes'), false);
+});
+
+test('parseFeverTicketText: a body missing the purchase-details marker throws with the full raw text', () => {
+  const body = REAL_FEVER_BODY_TEXT.replace('Tady jsou podrobnosti o tvém nákupu', '');
+  assert.throws(
+    () => parseFeverTicketText(body, FEVER_REFERENCE_DATE),
+    (err) => {
+      assert.ok(err.message.includes(body));
+      return true;
+    }
+  );
+});
+
+test('parseFeverTicketText: a body missing the map-link marker throws with the full raw text', () => {
+  const body = REAL_FEVER_BODY_TEXT.replace('Zobrazit na mapě', '');
+  assert.throws(
+    () => parseFeverTicketText(body, FEVER_REFERENCE_DATE),
+    (err) => {
+      assert.ok(err.message.includes(body));
+      return true;
+    }
+  );
+});
+
+test('parseFeverTicketText: a body with no recognizable date/time throws with the full raw text', () => {
+  const body = REAL_FEVER_BODY_TEXT.replace(FEVER_FIXTURE_DATE_LINE, 'termín bude upřesněn');
+  assert.throws(
+    () => parseFeverTicketText(body, FEVER_REFERENCE_DATE),
+    (err) => {
+      assert.ok(err.message.includes(body));
+      return true;
+    }
+  );
+});
+
+test('parseFeverTicketText: an unrecognized month abbreviation throws, naming the bad token, with the full raw text (D-04)', () => {
+  const body = buildFeverFixture({ dateLine: 'so 19 xxx - 08:00 odp.' });
+  assert.throws(
+    () => parseFeverTicketText(body, FEVER_REFERENCE_DATE),
+    (err) => {
+      assert.ok(err.message.includes('xxx'));
+      assert.ok(err.message.includes(body));
+      return true;
+    }
+  );
+});
+
+test('parseFeverTicketText: hour and minute out-of-range each throw with the full raw text, including an hour above 12 written WITH a day-period marker (D-05)', () => {
+  const noMeridiemHourBody = buildFeverFixture({ dateLine: 'so 19 pro - 25:00' });
+  assert.throws(
+    () => parseFeverTicketText(noMeridiemHourBody, FEVER_REFERENCE_DATE),
+    (err) => {
+      assert.match(err.message, /Hour out of range \(0-23\)/);
+      assert.ok(err.message.includes(noMeridiemHourBody));
+      return true;
+    }
+  );
+
+  const minuteBody = buildFeverFixture({ dateLine: 'so 19 pro - 08:75 odp.' });
+  assert.throws(
+    () => parseFeverTicketText(minuteBody, FEVER_REFERENCE_DATE),
+    (err) => {
+      assert.match(err.message, /Minute out of range \(0-59\)/);
+      assert.ok(err.message.includes(minuteBody));
+      return true;
+    }
+  );
+
+  const meridiemHourBody = buildFeverFixture({ dateLine: 'so 19 pro - 15:00 odp.' });
+  assert.throws(
+    () => parseFeverTicketText(meridiemHourBody, FEVER_REFERENCE_DATE),
+    (err) => {
+      assert.match(err.message, /Hour out of range \(1-12\)/);
+      assert.ok(err.message.includes(meridiemHourBody));
+      return true;
+    }
+  );
+});
+
+test('parseFeverTicketText: a region yielding no usable event name throws with the full raw text; a region yielding no usable location throws with the full raw text', () => {
+  const noEventNameBody = [
+    'Zobrazit v prohlížeči',
+    'Tady jsou podrobnosti o tvém nákupu',
+    '',
+    'Koupit znova',
+    '',
+    'Zobrazit na mapě',
+    FEVER_FIXTURE_DATE_LINE,
+  ].join('\n');
+  assert.throws(
+    () => parseFeverTicketText(noEventNameBody, FEVER_REFERENCE_DATE),
+    (err) => {
+      assert.ok(err.message.includes(noEventNameBody));
+      return true;
+    }
+  );
+
+  const noLocationBody = [
+    'Zobrazit v prohlížeči',
+    'Tady jsou podrobnosti o tvém nákupu',
+    FEVER_FIXTURE_EVENT_NAME,
+    'Zobrazit na mapě',
+    FEVER_FIXTURE_DATE_LINE,
+  ].join('\n');
+  assert.throws(
+    () => parseFeverTicketText(noLocationBody, FEVER_REFERENCE_DATE),
+    (err) => {
+      assert.ok(err.message.includes(noLocationBody));
+      return true;
+    }
+  );
+});
+
+test('parseFeverTicketText: TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL["hello@feverup.com"] is strictly equal to the exported parseFeverTicketText (D-01)', () => {
+  // Guarded with the typeof check so this assertion genuinely fails before
+  // Task 2 (both sides would otherwise be `undefined` and trivially equal).
+  assert.equal(typeof parseFeverTicketText, 'function');
+  assert.equal(TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL['hello@feverup.com'], parseFeverTicketText);
+});
+
+test('Fever ABSENCE PROOF -- no key in TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL, and no key in TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL (D-01/D-11)', () => {
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL, 'hello@feverup.com'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL, 'hello@feverup.com'), false);
+});
+
+const FEVER_MARKETING_BODY = 'Podívej se na nové akce ve tvém městě! Nenech si ujít nadcházející koncerty a festivaly.';
+
+test('feverTextHasPurchaseDetails: registered strictly, returns true on the real fixture, false on Fever marketing mail, and false (never throwing) on null/empty (D-08)', () => {
+  assert.equal(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL['hello@feverup.com'], feverTextHasPurchaseDetails);
+
+  assert.equal(feverTextHasPurchaseDetails(REAL_FEVER_BODY_TEXT), true);
+  assert.equal(feverTextHasPurchaseDetails(FEVER_MARKETING_BODY), false);
+  assert.equal(feverTextHasPurchaseDetails(null), false);
+  assert.equal(feverTextHasPurchaseDetails(''), false);
+});
+
+test('resolveTicketProcessingJobs / appliesTo: a Fever purchase confirmation yields exactly one mode:"body" job and applies; a Fever marketing email yields ZERO jobs and does not apply (D-08)', () => {
+  const portals = [{ identifyingEmail: 'hello@feverup.com', calendarId: 'FEVER_CAL', insertPdfIntoEvent: false }];
+
+  const purchaseMessage = fakeMessage('Fever <hello@feverup.com>', [], REAL_FEVER_BODY_TEXT);
+  const jobs = resolveTicketProcessingJobs([purchaseMessage], portals);
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'body');
+  assert.equal(jobs[0].message, purchaseMessage);
+  assert.equal(jobs[0].portal, portals[0]);
+
+  const marketingMessage = fakeMessage('Fever <hello@feverup.com>', [], FEVER_MARKETING_BODY);
+  assert.equal(resolveTicketProcessingJobs([marketingMessage], portals).length, 0);
+
+  // appliesTo consults the REAL shipped TICKETING_PORTALS_ACTION_CONFIG
+  // default (D-15 seeds the Fever entry there), not the local `portals`
+  // array above.
+  const purchaseThread = {
+    getMessages: function () {
+      return [purchaseMessage];
+    },
+  };
+  const marketingThread = {
+    getMessages: function () {
+      return [marketingMessage];
+    },
+  };
+  assert.equal(TICKETING_PORTALS_ACTION.appliesTo(purchaseThread), true);
+  assert.equal(TICKETING_PORTALS_ACTION.appliesTo(marketingThread), false);
+});
+
+test('resolveTicketProcessingJobs: a Fever message carrying the real PDF attachment still yields exactly one mode:"body" job -- never one job per attachment, never a pdf-mode job (D-01)', () => {
+  const portals = [{ identifyingEmail: 'hello@feverup.com', calendarId: 'FEVER_CAL', insertPdfIntoEvent: true }];
+  const pdfAttachment = fakeAttachment('order_998877665.pdf', 'application/pdf');
+  const message = fakeMessage('Fever <hello@feverup.com>', [pdfAttachment], REAL_FEVER_BODY_TEXT);
+
+  const jobs = resolveTicketProcessingJobs([message], portals);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'body');
+});
+
+test('findFeverTicketPdfAttachment: returns the order PDF, null on an unrelated PDF name, null on a matching name that is not a PDF content type, and is registered strictly (D-12)', () => {
+  const orderPdf = fakeAttachment('order_998877665.pdf', 'application/pdf');
+  const message = fakeMessage('Fever <hello@feverup.com>', [orderPdf], REAL_FEVER_BODY_TEXT);
+  assert.equal(findFeverTicketPdfAttachment(message), orderPdf);
+
+  const unrelatedPdf = fakeAttachment('terms.pdf', 'application/pdf');
+  const messageUnrelated = fakeMessage('Fever <hello@feverup.com>', [unrelatedPdf], REAL_FEVER_BODY_TEXT);
+  assert.equal(findFeverTicketPdfAttachment(messageUnrelated), null);
+
+  const nonPdfNamedOrder = fakeAttachment('order_998877665.txt', 'text/plain');
+  const messageNonPdf = fakeMessage('Fever <hello@feverup.com>', [nonPdfNamedOrder], REAL_FEVER_BODY_TEXT);
+  assert.equal(findFeverTicketPdfAttachment(messageNonPdf), null);
+
+  assert.equal(TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL['hello@feverup.com'], findFeverTicketPdfAttachment);
+});
+
+// `subject` (quick-260921-gj0 round 2) is an OPTIONAL second parameter
+// exposed as `getSubject()`, defaulting to `undefined` -- unchanged
+// round-1 callers that invoke this factory with only `receivedDate` get a
+// message whose subject is missing, which is exactly the D-24 fallback
+// condition and keeps every round-1 assertion against this factory valid.
+function feverBodyModeMessage(receivedDate, subject) {
+  return {
+    getFrom: function () {
+      return 'Fever <hello@feverup.com>';
+    },
+    getPlainBody: function () {
+      return REAL_FEVER_BODY_TEXT;
+    },
+    getBody: function () {
+      return '<html><body>irrelevant</body></html>';
+    },
+    getAttachments: function () {
+      return [];
+    },
+    getDate: function () {
+      return receivedDate;
+    },
+    getSubject: function () {
+      return subject;
+    },
+  };
+}
+
+test('processTicketFromMessageBody: passes message.getDate() through to the registered body parser as the year-inference reference date (D-07); the existing Kino Art and Entradio harness paths still produce their unchanged resources, proving the extra argument is inert for them', () => {
+  withTicketBodyRunGlobals({ respond: entradioRespondOk }, function (calls) {
+    processTicketFromMessageBody(feverBodyModeMessage(FEVER_REFERENCE_DATE), {
+      identifyingEmail: 'hello@feverup.com',
+      calendarId: 'FEVER_CAL',
+      insertPdfIntoEvent: false,
+    });
+
+    assert.equal(calls.inserted.length, 1);
+    assert.equal(calls.inserted[0].resource.start.dateTime.slice(0, 4), '2026');
+    assert.equal(calls.inserted[0].resource.summary, FEVER_FIXTURE_EVENT_NAME);
+  });
+
+  // Companion assertion: the existing Kino Art and Entradio harness paths are
+  // untouched by this change -- same assertions their own dedicated tests
+  // above already make, re-run here to prove the extra getDate() argument is
+  // inert for parsers that do not read it.
+  withTicketBodyRunGlobals({ respond: entradioRespondOk }, function (calls) {
+    processTicketFromMessageBody(kinoArtBodyModeMessage(), {
+      identifyingEmail: 'rezervace@kinoart.cz',
+      calendarId: 'ART_CAL',
+      insertPdfIntoEvent: true,
+    });
+    assert.equal(calls.inserted[0].resource.attachments.length, 1);
+    assert.equal(calls.inserted[0].resource.attachments[0].mimeType, 'application/pdf');
+  });
+
+  withTicketBodyRunGlobals({ respond: entradioRespondOk }, function (calls) {
+    processTicketFromMessageBody(entradioBodyModeMessage(), ENTRADIO_PORTAL_PDF_ON);
+    assert.equal(calls.inserted[0].resource.summary, 'ČERNO, VÍR');
+    assert.equal(calls.inserted[0].resource.attachments.length, 3);
+  });
+});
+
+test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: the shipped default fifth entry deepEquals the Fever entry, and resolveTicketingCalendarId on it returns the passed global default (D-15)', () => {
+  const portals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
+  assert.deepEqual(portals[4], { identifyingEmail: 'hello@feverup.com', calendarId: null, insertPdfIntoEvent: false });
+  assert.equal(resolveTicketingCalendarId(portals[4], 'GLOBAL_DEFAULT_CAL'), 'GLOBAL_DEFAULT_CAL');
+});
+
+test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: regression guard -- entries 0-3 (enigoo.cz, Kino Art, Ticketmaster CZ, Entradio) are unchanged and the array length is 5', () => {
+  const portals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
+  assert.equal(portals.length, 5);
+  assert.deepEqual(portals[0], { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false });
+  assert.deepEqual(portals[1], { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false });
+  assert.deepEqual(portals[2], { identifyingEmail: 'noreply@ticketmaster.cz', calendarId: null, insertPdfIntoEvent: false });
+  assert.deepEqual(portals[3], { identifyingEmail: 'no-reply@app.entradio.cz', calendarId: null, insertPdfIntoEvent: false });
+});
+
+// --- ROUND 2 (live-test-driven): subject-sourced event name, plus a Gmail --
+// --- image-placeholder skip in the body fallback -----------------------------
+//
+// These come from the owner's FIRST live run against a real Fever email
+// (Task 3), plus the message's own Subject header decoded from that same
+// real sample.
+//
+// Gmail rendered an <img> in the plain-text view as a bracketed placeholder
+// line ("[image: <alt text>]") sitting BETWEEN the purchase-details marker
+// and the real event-name line -- the first direct observation of what
+// message.getPlainBody() actually returns for a Fever email, and it became
+// the created event's summary verbatim (D-18). feverFirstNonEmptyLine and
+// feverLastNonEmptyLine now also skip such a line (D-19), narrowly -- a line
+// merely CONTAINING bracketed text stays eligible (D-20).
+//
+// Separately, the real Subject header decodes to a fixed template prefix
+// followed by the event name VERBATIM, including the event name's own
+// internal colon -- so the subject is now the PRIMARY event-name source
+// (matched as a literal prefix, never split on a colon) and the
+// placeholder-hardened body read above becomes the FALLBACK (D-24). The
+// location stays body-sourced always (D-26).
+//
+// Neither the owner's real event name, venue, subject, ticket ID nor seat
+// codes appear here -- fictional values only, per this suite's existing
+// FIXTURE PROVENANCE note above.
+
+// The real prefix, decoded from the real sample's own RFC 2047 subject
+// header (D-24). Reused everywhere below, exactly like FEVER_SUBJECT_PREFIX
+// inside the source file.
+const FEVER_FIXTURE_SUBJECT_PREFIX = 'Potvrzení nákupu na Fever: ';
+const FEVER_FIXTURE_SUBJECT = FEVER_FIXTURE_SUBJECT_PREFIX + FEVER_FIXTURE_EVENT_NAME;
+
+// A fictional Gmail image-placeholder line, in the exact bracketed shape
+// directly observed on the owner's live run (D-18).
+const FEVER_FIXTURE_IMAGE_PLACEHOLDER = '[image: Event cover photo]';
+
+test('parseFeverTicketText: THE LIVE REGRESSION -- a Gmail image-placeholder line rendered ABOVE the real event-name line is skipped, never returned as the event name (D-18)', () => {
+  const body = buildFeverFixture({ eventName: FEVER_FIXTURE_IMAGE_PLACEHOLDER + '\n' + FEVER_FIXTURE_EVENT_NAME });
+  const parsed = parseFeverTicketText(body, FEVER_REFERENCE_DATE);
+
+  assert.equal(parsed.eventName, FEVER_FIXTURE_EVENT_NAME);
+  assert.equal(parsed.location, FEVER_FIXTURE_LOCATION);
+  assert.equal(parsed.description.split('\n\n')[0], FEVER_FIXTURE_EVENT_NAME);
+});
+
+test('parseFeverTicketText: the LOCATION half of the same defect -- a placeholder line rendered between the venue and the map-link marker is skipped, never returned as the location (D-19)', () => {
+  const body = buildFeverFixture({ location: FEVER_FIXTURE_LOCATION + '\n' + FEVER_FIXTURE_IMAGE_PLACEHOLDER });
+  const parsed = parseFeverTicketText(body, FEVER_REFERENCE_DATE);
+
+  assert.equal(parsed.location, FEVER_FIXTURE_LOCATION);
+  assert.equal(parsed.eventName, FEVER_FIXTURE_EVENT_NAME);
+});
+
+test('parseFeverTicketText: the placeholder skip tolerates spacing/casing variance and two placeholders on one line, but a line that merely BEGINS with unrelated bracketed text is still returned intact -- narrow skip, not a blanket bracket filter (D-19/D-20)', () => {
+  const noSpace = parseFeverTicketText(
+    buildFeverFixture({ eventName: '[image:Event cover photo]\n' + FEVER_FIXTURE_EVENT_NAME }),
+    FEVER_REFERENCE_DATE
+  );
+  assert.equal(noSpace.eventName, FEVER_FIXTURE_EVENT_NAME);
+
+  const differentCase = parseFeverTicketText(
+    buildFeverFixture({ eventName: '[IMAGE: Event cover photo]\n' + FEVER_FIXTURE_EVENT_NAME }),
+    FEVER_REFERENCE_DATE
+  );
+  assert.equal(differentCase.eventName, FEVER_FIXTURE_EVENT_NAME);
+
+  const twoOnOneLine = parseFeverTicketText(
+    buildFeverFixture({ eventName: '[image: icon one][image: icon two]\n' + FEVER_FIXTURE_EVENT_NAME }),
+    FEVER_REFERENCE_DATE
+  );
+  assert.equal(twoOnOneLine.eventName, FEVER_FIXTURE_EVENT_NAME);
+
+  // NEGATIVE (D-20): a line that merely BEGINS with bracketed text, but is
+  // not an image-placeholder shape, is still fully eligible as the event
+  // name -- proving the skip is narrow rather than a blanket bracket filter.
+  const bracketedButReal = '[VIP] ' + FEVER_FIXTURE_EVENT_NAME;
+  const notAPlaceholder = parseFeverTicketText(buildFeverFixture({ eventName: bracketedButReal }), FEVER_REFERENCE_DATE);
+  assert.equal(notAPlaceholder.eventName, bracketedButReal);
+});
+
+test('parseFeverTicketText: a region containing NOTHING but placeholder lines still raises the EXISTING event-name throw carrying the full raw text -- degrades to a diagnostic email, never to a silently-wrong summary (D-20)', () => {
+  const body = buildFeverFixture({
+    eventName: FEVER_FIXTURE_IMAGE_PLACEHOLDER,
+    location: FEVER_FIXTURE_IMAGE_PLACEHOLDER,
+  });
+
+  assert.throws(
+    () => parseFeverTicketText(body, FEVER_REFERENCE_DATE),
+    (err) => {
+      assert.ok(
+        err.message.includes('could not extract the event name between the purchase-details marker and the map-link marker'),
+        'error message should be the EXISTING event-name-throw wording, unreworded'
+      );
+      assert.ok(err.message.includes(body), 'error message should include the full raw text');
+      return true;
+    }
+  );
+});
+
+test('parseFeverTicketText: SUBJECT WINS, AND WINS ON PURPOSE -- a real Fever subject overrides the body-derived event name even when the body would produce a different, equally plausible name, and the internal colon survives in full (D-24)', () => {
+  const differentCleanEventName = 'Novoroční ohňostroj: Staroměstské náměstí';
+  const subject = FEVER_FIXTURE_SUBJECT_PREFIX + differentCleanEventName;
+  const body = buildFeverFixture({}); // body's own event name is FEVER_FIXTURE_EVENT_NAME -- deliberately different from `subject`'s
+
+  const parsed = parseFeverTicketText(body, FEVER_REFERENCE_DATE, subject);
+
+  assert.equal(parsed.eventName, differentCleanEventName);
+  assert.notEqual(parsed.eventName, FEVER_FIXTURE_EVENT_NAME);
+  assert.ok(parsed.eventName.includes(':'), 'the event name\'s own internal colon must survive -- proves prefix-strip, not colon-split');
+  assert.equal(parsed.description.split('\n\n')[0], differentCleanEventName);
+});
+
+test('parseFeverTicketText: FALLBACK CONDITIONS -- a subject that is missing entirely, undefined, null, a non-string, empty, prefix-less (a plausible marketing subject), or the prefix alone with nothing after it all fall back to the BODY event name WITHOUT throwing (D-24/D-25)', () => {
+  const body = buildFeverFixture({});
+
+  // No third argument at all -- this IS today's only call shape and must
+  // keep working unchanged (D-25's round-1 compatibility guarantee).
+  assert.equal(parseFeverTicketText(body, FEVER_REFERENCE_DATE).eventName, FEVER_FIXTURE_EVENT_NAME);
+
+  [
+    undefined,
+    null,
+    12345,
+    '',
+    'Podívej se na nové akce ve tvém městě!', // plausible Fever MARKETING subject, no prefix match
+    FEVER_FIXTURE_SUBJECT_PREFIX, // the prefix alone, nothing after it
+  ].forEach(function (subject) {
+    const parsed = parseFeverTicketText(body, FEVER_REFERENCE_DATE, subject);
+    assert.equal(parsed.eventName, FEVER_FIXTURE_EVENT_NAME);
+  });
+});
+
+test('parseFeverTicketText: THE REAL PRODUCTION SHAPE -- a body carrying the placeholder-above-the-event-name defect AND a real subject together resolve to the SUBJECT-derived name, proving the two halves of this round compose rather than fight (D-19/D-24)', () => {
+  const bodyOnlyEventName = 'Zimní trhy na náměstí';
+  const body = buildFeverFixture({ eventName: FEVER_FIXTURE_IMAGE_PLACEHOLDER + '\n' + bodyOnlyEventName });
+
+  const parsed = parseFeverTicketText(body, FEVER_REFERENCE_DATE, FEVER_FIXTURE_SUBJECT);
+
+  assert.equal(parsed.eventName, FEVER_FIXTURE_EVENT_NAME);
+  assert.notEqual(parsed.eventName, bodyOnlyEventName);
+  assert.equal(parsed.location, FEVER_FIXTURE_LOCATION);
+});
+
+test('processTicketFromMessageBody: passes message.getSubject() through to the registered body parser as the THIRD argument (D-25/D-27) -- the inserted Calendar resource\'s summary is the SUBJECT-derived event name, not the body\'s, and the start still carries the year round 1\'s D-07 threading implies; the Kino Art and Entradio harness paths stay unchanged, proving the third argument is inert for them too', () => {
+  const differentSubjectEventName = 'Vítání jara: Karlův most';
+  const subject = FEVER_FIXTURE_SUBJECT_PREFIX + differentSubjectEventName;
+
+  withTicketBodyRunGlobals({ respond: entradioRespondOk }, function (calls) {
+    processTicketFromMessageBody(feverBodyModeMessage(FEVER_REFERENCE_DATE, subject), {
+      identifyingEmail: 'hello@feverup.com',
+      calendarId: 'FEVER_CAL',
+      insertPdfIntoEvent: false,
+    });
+
+    assert.equal(calls.inserted.length, 1);
+    assert.equal(calls.inserted[0].resource.summary, differentSubjectEventName);
+    assert.notEqual(calls.inserted[0].resource.summary, FEVER_FIXTURE_EVENT_NAME);
+    assert.equal(calls.inserted[0].resource.start.dateTime.slice(0, 4), '2026');
+  });
+
+  // Companion assertion: the existing Kino Art and Entradio harness paths are
+  // untouched by this change -- same assertions their own dedicated tests
+  // above already make, re-run here to prove the third argument is inert for
+  // parsers that do not read it, exactly as round 1 already proved for the
+  // second one.
+  withTicketBodyRunGlobals({ respond: entradioRespondOk }, function (calls) {
+    processTicketFromMessageBody(kinoArtBodyModeMessage(), {
+      identifyingEmail: 'rezervace@kinoart.cz',
+      calendarId: 'ART_CAL',
+      insertPdfIntoEvent: true,
+    });
+    assert.equal(calls.inserted[0].resource.attachments.length, 1);
+    assert.equal(calls.inserted[0].resource.attachments[0].mimeType, 'application/pdf');
+  });
+
+  withTicketBodyRunGlobals({ respond: entradioRespondOk }, function (calls) {
+    processTicketFromMessageBody(entradioBodyModeMessage(), ENTRADIO_PORTAL_PDF_ON);
+    assert.equal(calls.inserted[0].resource.summary, 'ČERNO, VÍR');
+    assert.equal(calls.inserted[0].resource.attachments.length, 3);
   });
 });
