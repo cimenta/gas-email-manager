@@ -47,7 +47,22 @@ const {
   feverTextHasPurchaseDetails,
   findFeverTicketPdfAttachment,
   feverResolveEventYear,
+  // quick-261005-orv: the SIXTH portal, Ticketportal.cz, ICS-SOURCED.
+  findTicketportalCzTicketPdfAttachment,
+  stripTicketportalCzSummaryDateSuffix,
+  extractTicketportalCzOrderNumber,
+  ticketInstantToWallClockComponents,
+  buildTicketportalCzParsedTicket,
+  findTicketIcsAttachments,
+  processTicketFromIcsAttachment,
+  TICKET_ICS_MODE_SENDERS,
+  DEFAULT_EVENT_DURATION_MINUTES,
 } = require('../src/07-action-ticketing-portals.js');
+
+// Separately required so tests derive the real event objects from the real
+// .ics fixture via the SAME parser processTicketFromIcsAttachment itself
+// uses (D-01) -- never a second, test-local ICS parser.
+const { parseIcs } = require('../src/05-action-ics-import.js');
 
 // --- parseEnigooTicketText ---------------------------------------------------
 //
@@ -1450,11 +1465,11 @@ test('TICKETING_PORTALS_ACTION_CONFIG: the shipped default seeds a THIRD entry f
   assert.equal(resolveTicketingCalendarId(thirdPortal, 'DEFAULT_CAL'), 'DEFAULT_CAL');
 });
 
-test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are still the unchanged enigoo.cz and Kino Art entries, array length is 5 (updated quick-260921-gj0)', () => {
+test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are still the unchanged enigoo.cz and Kino Art entries, array length is 6 (updated quick-261005-orv)', () => {
   const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
   const portals = TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals;
 
-  assert.equal(portals.length, 5);
+  assert.equal(portals.length, 6);
   assert.deepEqual(portals[0], { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[1], { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false });
 });
@@ -4243,9 +4258,9 @@ test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: the shipped default fift
   assert.equal(resolveTicketingCalendarId(portals[4], 'GLOBAL_DEFAULT_CAL'), 'GLOBAL_DEFAULT_CAL');
 });
 
-test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: regression guard -- entries 0-3 (enigoo.cz, Kino Art, Ticketmaster CZ, Entradio) are unchanged and the array length is 5', () => {
+test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: regression guard -- entries 0-3 (enigoo.cz, Kino Art, Ticketmaster CZ, Entradio) are unchanged and the array length is 6 (updated quick-261005-orv)', () => {
   const portals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
-  assert.equal(portals.length, 5);
+  assert.equal(portals.length, 6);
   assert.deepEqual(portals[0], { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[1], { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[2], { identifyingEmail: 'noreply@ticketmaster.cz', calendarId: null, insertPdfIntoEvent: false });
@@ -4432,4 +4447,500 @@ test('processTicketFromMessageBody: passes message.getSubject() through to the r
     assert.equal(calls.inserted[0].resource.summary, 'ČERNO, VÍR');
     assert.equal(calls.inserted[0].resource.attachments.length, 3);
   });
+});
+
+// --- quick-261005-orv: Ticketportal.cz, the SIXTH portal, ICS-SOURCED ---
+//
+// Unlike every portal above, Ticketportal.cz's event data comes from the
+// order confirmation's OWN .ics attachment (parsed by the EXISTING
+// parseIcs/isIcsAttachment exports of src/05-action-ics-import.js, never a
+// second parser), not from the body or an OCR'd PDF. Its eTicket PDF
+// contributes only the Calendar attachment and, via its filename, the
+// per-ORDER dedup ticketIdentifier -- never the .ics UID, which names the
+// per-PERFORMANCE occurrence, not the order (D-04d).
+//
+// The .ics text, the three PDF filenames, the From header and the real
+// SUMMARY string below are copied VERBATIM from the owner's real
+// "Potvrzení objednávky vstupenek.eml" sample -- the double space in
+// SUMMARY and the literal double colon in UID:: are real quirks, not typos.
+
+const REAL_TICKETPORTAL_CZ_ICS_LINES = [
+  'BEGIN:VCALENDAR',
+  'VERSION:2.0',
+  'PRODID:-//TICKETPORTAL//Vstupenky na dosah//CZ',
+  'METHOD:PUBLISH',
+  'BEGIN:VTIMEZONE',
+  'TZID:Europe/Prague',
+  'LAST-MODIFIED:20231222T233358Z',
+  'TZURL:https://www.tzurl.org/zoneinfo-outlook/Europe/Prague',
+  'X-LIC-LOCATION:Europe/Prague',
+  'BEGIN:DAYLIGHT',
+  'TZNAME:CEST',
+  'TZOFFSETFROM:+0100',
+  'TZOFFSETTO:+0200',
+  'DTSTART:19700329T020000',
+  'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU',
+  'END:DAYLIGHT',
+  'BEGIN:STANDARD',
+  'TZNAME:CET',
+  'TZOFFSETFROM:+0200',
+  'TZOFFSETTO:+0100',
+  'DTSTART:19701025T030000',
+  'RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU',
+  'END:STANDARD',
+  'END:VTIMEZONE',
+  'BEGIN:VEVENT',
+  'ORGANIZER;CN=TICKETPORTAL:MAILTO:help@ticketportal.cz',
+  'UID::ticketportal.performance.120009907',
+  'DTSTAMP:20261005T162614Z',
+  'DTSTART;TZID=Europe/Prague:20261019T190000',
+  'DTEND;TZID=Europe/Prague:20261019T213000',
+  'SUMMARY:HELENA Forever  19.10.2026 19:00',
+  'LOCATION:BOBYHALL, Sportovní 559/2A, Brno',
+  'GEO:49.212292;16.608061',
+  'DESCRIPTION:Přidejte si do Vašeho kalendáře.',
+  'URL:https://www.ticketportal.sk/event/12005754',
+  'CATEGORIES:Koncerty - Pop',
+  'BEGIN:VALARM',
+  'ACTION:DISPLAY',
+  'DESCRIPTION:Přidejte si připomínku do kalendáře.',
+  'END:VALARM',
+  'END:VEVENT',
+  'END:VCALENDAR',
+];
+const REAL_TICKETPORTAL_CZ_ICS_TEXT = REAL_TICKETPORTAL_CZ_ICS_LINES.join('\r\n');
+
+// Derived fixtures (label: "derived", never claimed as real sample data).
+const TICKETPORTAL_CZ_DERIVED_ICS_NO_DTEND_TEXT = REAL_TICKETPORTAL_CZ_ICS_LINES
+  .filter(function (line) {
+    return line !== 'DTEND;TZID=Europe/Prague:20261019T213000';
+  })
+  .join('\r\n');
+
+const TICKETPORTAL_CZ_DERIVED_ICS_NO_VEVENT_TEXT = (function () {
+  const veventStart = REAL_TICKETPORTAL_CZ_ICS_LINES.indexOf('BEGIN:VEVENT');
+  const veventEnd = REAL_TICKETPORTAL_CZ_ICS_LINES.indexOf('END:VEVENT');
+  return REAL_TICKETPORTAL_CZ_ICS_LINES.slice(0, veventStart)
+    .concat(REAL_TICKETPORTAL_CZ_ICS_LINES.slice(veventEnd + 1))
+    .join('\r\n');
+})();
+
+const TICKETPORTAL_CZ_DERIVED_ICS_EMPTY_SUMMARY_TEXT = REAL_TICKETPORTAL_CZ_ICS_LINES
+  .map(function (line) {
+    return line === 'SUMMARY:HELENA Forever  19.10.2026 19:00' ? 'SUMMARY:' : line;
+  })
+  .join('\r\n');
+
+const REAL_TICKETPORTAL_CZ_FROM_HEADER = '"Vstupenky Ticketportal" <vstupenky@ticketportal.cz>';
+const REAL_TICKETPORTAL_CZ_SUBJECT = 'Potvrzení objednávky vstupenek';
+const TICKETPORTAL_CZ_ETICKET_PDF_NAME = 'eTicket_13634244.pdf';
+const TICKETPORTAL_CZ_FEE_RECEIPT_PDF_NAME = 'Doklad_poplatek_13634244.pdf';
+// The T&Cs filename's MIME-encoded-word header decodes to this real string.
+const TICKETPORTAL_CZ_TERMS_PDF_NAME = 'VŠEOBECNÉ A OBCHODNÍ PODMÍNKY A REKLAMAČNÍ ŘÁD (120202026).pdf';
+
+// intlFormatDateForTests -- stands in for GAS Utilities.formatDate under
+// Node. Throws on any pattern other than the one production actually uses,
+// so a drift in the production pattern string fails loudly here too.
+function intlFormatDateForTests(date, timeZone, pattern) {
+  if (pattern !== 'yyyy-MM-dd HH:mm') {
+    throw new Error('intlFormatDateForTests: unsupported pattern "' + pattern + '"');
+  }
+
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+
+  const byType = {};
+  parts.forEach(function (part) {
+    byType[part.type] = part.value;
+  });
+
+  return byType.year + '-' + byType.month + '-' + byType.day + ' ' + byType.hour + ':' + byType.minute;
+}
+
+// ticketportalCzFakeAttachment -- like fakeAttachment above, plus
+// getDataAsString() (the .ics text) and copyBlob() (PDFs), both needed by
+// processTicketFromIcsAttachment's GAS-shaped calls.
+function ticketportalCzFakeAttachment(name, contentType, dataString) {
+  return {
+    getName: function () {
+      return name;
+    },
+    getContentType: function () {
+      return contentType || '';
+    },
+    getDataAsString: function () {
+      return dataString;
+    },
+    copyBlob: function () {
+      return { __fakeBlobFor: name };
+    },
+  };
+}
+
+function ticketportalCzRealShapedMessage() {
+  const icsAttachment = ticketportalCzFakeAttachment('event.ics', 'text/calendar', REAL_TICKETPORTAL_CZ_ICS_TEXT);
+  const eTicketPdf = ticketportalCzFakeAttachment(TICKETPORTAL_CZ_ETICKET_PDF_NAME, 'application/octet-stream');
+  const feeReceiptPdf = ticketportalCzFakeAttachment(TICKETPORTAL_CZ_FEE_RECEIPT_PDF_NAME, 'application/octet-stream');
+  const termsPdf = ticketportalCzFakeAttachment(TICKETPORTAL_CZ_TERMS_PDF_NAME, 'application/octet-stream');
+
+  return fakeMessage(REAL_TICKETPORTAL_CZ_FROM_HEADER, [icsAttachment, eTicketPdf, feeReceiptPdf, termsPdf], '', undefined, REAL_TICKETPORTAL_CZ_SUBJECT);
+}
+
+function ticketportalCzOneMessageThread(message) {
+  return {
+    getMessages: function () {
+      return [message];
+    },
+  };
+}
+
+// withTicketportalCzIcsRunGlobals -- wraps withTicketBodyRunGlobals (reused
+// as-is) and additionally injects/restores global.Utilities, which that
+// harness deliberately does NOT inject.
+function withTicketportalCzIcsRunGlobals(fn) {
+  const hadUtilities = Object.prototype.hasOwnProperty.call(global, 'Utilities');
+  const previousUtilities = global.Utilities;
+  global.Utilities = { formatDate: intlFormatDateForTests };
+
+  try {
+    return withTicketBodyRunGlobals({}, fn);
+  } finally {
+    if (hadUtilities) {
+      global.Utilities = previousUtilities;
+    } else {
+      delete global.Utilities;
+    }
+  }
+}
+
+test('quick-261005-orv: pin -- parseIcs(REAL_TICKETPORTAL_CZ_ICS_TEXT) returns exactly 1 event with the real quirks this whole suite depends on (D-01)', () => {
+  const events = parseIcs(REAL_TICKETPORTAL_CZ_ICS_TEXT);
+  assert.equal(events.length, 1);
+  assert.strictEqual(events[0].uid, ':ticketportal.performance.120009907');
+  assert.strictEqual(events[0].summary, 'HELENA Forever  19.10.2026 19:00');
+});
+
+test('quick-261005-orv: TICKET_ICS_MODE_SENDERS deepEquals [vstupenky@ticketportal.cz], and that sender is absent from both the text and body parser registries (D-02)', () => {
+  assert.deepEqual(TICKET_ICS_MODE_SENDERS, ['vstupenky@ticketportal.cz']);
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL, 'vstupenky@ticketportal.cz'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL, 'vstupenky@ticketportal.cz'), false);
+});
+
+test('quick-261005-orv: resolveTicketProcessingJobs -- the real-shaped Ticketportal.cz message yields exactly ONE job, mode "ics" (D-02)', () => {
+  const message = ticketportalCzRealShapedMessage();
+  const jobs = resolveTicketProcessingJobs([message], TICKETING_PORTALS_ACTION.config.ticketingPortals);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'ics');
+  assert.strictEqual(jobs[0].message, message);
+  assert.equal(jobs[0].portal.identifyingEmail, 'vstupenky@ticketportal.cz');
+});
+
+test('quick-261005-orv: a Ticketportal.cz message with the 3 PDFs but NO .ics yields zero jobs and appliesTo is false; with the .ics present appliesTo is true (D-02)', () => {
+  const eTicketPdf = ticketportalCzFakeAttachment(TICKETPORTAL_CZ_ETICKET_PDF_NAME, 'application/octet-stream');
+  const feeReceiptPdf = ticketportalCzFakeAttachment(TICKETPORTAL_CZ_FEE_RECEIPT_PDF_NAME, 'application/octet-stream');
+  const termsPdf = ticketportalCzFakeAttachment(TICKETPORTAL_CZ_TERMS_PDF_NAME, 'application/octet-stream');
+  const noIcsMessage = fakeMessage(REAL_TICKETPORTAL_CZ_FROM_HEADER, [eTicketPdf, feeReceiptPdf, termsPdf], '', undefined, REAL_TICKETPORTAL_CZ_SUBJECT);
+
+  const jobs = resolveTicketProcessingJobs([noIcsMessage], TICKETING_PORTALS_ACTION.config.ticketingPortals);
+  assert.equal(jobs.length, 0);
+  assert.equal(TICKETING_PORTALS_ACTION.appliesTo(ticketportalCzOneMessageThread(noIcsMessage)), false);
+
+  const withIcsMessage = ticketportalCzRealShapedMessage();
+  assert.equal(TICKETING_PORTALS_ACTION.appliesTo(ticketportalCzOneMessageThread(withIcsMessage)), true);
+});
+
+test('quick-261005-orv: a text/calendar attachment on any of the OTHER five portal senders never produces a mode "ics" job (D-02)', () => {
+  const otherFivePortalSenders = [
+    '"Enigoo" <no-reply@enigoo.cz>',
+    '"Kino Art" <rezervace@kinoart.cz>',
+    '"Ticketmaster" <noreply@ticketmaster.cz>',
+    '"Entradio" <no-reply@app.entradio.cz>',
+    '"Fever" <hello@feverup.com>',
+  ];
+
+  otherFivePortalSenders.forEach(function (fromHeader) {
+    const icsAttachment = ticketportalCzFakeAttachment('event.ics', 'text/calendar', REAL_TICKETPORTAL_CZ_ICS_TEXT);
+    const message = fakeMessage(fromHeader, [icsAttachment], '', undefined, '');
+    const jobs = resolveTicketProcessingJobs([message], TICKETING_PORTALS_ACTION.config.ticketingPortals);
+
+    jobs.forEach(function (job) {
+      assert.notEqual(job.mode, 'ics');
+    });
+  });
+});
+
+test('quick-261005-orv: findTicketIcsAttachments returns exactly the one text/calendar fake (identity) from the real-shaped message, and [] from a PDF-only message (D-02)', () => {
+  const message = ticketportalCzRealShapedMessage();
+  const icsAttachments = findTicketIcsAttachments(message);
+  assert.equal(icsAttachments.length, 1);
+  assert.strictEqual(icsAttachments[0], message.getAttachments()[0]);
+
+  const eTicketPdf = ticketportalCzFakeAttachment(TICKETPORTAL_CZ_ETICKET_PDF_NAME, 'application/octet-stream');
+  const pdfOnlyMessage = fakeMessage(REAL_TICKETPORTAL_CZ_FROM_HEADER, [eTicketPdf], '', undefined, '');
+  assert.deepEqual(findTicketIcsAttachments(pdfOnlyMessage), []);
+});
+
+test('quick-261005-orv: findTicketportalCzTicketPdfAttachment finds the eTicket PDF (identity) and rejects the fee receipt + T&Cs PDF, proving the rejection is the discriminator, not the PDF filter (D-03)', () => {
+  const message = ticketportalCzRealShapedMessage();
+  const found = findTicketportalCzTicketPdfAttachment(message);
+  assert.strictEqual(found, message.getAttachments()[1]);
+
+  const feeReceiptPdf = ticketportalCzFakeAttachment(TICKETPORTAL_CZ_FEE_RECEIPT_PDF_NAME, 'application/octet-stream');
+  const termsPdf = ticketportalCzFakeAttachment(TICKETPORTAL_CZ_TERMS_PDF_NAME, 'application/octet-stream');
+  const noEticketMessage = fakeMessage(REAL_TICKETPORTAL_CZ_FROM_HEADER, [feeReceiptPdf, termsPdf], '', undefined, '');
+  assert.equal(findTicketportalCzTicketPdfAttachment(noEticketMessage), null);
+
+  // findTicketPdfAttachments DOES include the diacritic T&Cs filename (it is
+  // a .pdf) -- proves the null above comes from the "eTicket" discriminator.
+  assert.equal(findTicketPdfAttachments(noEticketMessage).length, 2);
+
+  assert.strictEqual(TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL['vstupenky@ticketportal.cz'], findTicketportalCzTicketPdfAttachment);
+});
+
+test('quick-261005-orv: stripTicketportalCzSummaryDateSuffix strips the baked-in date tail, trims a plain summary unchanged, and never throws on null/undefined/empty (D-04b)', () => {
+  assert.equal(stripTicketportalCzSummaryDateSuffix('HELENA Forever  19.10.2026 19:00'), 'HELENA Forever');
+  assert.equal(stripTicketportalCzSummaryDateSuffix('  Some Other Event  '), 'Some Other Event');
+  assert.equal(stripTicketportalCzSummaryDateSuffix(null), '');
+  assert.equal(stripTicketportalCzSummaryDateSuffix(undefined), '');
+  assert.equal(stripTicketportalCzSummaryDateSuffix(''), '');
+});
+
+test('quick-261005-orv: ticketInstantToWallClockComponents converts via the injected formatter, honors the passed timezone, records the exact call the spy sees, and fails closed on a malformed formatter output (D-04c)', () => {
+  const realEvent = parseIcs(REAL_TICKETPORTAL_CZ_ICS_TEXT)[0];
+
+  assert.deepEqual(ticketInstantToWallClockComponents(realEvent.start, 'Europe/Prague', intlFormatDateForTests), {
+    year: 2026,
+    month: 9,
+    day: 19,
+    hour: 19,
+    minute: 0,
+  });
+  assert.deepEqual(ticketInstantToWallClockComponents(realEvent.end, 'Europe/Prague', intlFormatDateForTests), {
+    year: 2026,
+    month: 9,
+    day: 19,
+    hour: 21,
+    minute: 30,
+  });
+
+  assert.deepEqual(ticketInstantToWallClockComponents(realEvent.start, 'Etc/UTC', intlFormatDateForTests), {
+    year: 2026,
+    month: 9,
+    day: 19,
+    hour: 17,
+    minute: 0,
+  });
+  assert.deepEqual(ticketInstantToWallClockComponents(realEvent.end, 'Etc/UTC', intlFormatDateForTests), {
+    year: 2026,
+    month: 9,
+    day: 19,
+    hour: 19,
+    minute: 30,
+  });
+
+  const spyCalls = [];
+  const spyFormatter = function (date, timeZone, pattern) {
+    spyCalls.push({ date: date, timeZone: timeZone, pattern: pattern });
+    return intlFormatDateForTests(date, timeZone, pattern);
+  };
+  ticketInstantToWallClockComponents(realEvent.start, 'Europe/Prague', spyFormatter);
+  assert.equal(spyCalls.length, 1);
+  assert.strictEqual(spyCalls[0].date, realEvent.start);
+  assert.equal(spyCalls[0].timeZone, 'Europe/Prague');
+  assert.equal(spyCalls[0].pattern, 'yyyy-MM-dd HH:mm');
+
+  assert.throws(function () {
+    ticketInstantToWallClockComponents(realEvent.start, 'Europe/Prague', function () {
+      return '19.10.2026';
+    });
+  });
+});
+
+test('quick-261005-orv: buildTicketCalendarEventResource honors an explicit parsedTicket.end, and every pre-existing portal (no end field) still gets the DEFAULT_EVENT_DURATION_MINUTES default (D-05)', () => {
+  const withExplicitEnd = Object.assign({}, ENIGOO_SHAPED_PARSED_TICKET, {
+    year: 2026,
+    month: 9,
+    day: 19,
+    hour: 19,
+    minute: 0,
+    end: { year: 2026, month: 9, day: 19, hour: 21, minute: 30 },
+  });
+  const built = buildTicketCalendarEventResource(withExplicitEnd, 'Europe/Prague', []);
+  assert.equal(built.resource.start.dateTime, '2026-10-19T19:00:00');
+  assert.equal(built.resource.end.dateTime, '2026-10-19T21:30:00');
+
+  // REGRESSION: Kino Art's own parsed ticket has no `end` property at all.
+  const kinoArtParsed = parseKinoArtTicketText(REAL_KINO_ART_VELKY_SAL_BODY_TEXT);
+  assert.equal(Object.prototype.hasOwnProperty.call(kinoArtParsed, 'end'), false);
+  const kinoArtBuilt = buildTicketCalendarEventResource(kinoArtParsed, 'Europe/Prague', []);
+  const kinoArtStartComponents = {
+    year: kinoArtParsed.year,
+    month: kinoArtParsed.month,
+    day: kinoArtParsed.day,
+    hour: kinoArtParsed.hour,
+    minute: kinoArtParsed.minute,
+  };
+  assert.equal(
+    kinoArtBuilt.resource.end.dateTime,
+    formatWallClockComponentsIso(addMinutesToWallClockComponents(kinoArtStartComponents, DEFAULT_EVENT_DURATION_MINUTES))
+  );
+
+  // REGRESSION: the Enigoo-shaped parsed ticket, same proof.
+  const enigooBuilt = buildTicketCalendarEventResource(ENIGOO_SHAPED_PARSED_TICKET, 'Europe/Prague', []);
+  const enigooStartComponents = {
+    year: ENIGOO_SHAPED_PARSED_TICKET.year,
+    month: ENIGOO_SHAPED_PARSED_TICKET.month,
+    day: ENIGOO_SHAPED_PARSED_TICKET.day,
+    hour: ENIGOO_SHAPED_PARSED_TICKET.hour,
+    minute: ENIGOO_SHAPED_PARSED_TICKET.minute,
+  };
+  assert.equal(
+    enigooBuilt.resource.end.dateTime,
+    formatWallClockComponentsIso(addMinutesToWallClockComponents(enigooStartComponents, DEFAULT_EVENT_DURATION_MINUTES))
+  );
+
+  assert.equal(DEFAULT_EVENT_DURATION_MINUTES, 120);
+});
+
+test('quick-261005-orv: buildTicketportalCzParsedTicket carries the real DTEND as parsedTicket.end; a DERIVED fixture with DTEND removed has no own end, falling back to start+120 (D-05)', () => {
+  const realEvent = parseIcs(REAL_TICKETPORTAL_CZ_ICS_TEXT)[0];
+  const parsed = buildTicketportalCzParsedTicket(realEvent, TICKETPORTAL_CZ_ETICKET_PDF_NAME, 'Europe/Prague', intlFormatDateForTests);
+  assert.deepEqual(parsed.end, { year: 2026, month: 9, day: 19, hour: 21, minute: 30 });
+
+  const derivedEvent = parseIcs(TICKETPORTAL_CZ_DERIVED_ICS_NO_DTEND_TEXT)[0];
+  const derivedParsed = buildTicketportalCzParsedTicket(derivedEvent, TICKETPORTAL_CZ_ETICKET_PDF_NAME, 'Europe/Prague', intlFormatDateForTests);
+  assert.equal(Object.prototype.hasOwnProperty.call(derivedParsed, 'end'), false);
+  const derivedBuilt = buildTicketCalendarEventResource(derivedParsed, 'Europe/Prague', []);
+  assert.equal(derivedBuilt.resource.end.dateTime, '2026-10-19T21:00:00');
+});
+
+test('quick-261005-orv: extractTicketportalCzOrderNumber reads the order number from the eTicket filename; buildTicketportalCzParsedTicket never uses the .ics UID as ticketIdentifier, and throws on an empty stripped summary (D-04d)', () => {
+  assert.equal(extractTicketportalCzOrderNumber('eTicket_13634244.pdf'), '13634244');
+  assert.equal(extractTicketportalCzOrderNumber('eTicket.pdf'), null);
+  assert.equal(extractTicketportalCzOrderNumber(null), null);
+  assert.equal(extractTicketportalCzOrderNumber(''), null);
+
+  const realEvent = parseIcs(REAL_TICKETPORTAL_CZ_ICS_TEXT)[0];
+  const parsed = buildTicketportalCzParsedTicket(realEvent, 'eTicket_13634244.pdf', 'Europe/Prague', intlFormatDateForTests);
+  assert.deepEqual(parsed, {
+    eventName: 'HELENA Forever',
+    location: 'BOBYHALL, Sportovní 559/2A, Brno',
+    year: 2026,
+    month: 9,
+    day: 19,
+    hour: 19,
+    minute: 0,
+    end: { year: 2026, month: 9, day: 19, hour: 21, minute: 30 },
+    ticketIdentifier: '13634244',
+  });
+  assert.notStrictEqual(parsed.ticketIdentifier, realEvent.uid);
+
+  const parsedWithNullPdfName = buildTicketportalCzParsedTicket(realEvent, null, 'Europe/Prague', intlFormatDateForTests);
+  assert.equal(parsedWithNullPdfName.ticketIdentifier, null);
+  assert.notStrictEqual(parsedWithNullPdfName.ticketIdentifier, realEvent.uid);
+
+  const emptySummaryEvent = parseIcs(TICKETPORTAL_CZ_DERIVED_ICS_EMPTY_SUMMARY_TEXT)[0];
+  assert.throws(function () {
+    buildTicketportalCzParsedTicket(emptySummaryEvent, 'eTicket_13634244.pdf', 'Europe/Prague', intlFormatDateForTests);
+  });
+});
+
+test('quick-261005-orv: processTicketFromIcsAttachment end-to-end -- exactly 1 insert with the real event shape, PDF-filename dedup key, the UID nowhere in the resource, and the dedup lookup keyed on it (D-04e/D-08)', () => {
+  withTicketportalCzIcsRunGlobals(function (calls) {
+    const listCalls = [];
+    const previousList = global.Calendar.Events.list;
+    global.Calendar.Events.list = function (calendarId, params) {
+      listCalls.push({ calendarId: calendarId, params: params });
+      return previousList(calendarId, params);
+    };
+
+    const message = ticketportalCzRealShapedMessage();
+    processTicketFromIcsAttachment(message, { identifyingEmail: 'vstupenky@ticketportal.cz', calendarId: null, insertPdfIntoEvent: true });
+
+    assert.equal(calls.inserted.length, 1);
+    const insertCall = calls.inserted[0];
+    assert.equal(insertCall.calendarId, 'DEFAULT_CAL');
+    assert.equal(insertCall.resource.summary, 'HELENA Forever');
+    assert.equal(insertCall.resource.location, 'BOBYHALL, Sportovní 559/2A, Brno');
+    assert.equal(insertCall.resource.start.dateTime, '2026-10-19T19:00:00');
+    assert.equal(insertCall.resource.start.timeZone, 'Europe/Prague');
+    assert.equal(insertCall.resource.end.dateTime, '2026-10-19T21:30:00');
+    assert.equal(insertCall.resource.end.timeZone, 'Europe/Prague');
+    assert.equal(insertCall.resource.extendedProperties.private.ticketIdentifier, '13634244');
+    assert.equal(JSON.stringify(insertCall.resource).indexOf('ticketportal.performance'), -1);
+    assert.equal(insertCall.resource.attachments.length, 1);
+    assert.equal(insertCall.resource.attachments[0].mimeType, 'application/pdf');
+    assert.equal(insertCall.resource.attachments[0].title, 'HELENA Forever - 2026-10-19 - 13634244.pdf');
+    assert.equal(insertCall.optionalArgs.supportsAttachments, true);
+    assert.equal(calls.created.length, 1);
+    assert.equal(calls.fetched.length, 0);
+
+    assert.equal(listCalls.length, 1);
+    assert.equal(listCalls[0].params.privateExtendedProperty, 'ticketIdentifier=13634244');
+  });
+});
+
+test('quick-261005-orv: processTicketFromIcsAttachment with insertPdfIntoEvent false still tags ticketIdentifier, but creates no attachment and no Drive copy (D-04e)', () => {
+  withTicketportalCzIcsRunGlobals(function (calls) {
+    const message = ticketportalCzRealShapedMessage();
+    processTicketFromIcsAttachment(message, { identifyingEmail: 'vstupenky@ticketportal.cz', calendarId: null, insertPdfIntoEvent: false });
+
+    assert.equal(calls.inserted.length, 1);
+    assert.equal(Object.prototype.hasOwnProperty.call(calls.inserted[0].resource, 'attachments'), false);
+    assert.equal(calls.created.length, 0);
+    assert.equal(calls.inserted[0].resource.extendedProperties.private.ticketIdentifier, '13634244');
+  });
+});
+
+test('quick-261005-orv: processTicketFromIcsAttachment -- when the spy list returns an existing tagged event, there are 0 inserts and 0 Drive copies (D-04e)', () => {
+  withTicketportalCzIcsRunGlobals(function (calls) {
+    global.Calendar.Events.list = function () {
+      return { items: [{ id: 'existing-event' }] };
+    };
+
+    const message = ticketportalCzRealShapedMessage();
+    processTicketFromIcsAttachment(message, { identifyingEmail: 'vstupenky@ticketportal.cz', calendarId: null, insertPdfIntoEvent: true });
+
+    assert.equal(calls.inserted.length, 0);
+    assert.equal(calls.created.length, 0);
+  });
+});
+
+test('quick-261005-orv: processTicketFromIcsAttachment throws on a derived .ics with no VEVENT at all, with zero inserts -- no silent no-op (D-04a)', () => {
+  withTicketportalCzIcsRunGlobals(function (calls) {
+    const icsAttachment = ticketportalCzFakeAttachment('event.ics', 'text/calendar', TICKETPORTAL_CZ_DERIVED_ICS_NO_VEVENT_TEXT);
+    const message = fakeMessage(REAL_TICKETPORTAL_CZ_FROM_HEADER, [icsAttachment], '', undefined, REAL_TICKETPORTAL_CZ_SUBJECT);
+
+    assert.throws(function () {
+      processTicketFromIcsAttachment(message, { identifyingEmail: 'vstupenky@ticketportal.cz', calendarId: null, insertPdfIntoEvent: true });
+    });
+    assert.equal(calls.inserted.length, 0);
+  });
+});
+
+test('quick-261005-orv: TICKETING_PORTALS_ACTION.run on a one-message real-shaped Ticketportal.cz thread gives exactly 1 insert with the 19:00/21:30 times, 1 attachment under the shipped insertPdfIntoEvent true (dispatch)', () => {
+  withTicketportalCzIcsRunGlobals(function (calls) {
+    const message = ticketportalCzRealShapedMessage();
+    const thread = ticketportalCzOneMessageThread(message);
+    TICKETING_PORTALS_ACTION.run(thread);
+
+    assert.equal(calls.inserted.length, 1);
+    assert.equal(calls.inserted[0].resource.start.dateTime, '2026-10-19T19:00:00');
+    assert.equal(calls.inserted[0].resource.end.dateTime, '2026-10-19T21:30:00');
+    assert.equal(calls.inserted[0].resource.attachments.length, 1);
+  });
+});
+
+test('quick-261005-orv: TICKETING_PORTALS_ACTION.config.ticketingPortals[5] is the shipped Ticketportal.cz entry, and resolveTicketingCalendarId on it returns the passed default (D-06)', () => {
+  const portals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
+  assert.deepEqual(portals[5], { identifyingEmail: 'vstupenky@ticketportal.cz', calendarId: null, insertPdfIntoEvent: true });
+  assert.equal(resolveTicketingCalendarId(portals[5], 'GLOBAL_DEFAULT_CAL'), 'GLOBAL_DEFAULT_CAL');
 });

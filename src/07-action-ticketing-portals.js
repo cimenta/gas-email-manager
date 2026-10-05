@@ -8,7 +8,7 @@
  * page in a single-purchase PDF repeats the same event name/date/venue
  * (only a trailing per-ticket number differs).
  *
- * Two processing modes, depending on the portal:
+ * Three processing modes, depending on the portal:
  *   - PDF/OCR-sourced (e.g. enigoo.cz): the confirmation email's BODY
  *     carries no usable event data — everything (event name, date/time,
  *     venue) is inside an attached PDF ticket, extracted via Google
@@ -16,6 +16,10 @@
  *     native PDF text parser.
  *   - Body-sourced (e.g. Kino Art, Ticketmaster CZ): the event data is
  *     parsed directly from the email's plain-text body.
+ *   - ICS-sourced (Ticketportal.cz, quick-261005-orv): the event data comes
+ *     from the confirmation email's OWN `.ics` attachment, parsed by the
+ *     EXISTING parseIcs (src/05-action-ics-import.js) — the only mode with
+ *     no portal-specific parser FUNCTION, since parseIcs is itself generic.
  *
  * DEDUP SAFETY NET: a portal parser extracts a stable `ticketIdentifier`
  * where one exists; the created event is tagged at creation time via
@@ -2091,6 +2095,61 @@ function feverTextHasPurchaseDetails(text) {
   return feverNormalizeBodyText(text).indexOf(FEVER_PURCHASE_DETAILS_MARKER) !== -1;
 }
 
+// --- TICKETPORTAL.CZ (ICS-SOURCED, quick-261005-orv) ------------------------
+//
+// The SIXTH portal, and the first whose event data is NOT extracted by a
+// portal-specific text/body parser at all: Ticketportal.cz's order
+// confirmation carries the event's own `.ics` attachment, parsed by the
+// EXISTING parseIcs/isIcsAttachment exports of src/05-action-ics-import.js
+// (D-01) -- never a second ICS parser. The pure helpers below only
+// post-process what parseIcs already returned.
+
+// TICKETPORTAL_CZ_SUMMARY_DATE_SUFFIX_PATTERN — Ticketportal.cz bakes a
+// "D(D).M(M).YYYY H(H):MM" date/time tail onto the end of the .ics SUMMARY
+// (e.g. "HELENA Forever  19.10.2026 19:00"), separated from the real event
+// name by 2+ spaces. That date/time is already available, correctly, from
+// DTSTART -- this pattern strips the redundant, duplicated tail so the
+// calendar event's summary is just the event name.
+const TICKETPORTAL_CZ_SUMMARY_DATE_SUFFIX_PATTERN = /\s{2,}\d{1,2}\.\s*\d{1,2}\.\s*\d{4}\s+\d{1,2}:\d{2}\s*$/;
+
+/**
+ * stripTicketportalCzSummaryDateSuffix — removes the trailing baked-in
+ * date/time tail (TICKETPORTAL_CZ_SUMMARY_DATE_SUFFIX_PATTERN) from a
+ * Ticketportal.cz .ics SUMMARY, then trims the result. A summary with no
+ * such tail is returned trimmed and otherwise unchanged. null/undefined/''
+ * all return ''. Never throws. Pure, no GAS globals.
+ */
+function stripTicketportalCzSummaryDateSuffix(summary) {
+  return String(summary || '')
+    .replace(TICKETPORTAL_CZ_SUMMARY_DATE_SUFFIX_PATTERN, '')
+    .trim();
+}
+
+// TICKETPORTAL_CZ_ORDER_NUMBER_FROM_PDF_NAME_PATTERN — the digit run
+// immediately before the `.pdf` extension in the eTicket filename (e.g.
+// "eTicket_13634244.pdf" -> "13634244").
+const TICKETPORTAL_CZ_ORDER_NUMBER_FROM_PDF_NAME_PATTERN = /_(\d+)\.pdf$/i;
+
+/**
+ * extractTicketportalCzOrderNumber — reads the per-ORDER confirmation
+ * number from the eTicket PDF's own FILENAME (D-04d). Returns the digit
+ * string, or `null` when `pdfName` is null/undefined/empty or does not
+ * match. Never throws. Pure, no GAS globals.
+ *
+ * WHY THE FILENAME, NEVER THE .ics UID: the .ics UID
+ * (`:ticketportal.performance.120009907`) names the PERFORMANCE, not the
+ * ORDER. Two genuine, separate orders for the same show share that UID, so
+ * keying isDuplicateTicketPurchase on it would silently skip the second
+ * order's calendar event -- a false "already exists" that drops a real
+ * purchase. The order number baked into the eTicket filename is per-ORDER
+ * (it equals the body's own "Variabilní symbol"), which is what this
+ * portal's dedup safety net must key on instead.
+ */
+function extractTicketportalCzOrderNumber(pdfName) {
+  const match = TICKETPORTAL_CZ_ORDER_NUMBER_FROM_PDF_NAME_PATTERN.exec(String(pdfName || ''));
+  return match ? match[1] : null;
+}
+
 /**
  * TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL — the local (single-file)
  * registry mapping a BODY-SOURCED ticketing portal's `identifyingEmail`
@@ -2100,6 +2159,11 @@ function feverTextHasPurchaseDetails(text) {
  * determines which processing mode `resolveTicketProcessingJobs`/`run`
  * route it through.
  */
+// DELIBERATE ABSENCE: there is NO 'vstupenky@ticketportal.cz' key here
+// (quick-261005-orv). Ticketportal.cz is ICS-SOURCED -- its event data comes
+// from its order confirmation's own .ics attachment, parsed by the generic
+// parseIcs, never by a per-portal body parser. See TICKET_ICS_MODE_SENDERS
+// below.
 const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
   'rezervace@kinoart.cz': parseKinoArtTicketText,
   'noreply@ticketmaster.cz': parseTicketmasterCzTicketText,
@@ -2118,16 +2182,34 @@ const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
 // DELIBERATE ABSENCE: there is NO 'hello@feverup.com' key here (D-01). Fever
 // is body-sourced -- everything the calendar event needs is already in the
 // email body, so no Drive upload and no OCR conversion is needed for it.
+// Also NO 'vstupenky@ticketportal.cz' key (quick-261005-orv) -- it is
+// ICS-SOURCED, not OCR-sourced; see TICKET_ICS_MODE_SENDERS below.
 const TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL = {
   'no-reply@enigoo.cz': parseEnigooTicketText,
 };
+
+/**
+ * TICKET_ICS_MODE_SENDERS — the ICS-SOURCED counterpart to the two parser
+ * registries above (quick-261005-orv, D-02). A portal in this list has its
+ * event data extracted from its own `.ics` attachment via the generic,
+ * already-existing parseIcs (src/05-action-ics-import.js) — there is
+ * deliberately NO per-portal parser FUNCTION for this mode, since parseIcs
+ * is itself the parser. A message's sender resolving into this list AND
+ * carrying at least one qualifying `.ics` attachment
+ * (findTicketIcsAttachments) is what admits the `mode: 'ics'` job (see
+ * resolveTicketProcessingJobs / TICKETING_PORTALS_ACTION.appliesTo/run).
+ */
+const TICKET_ICS_MODE_SENDERS = ['vstupenky@ticketportal.cz'];
 
 /**
  * DEFAULT_EVENT_DURATION_MINUTES — the fixed default duration (2 hours)
  * added to a parsed ticket's start time when a portal's PDF carries no
  * explicit end time. A per-portal-parser default to reach for, not a rule
  * every future portal is forced through — a FUTURE portal whose PDF DOES
- * include an end time should use it directly instead.
+ * include an end time should use it directly instead. Ticketportal.cz
+ * (quick-261005-orv) is exactly that future portal: its .ics DTEND supplies
+ * a real end time via `parsedTicket.end` (see buildTicketCalendarEventResource
+ * below), so this default never applies to it.
  */
 const DEFAULT_EVENT_DURATION_MINUTES = 120;
 
@@ -2153,6 +2235,111 @@ function addMinutesToWallClockComponents(components, minutes) {
     hour: rolled.getUTCHours(),
     minute: rolled.getUTCMinutes(),
   };
+}
+
+// TICKET_WALL_CLOCK_FORMAT_PATTERN (quick-261005-orv, D-04c) — the Java
+// SimpleDateFormat pattern GAS's `Utilities.formatDate(date, timeZone,
+// pattern)` expects, used to convert a .ics-parsed UTC Date instant into
+// wall-clock digits in a given IANA timeZone. Shared by
+// ticketInstantToWallClockComponents and its production caller
+// (processTicketFromIcsAttachment) so the pattern string and its parser
+// below can never drift apart.
+const TICKET_WALL_CLOCK_FORMAT_PATTERN = 'yyyy-MM-dd HH:mm';
+
+/**
+ * ticketInstantToWallClockComponents — converts a UTC Date instant
+ * (`date`, e.g. a parseIcs event's `start`/`end`) into a `{ year, month
+ * (ZERO-indexed), day, hour, minute }` wall-clock components object in
+ * `timeZone`, via an INJECTED `formatDate(date, timeZone, pattern)`
+ * function — production passes a thin wrapper around GAS's
+ * `Utilities.formatDate` (unavailable under Node); tests pass an
+ * Intl-based stand-in. This injection seam is what keeps this function
+ * itself pure and unit-testable (quick-261005-orv, D-04c).
+ *
+ * FAILS CLOSED: throws a clear Error quoting the raw formatter output if
+ * it does not match `TICKET_WALL_CLOCK_FORMAT_PATTERN`'s own shape
+ * (`/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/`), and throws if `date` is
+ * not a valid Date — silently returning NaN-laced components would risk
+ * writing a wrong calendar event rather than failing the action loudly.
+ * Pure given its injected `formatDate`; no direct GAS global reference.
+ */
+function ticketInstantToWallClockComponents(date, timeZone, formatDate) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+    throw new Error('ticketInstantToWallClockComponents: "date" is not a valid Date: ' + date);
+  }
+
+  const formatted = formatDate(date, timeZone, TICKET_WALL_CLOCK_FORMAT_PATTERN);
+  const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/.exec(String(formatted));
+  if (!match) {
+    throw new Error(
+      'ticketInstantToWallClockComponents: formatDate returned an unrecognized shape (expected "' +
+        TICKET_WALL_CLOCK_FORMAT_PATTERN +
+        '"): "' +
+        formatted +
+        '"'
+    );
+  }
+
+  return {
+    year: Number(match[1]),
+    month: Number(match[2]) - 1,
+    day: Number(match[3]),
+    hour: Number(match[4]),
+    minute: Number(match[5]),
+  };
+}
+
+/**
+ * buildTicketportalCzParsedTicket — builds the `parsedTicket` shape
+ * (quick-261005-orv, D-04, D-05) from a single parseIcs-returned event
+ * (`icsEvent`), the matched eTicket PDF's filename (`ticketPdfName`,
+ * nullable), the target calendar's own `timeZone`, and an injected
+ * `formatDate` (see ticketInstantToWallClockComponents). Pure.
+ *
+ * Returns `{ eventName, location, year, month, day, hour, minute,
+ * ticketIdentifier }`, PLUS `end: { year, month, day, hour, minute }` ONLY
+ * when `icsEvent.end` is a Date strictly LATER than `icsEvent.start` —
+ * parseVeventBlock sets `end = start` when the .ics carries no DTEND, and
+ * omitting `end` in that case is what lets buildTicketCalendarEventResource's
+ * existing DEFAULT_EVENT_DURATION_MINUTES fallback apply exactly as it does
+ * for every other portal (D-05).
+ *
+ * `eventName` = stripTicketportalCzSummaryDateSuffix(icsEvent.summary) —
+ * throws a clear Error if that comes back empty (a stripped-to-nothing
+ * summary is not a usable event name).
+ * `location` = icsEvent.location, or '' when absent.
+ * `ticketIdentifier` = extractTicketportalCzOrderNumber(ticketPdfName) —
+ * `null` when absent, NEVER icsEvent.uid in any fallback (D-04d; see that
+ * function's own JSDoc for why the UID is unsafe to use here).
+ *
+ * Deliberately sets no `description`: the .ics DESCRIPTION is boilerplate
+ * ("Přidejte si do Vašeho kalendáře.") plus parseIcs's own organizer line,
+ * which adds nothing an owner reading the calendar event needs.
+ */
+function buildTicketportalCzParsedTicket(icsEvent, ticketPdfName, timeZone, formatDate) {
+  const eventName = stripTicketportalCzSummaryDateSuffix(icsEvent.summary);
+  if (!eventName) {
+    throw new Error('Ticketportal.cz: stripped .ics SUMMARY is empty, no usable event name. Raw summary: "' + icsEvent.summary + '"');
+  }
+
+  const startComponents = ticketInstantToWallClockComponents(icsEvent.start, timeZone, formatDate);
+
+  const parsedTicket = {
+    eventName: eventName,
+    location: icsEvent.location || '',
+    year: startComponents.year,
+    month: startComponents.month,
+    day: startComponents.day,
+    hour: startComponents.hour,
+    minute: startComponents.minute,
+    ticketIdentifier: extractTicketportalCzOrderNumber(ticketPdfName),
+  };
+
+  if (icsEvent.end instanceof Date && icsEvent.end.getTime() > icsEvent.start.getTime()) {
+    parsedTicket.end = ticketInstantToWallClockComponents(icsEvent.end, timeZone, formatDate);
+  }
+
+  return parsedTicket;
 }
 
 /**
@@ -2290,6 +2477,19 @@ function findTicketPdfAttachments(message) {
 }
 
 /**
+ * findTicketIcsAttachments (quick-261005-orv, D-02) — every GmailAttachment
+ * on `message` matching isIcsAttachment (the EXISTING matcher from
+ * src/05-action-ics-import.js, reused via this file's end-of-file Node
+ * bridge under Node / the shared GAS global scope — never a second .ics
+ * matcher), in source order, or `[]` if none match. Pure over the passed-in
+ * `message`, so this is fully unit-testable under Node with a duck-typed
+ * fake.
+ */
+function findTicketIcsAttachments(message) {
+  return message.getAttachments().filter(isIcsAttachment);
+}
+
+/**
  * findKinoArtTicketPdfAttachment — Kino Art sends TWO PDF attachments per
  * confirmation email: `Vstupenky.pdf` (the real ticket, one page per
  * seat) and `Doklad.pdf` (a separate receipt/invoice, NOT ticket data —
@@ -2360,6 +2560,34 @@ function findFeverTicketPdfAttachment(message) {
 }
 
 /**
+ * findTicketportalCzTicketPdfAttachment (quick-261005-orv, D-03) —
+ * Ticketportal.cz's own ticket-PDF finder, for BOTH the OPTIONAL
+ * `insertPdfIntoEvent` attachment path AND the per-ORDER
+ * extractTicketportalCzOrderNumber dedup key. The real observed order
+ * confirmation carries THREE PDF attachments: `eTicket_<order>.pdf` (the
+ * real ticket), `Doklad_poplatek_<order>.pdf` (a service-fee receipt, NOT
+ * ticket data), and a venue terms-and-conditions PDF with a diacritic
+ * filename (also NOT ticket data). Returns the FIRST qualifying PDF
+ * attachment whose name contains `"eTicket"`, or `null` — same discipline
+ * as findKinoArtTicketPdfAttachment/findTicketmasterCzTicketPdfAttachment/
+ * findFeverTicketPdfAttachment above. SCOPE LIMITATION: a differently-named
+ * attachment would need handling THEN, with real data. Pure, no GAS
+ * globals.
+ */
+function findTicketportalCzTicketPdfAttachment(message) {
+  const pdfAttachments = findTicketPdfAttachments(message);
+
+  for (let i = 0; i < pdfAttachments.length; i++) {
+    const name = pdfAttachments[i].getName() || '';
+    if (name.indexOf('eTicket') !== -1) {
+      return pdfAttachments[i];
+    }
+  }
+
+  return null;
+}
+
+/**
  * TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL — the local
  * (single-file) registry mapping a BODY-SOURCED ticketing portal's
  * `identifyingEmail` to its own ticket-PDF-finder function, kept as a
@@ -2377,10 +2605,15 @@ function findFeverTicketPdfAttachment(message) {
 // TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL registry
 // instead -- see that registry's JSDoc for why fetching and finding are
 // kept apart.
+// Ticketportal.cz (quick-261005-orv, D-08) is registered here too, despite
+// being ICS-SOURCED rather than body-sourced: this registry's attach-step
+// consumer (processTicketFromIcsAttachment) reuses it exactly as the
+// body-sourced pipeline does, regardless of processing mode.
 const TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL = {
   'rezervace@kinoart.cz': findKinoArtTicketPdfAttachment,
   'noreply@ticketmaster.cz': findTicketmasterCzTicketPdfAttachment,
   'hello@feverup.com': findFeverTicketPdfAttachment,
+  'vstupenky@ticketportal.cz': findTicketportalCzTicketPdfAttachment,
 };
 
 /**
@@ -2468,9 +2701,17 @@ function ticketBodyLooksProcessable(message, senderKey) {
  *     TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL (body-sourced, e.g. Kino
  *     Art) — the ticket data comes from the body itself, once per
  *     message, never per attachment.
+ *   - `{ mode: 'ics', message, portal }` — EXACTLY ONE JOB PER MATCHING
+ *     MESSAGE, for a portal whose sender resolves against
+ *     TICKET_ICS_MODE_SENDERS (ICS-sourced, Ticketportal.cz,
+ *     quick-261005-orv, D-02) AND the message carries at least one
+ *     qualifying `.ics` attachment (findTicketIcsAttachments) — the ticket
+ *     data comes from the .ics itself, once per message, never per
+ *     attachment.
  * A message whose sender does not resolve to any configured portal, or
- * whose portal resolves to neither registry, or (for a PDF-sourced
- * portal) carries no qualifying PDF attachment, contributes NO jobs.
+ * whose portal resolves to none of the three registries, or (for a
+ * PDF/ICS-sourced portal) carries no qualifying attachment, contributes NO
+ * jobs.
  * Pure, no GAS globals — every GAS-shaped method call here is invoked ON
  * THE PASSED-IN objects only, so this is fully unit-testable under Node
  * with fake message/attachment objects.
@@ -2504,6 +2745,8 @@ function resolveTicketProcessingJobs(messages, portals) {
       }
     } else if (TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL[senderKey] && ticketBodyLooksProcessable(message, senderKey)) {
       jobs.push({ mode: 'body', message: message, portal: portal });
+    } else if (TICKET_ICS_MODE_SENDERS.indexOf(senderKey) !== -1 && findTicketIcsAttachments(message).length > 0) {
+      jobs.push({ mode: 'ics', message: message, portal: portal });
     }
   }
 
@@ -2584,6 +2827,13 @@ function isDuplicateTicketPurchase(ticketIdentifier, calendarId) {
  *
  * TIMEZONE is passed IN rather than resolved here, which is what keeps
  * this function pure — its caller does the one `CalendarApp` round-trip.
+ *
+ * EXPLICIT END (quick-261005-orv, D-05): when `parsedTicket.end` is truthy
+ * (a `{ year, month, day, hour, minute }` components object — currently
+ * only buildTicketportalCzParsedTicket ever sets this), it is used
+ * VERBATIM as the end components instead of the
+ * DEFAULT_EVENT_DURATION_MINUTES fallback below. No pre-existing parser
+ * sets `parsedTicket.end`, so this is a no-op for every other portal.
  */
 function buildTicketCalendarEventResource(parsedTicket, timeZone, attachments) {
   const startComponents = {
@@ -2593,7 +2843,15 @@ function buildTicketCalendarEventResource(parsedTicket, timeZone, attachments) {
     hour: parsedTicket.hour,
     minute: parsedTicket.minute,
   };
-  const endComponents = addMinutesToWallClockComponents(startComponents, DEFAULT_EVENT_DURATION_MINUTES);
+  const endComponents = parsedTicket.end
+    ? {
+        year: parsedTicket.end.year,
+        month: parsedTicket.end.month,
+        day: parsedTicket.end.day,
+        hour: parsedTicket.end.hour,
+        minute: parsedTicket.end.minute,
+      }
+    : addMinutesToWallClockComponents(startComponents, DEFAULT_EVENT_DURATION_MINUTES);
 
   const resource = {
     summary: parsedTicket.eventName,
@@ -2932,6 +3190,124 @@ function processTicketFromMessageBody(message, portal) {
 }
 
 /**
+ * processTicketFromIcsAttachment (quick-261005-orv, D-04, D-08) — the
+ * ICS-SOURCED processing mode, Ticketportal.cz's own: `message`'s own
+ * `.ics` attachment supplies the event data (via the EXISTING parseIcs,
+ * reused through this file's end-of-file Node bridge / the shared GAS
+ * global scope — D-01), never a portal-specific text/body parser. GAS-only
+ * (CalendarApp/Calendar/DriveApp/Utilities globals) — not unit-tested
+ * directly beyond this function's own GAS-shaped coordination; the pure
+ * logic it depends on (buildTicketportalCzParsedTicket and friends) IS
+ * fully unit-tested. Exported for the Node global-injection harness, same
+ * as processTicketFromMessageBody.
+ *
+ * Flow:
+ *   (a) icsAttachments = findTicketIcsAttachments(message). Throws if
+ *       empty (should not happen when appliesTo/resolveTicketProcessingJobs
+ *       already gated on this, but guards against a future call-order
+ *       bug).
+ *   (b) events = parseIcs(icsAttachments[0].getDataAsString()). Throws a
+ *       clear Error naming the portal if zero VEVENTs parsed. SCOPE
+ *       LIMITATION: the real sample carries exactly one `.ics` attachment
+ *       and one VEVENT; if more than one of either is ever seen, only the
+ *       first is used and a console.log notes it — generalizing to more
+ *       is deferred until real data shows it is needed.
+ *   (c) Resolve the target calendar (resolveTicketingCalendarId + the one
+ *       CalendarApp.getCalendarById round-trip, same pattern as
+ *       createTicketCalendarEvent) and its live timeZone. Throws if the
+ *       resolved calendarId does not resolve to a real calendar.
+ *   (d) Resolve the matched eTicket PDF via the EXISTING
+ *       TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL registry (D-08) —
+ *       REGARDLESS of `portal.insertPdfIntoEvent`, since the dedup
+ *       ticketIdentifier depends on the PDF's filename even when the PDF
+ *       itself will not be attached.
+ *   (e) parsedTicket = buildTicketportalCzParsedTicket(...). A null
+ *       ticketIdentifier (no matched PDF) is logged — the dedup safety net
+ *       simply cannot run for this message, same documented limitation as
+ *       every other portal missing a stable identifier.
+ *   (f) DEDUP SAFETY NET (shared via isDuplicateTicketPurchase) — if a
+ *       duplicate, silent no-op, no Drive/Calendar writes at all.
+ *   (g) If `portal.insertPdfIntoEvent` AND a matched PDF exists: copy it
+ *       into the PERMANENT CONFIG.ticketAttachmentDriveFolderName folder
+ *       (via getOrCreateDriveFolderByName), rename it via the shared
+ *       buildTicketAttachmentFilename convention, and push one
+ *       `{ fileId, fileUrl, title, mimeType: 'application/pdf' }` entry —
+ *       the exact same shape processTicketFromMessageBody's own PDF-finder
+ *       path produces.
+ *   (h) Build and insert the Calendar event via the SHARED
+ *       createTicketCalendarEvent, passing the accumulated attachments
+ *       ARRAY (same diagnostic log convention as the other two modes).
+ */
+function processTicketFromIcsAttachment(message, portal) {
+  const calendarId = resolveTicketingCalendarId(portal, CONFIG.calendarId);
+  const senderKey = ticketingExtractEmailAddress(portal.identifyingEmail);
+
+  const icsAttachments = findTicketIcsAttachments(message);
+  if (icsAttachments.length === 0) {
+    throw new Error('Ticketing portal (ics mode): no .ics attachment found on message for portal: ' + portal.identifyingEmail);
+  }
+  if (icsAttachments.length > 1) {
+    console.log('Ticketing portal (ics mode): more than one .ics attachment found; only the first is used.');
+  }
+
+  const events = parseIcs(icsAttachments[0].getDataAsString());
+  if (events.length === 0) {
+    throw new Error('Ticketing portal (ics mode): the .ics attachment carried zero VEVENTs, for portal: ' + portal.identifyingEmail);
+  }
+  if (events.length > 1) {
+    console.log('Ticketing portal (ics mode): more than one VEVENT found in the .ics; only the first is used.');
+  }
+
+  const calendar = CalendarApp.getCalendarById(calendarId);
+  if (!calendar) {
+    throw new Error('Ticketing portal (ics mode): Calendar not found for resolved calendarId: ' + calendarId);
+  }
+  const timeZone = calendar.getTimeZone();
+
+  const findPortalTicketPdfAttachment = TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL[senderKey];
+  const ticketPdf = findPortalTicketPdfAttachment ? findPortalTicketPdfAttachment(message) : null;
+
+  const parsedTicket = buildTicketportalCzParsedTicket(
+    events[0],
+    ticketPdf ? ticketPdf.getName() : null,
+    timeZone,
+    function (date, timeZoneForFormat, pattern) {
+      return Utilities.formatDate(date, timeZoneForFormat, pattern);
+    }
+  );
+  if (!parsedTicket.ticketIdentifier) {
+    console.log('Ticketing portal (ics mode): no ticketIdentifier available (no matched eTicket PDF); dedup protection is unavailable for this message.');
+  }
+
+  if (isDuplicateTicketPurchase(parsedTicket.ticketIdentifier, calendarId)) {
+    return;
+  }
+
+  const attachments = [];
+  if (portal.insertPdfIntoEvent && ticketPdf) {
+    const permanentFolder = getOrCreateDriveFolderByName(CONFIG.ticketAttachmentDriveFolderName);
+    const permanentPdfFile = permanentFolder.createFile(ticketPdf.copyBlob());
+    permanentPdfFile.setName(buildTicketAttachmentFilename(parsedTicket.eventName, parsedTicket, parsedTicket.ticketIdentifier));
+    attachments.push({
+      fileId: permanentPdfFile.getId(),
+      fileUrl: permanentPdfFile.getUrl(),
+      title: permanentPdfFile.getName(),
+      mimeType: 'application/pdf',
+    });
+  } else if (portal.insertPdfIntoEvent) {
+    console.log(
+      'Ticketing portal (ics mode): insertPdfIntoEvent is true but no matching eTicket PDF attachment was found on the message.'
+    );
+  }
+
+  console.log(
+    'Ticketing portal: creating calendar event for "' + parsedTicket.eventName + '" (ticketIdentifier=' +
+      parsedTicket.ticketIdentifier + ') on calendar ' + calendarId + '.'
+  );
+  createTicketCalendarEvent(parsedTicket, calendarId, attachments);
+}
+
+/**
  * TICKETING_PORTALS_ACTION — the ticketing-portals action descriptor.
  * Carries its own config block (TICKETING_PORTALS_ACTION_CONFIG),
  * independent of CONFIG and of any other action's config, except for the
@@ -2953,13 +3329,16 @@ const TICKETING_PORTALS_ACTION = {
   /**
    * appliesTo — returns a literal boolean. True when any message on the
    * thread is from a sender matching a configured TICKETING_PORTALS entry
-   * AND either: (a) that portal resolves against
+   * AND any of: (a) that portal resolves against
    * TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL (PDF/OCR-sourced) AND the
-   * message carries at least one qualifying PDF attachment, or (b) that
+   * message carries at least one qualifying PDF attachment, (b) that
    * portal resolves against TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL
    * (body-sourced) AND the message body passes that portal's registered
-   * content detector, if it has one (ticketBodyLooksProcessable). Otherwise
-   * false. dispatchActions only skips on a strict `=== false`, so a literal
+   * content detector, if it has one (ticketBodyLooksProcessable), or (c)
+   * that portal resolves against TICKET_ICS_MODE_SENDERS (ICS-sourced,
+   * Ticketportal.cz, quick-261005-orv, D-02) AND the message carries at
+   * least one qualifying `.ics` attachment. Otherwise false.
+   * dispatchActions only skips on a strict `=== false`, so a literal
    * boolean is required.
    *
    * There is still NO attachment requirement for a body-sourced portal, but
@@ -2987,6 +3366,9 @@ const TICKETING_PORTALS_ACTION = {
       if (TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL[senderKey] && ticketBodyLooksProcessable(messages[i], senderKey)) {
         return true;
       }
+      if (TICKET_ICS_MODE_SENDERS.indexOf(senderKey) !== -1 && findTicketIcsAttachments(messages[i]).length > 0) {
+        return true;
+      }
     }
 
     return false;
@@ -2994,15 +3376,17 @@ const TICKETING_PORTALS_ACTION = {
 
   /**
    * run — builds the processing job list via the pure, TESTABLE
-   * resolveTicketProcessingJobs (each job tagged with `mode: 'pdf'` or
-   * `'body'`), then runs the appropriate pipeline exactly once per job:
-   * processTicketPdfAttachment for `'pdf'` jobs (the Drive/OCR pipeline),
-   * processTicketFromMessageBody for `'body'` jobs (body text only, no
-   * Drive/OCR). Duplicate-event protection is provided entirely by the
-   * DEDUP SAFETY NET shared by both pipelines (isDuplicateTicketPurchase),
-   * not by restricting which attachments/messages get processed here. A
-   * message matching neither a configured portal nor either processing
-   * mode's requirements contributes no job and is skipped gracefully.
+   * resolveTicketProcessingJobs (each job tagged with `mode: 'pdf'`,
+   * `'body'` or `'ics'`), then runs the appropriate pipeline exactly once
+   * per job: processTicketPdfAttachment for `'pdf'` jobs (the Drive/OCR
+   * pipeline), processTicketFromMessageBody for `'body'` jobs (body text
+   * only, no Drive/OCR), processTicketFromIcsAttachment for `'ics'` jobs
+   * (the message's own .ics attachment, quick-261005-orv). Duplicate-event
+   * protection is provided entirely by the DEDUP SAFETY NET shared by all
+   * three pipelines (isDuplicateTicketPurchase), not by restricting which
+   * attachments/messages get processed here. A message matching neither a
+   * configured portal nor any processing mode's requirements contributes
+   * no job and is skipped gracefully.
    */
   run: function (thread) {
     const messages = thread.getMessages();
@@ -3013,6 +3397,8 @@ const TICKETING_PORTALS_ACTION = {
         processTicketPdfAttachment(job.attachment, job.portal);
       } else if (job.mode === 'body') {
         processTicketFromMessageBody(job.message, job.portal);
+      } else if (job.mode === 'ics') {
+        processTicketFromIcsAttachment(job.message, job.portal);
       }
     });
   },
@@ -3102,5 +3488,34 @@ if (typeof module !== 'undefined' && module.exports) {
     feverTextHasPurchaseDetails: feverTextHasPurchaseDetails,
     findFeverTicketPdfAttachment: findFeverTicketPdfAttachment,
     feverResolveEventYear: feverResolveEventYear,
+    // The sixth portal, Ticketportal.cz (quick-261005-orv).
+    TICKET_ICS_MODE_SENDERS: TICKET_ICS_MODE_SENDERS,
+    findTicketIcsAttachments: findTicketIcsAttachments,
+    findTicketportalCzTicketPdfAttachment: findTicketportalCzTicketPdfAttachment,
+    stripTicketportalCzSummaryDateSuffix: stripTicketportalCzSummaryDateSuffix,
+    extractTicketportalCzOrderNumber: extractTicketportalCzOrderNumber,
+    ticketInstantToWallClockComponents: ticketInstantToWallClockComponents,
+    buildTicketportalCzParsedTicket: buildTicketportalCzParsedTicket,
+    processTicketFromIcsAttachment: processTicketFromIcsAttachment,
   };
+}
+
+// Node/GAS environment bridge for src/05-action-ics-import.js's parseIcs and
+// isIcsAttachment (quick-261005-orv, D-01). Deliberately placed AFTER the
+// module.exports block above, i.e. as the LAST statement in this file: 05
+// requires THIS file back (its own end-of-file bridge, for
+// resolveTicketingPortal/TICKETING_PORTALS_ACTION), so whichever of 05/07
+// loads FIRST would otherwise see the OTHER file's module.exports still at
+// its original, empty `{}` -- a mid-file placement here would hand 05 this
+// file's own PARTIAL exports during that file's own require() of this one.
+// Same end-of-file-after-module.exports technique both bridges use, which
+// is what makes either load order safe (see 05's own matching bridge
+// comment). Under GAS's shared global scope this block never runs
+// (`typeof module` is always 'undefined' there); the bare `parseIcs`/
+// `isIcsAttachment` names resolve through the concatenated global scope at
+// call time instead.
+if (typeof module !== 'undefined' && module.exports) {
+  const icsModule = require('./05-action-ics-import.js');
+  globalThis.parseIcs = icsModule.parseIcs;
+  globalThis.isIcsAttachment = icsModule.isIcsAttachment;
 }

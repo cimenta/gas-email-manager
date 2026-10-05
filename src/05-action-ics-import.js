@@ -1130,6 +1130,48 @@ function isExcludedSender(fromHeader, excludeFrom) {
 }
 
 /**
+ * isTicketingPortalSender (quick-261005-orv, D-07) — true when `fromHeader`
+ * resolves to a configured TICKETING_PORTALS entry, via the EXISTING
+ * resolveTicketingPortal (src/07-action-ticketing-portals.js, reused
+ * through this file's end-of-file Node bridge / the shared GAS global
+ * scope — never a re-implemented matcher). `ticketingPortals` is the
+ * TICKETING_PORTALS config array to resolve against. Pure apart from that
+ * one cross-file call.
+ *
+ * STRUCTURAL, NOT ANOTHER excludeFrom DEFAULT. Precedent: the
+ * regiojet-cancel-not-deleted debug session concluded "a correctness
+ * guarantee resting on a Script Property that defaults to off is not a
+ * mitigation; it is an unset switch." A sender-list toggle that defaults
+ * to exclude-nobody has exactly that shape — it only protects an install
+ * where the owner remembered to set it. This function is instead applied
+ * UNCONDITIONALLY at both of this file's .ics filter points, independent
+ * of config.excludeFrom, so the exclusion holds on a fresh install with
+ * every override left at its code default.
+ *
+ * WHY THIS MUST EXIST AT ALL: without it, TICKETING_PORTALS_ACTION's
+ * `Events.insert` (ticketIdentifier-deduped) and this action's
+ * `Events.import`/`Events.insert` (iCalUID-deduped) would each see the SAME
+ * `.ics` attachment from a configured portal sender (e.g. Ticketportal.cz)
+ * and EACH create its own calendar event for it — two competing events
+ * from one email, since neither action's dedup mechanism can see the
+ * other's write.
+ *
+ * KEYED ON THE CONFIGURED LIST, not a hardcoded address: this covers every
+ * CURRENT and FUTURE TICKETING_PORTALS entry with no further change here.
+ *
+ * DELIBERATELY DOES NOT CONSULT TICKETING_PORTALS_ACTION.config.enabled.
+ * Disabling that action must not silently reroute a portal's `.ics` into
+ * this action's import path instead — the owner's actual intent when
+ * disabling TICKETING_PORTALS_ACTION is almost always "stop touching this
+ * sender's mail entirely," not "hand it to the other action." To return a
+ * sender to ICS import, remove it from TICKETING_PORTALS; disabling the
+ * ticketing-portals action is a separate, independent decision.
+ */
+function isTicketingPortalSender(fromHeader, ticketingPortals) {
+  return resolveTicketingPortal(fromHeader, ticketingPortals) !== null;
+}
+
+/**
  * resolveIcsCalendarId — resolves which calendar ID a given ICS-carrying
  * message's event(s) should be written into. Three-tier resolution,
  * most-specific wins:
@@ -1263,6 +1305,18 @@ if (typeof module !== 'undefined' && module.exports) {
  * excludes nobody. The owner sets the real value out-of-band via Script
  * Properties — never hardcoded into this action's shipped default.
  *
+ * TICKETING-PORTAL SENDERS (structural, quick-261005-orv, D-07): ANY sender
+ * resolving to a CONFIGURED TICKETING_PORTALS entry (src/07-action-ticketing-portals.js)
+ * is skipped at the SAME two filter points as the exclude-list above
+ * (isTicketingPortalSender), but UNCONDITIONALLY — independent of
+ * config.excludeFrom, and true even with every Script Property left at its
+ * code default. This closes the double-booking path a hand-off switch that
+ * defaults to "exclude nobody" cannot: Ticketportal.cz's order confirmation
+ * carries its own .ics, which TICKETING_PORTALS_ACTION also processes (its
+ * own ICS-sourced mode) — without this structural exclusion, both actions
+ * would create a competing calendar event for the exact same email. See
+ * isTicketingPortalSender's own JSDoc for the full rationale.
+ *
  * SEQUENCE-CONFLICT RECOVERY: even with buildEventResource always setting a
  * real `sequence`, `Calendar.Events.import` can still throw
  * `GoogleJsonResponseException: Invalid sequence value...` in a narrower
@@ -1315,7 +1369,9 @@ const ICS_CALENDAR_ACTION = {
    * or whose content-type is text/calendar, AND whose sender passes the
    * config.importOnlyFrom allow-list (see findIcsAttachments); false
    * otherwise. dispatchActions only skips on a strict `=== false`, so a
-   * literal boolean is required.
+   * literal boolean is required. A sender resolving to a configured
+   * TICKETING_PORTALS entry is structurally excluded here too
+   * (quick-261005-orv, D-07; see findIcsAttachments' own JSDoc).
    */
   appliesTo: function (thread) {
     return findIcsAttachments(thread).length > 0;
@@ -1733,16 +1789,27 @@ function isIcsAttachment(attachment) {
  * own a sender whose .ics attachments this action would otherwise also
  * claim. With the default empty excludeFrom, no sender is excluded, so
  * behavior is unchanged from before this gate existed.
+ *
+ * TICKETING-PORTAL SENDERS (structural, quick-261005-orv, D-07): a
+ * message's "From" header is ALSO, UNCONDITIONALLY, checked against every
+ * CONFIGURED TICKETING_PORTALS entry via isTicketingPortalSender — skipped
+ * the same way, but independent of config.excludeFrom (see
+ * isTicketingPortalSender's own JSDoc for why this is structural rather
+ * than another excludeFrom-shaped default).
  */
 function findIcsAttachments(thread) {
   const messages = thread.getMessages();
   const matches = [];
+  const ticketingPortals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
 
   for (let i = 0; i < messages.length; i++) {
     if (!isAllowedSender(messages[i].getFrom(), ICS_CALENDAR_ACTION.config.importOnlyFrom)) {
       continue;
     }
     if (isExcludedSender(messages[i].getFrom(), ICS_CALENDAR_ACTION.config.excludeFrom)) {
+      continue;
+    }
+    if (isTicketingPortalSender(messages[i].getFrom(), ticketingPortals)) {
       continue;
     }
 
@@ -1775,12 +1842,17 @@ function findIcsAttachments(thread) {
  * resolveIcsCalendarId and reuse it for every event that message's
  * attachment(s) produce — see ICS_CALENDAR_ACTION's class-level JSDoc.
  *
+ * TICKETING-PORTAL SENDERS (structural, quick-261005-orv, D-07): same
+ * UNCONDITIONAL isTicketingPortalSender check as findIcsAttachments above,
+ * at this filter point too.
+ *
  * Throws if the thread yields zero groups (should not happen when
  * appliesTo returned true, but guards against a future call-order bug).
  */
 function getIcsAttachmentTextsByMessage(thread) {
   const messages = thread.getMessages();
   const groups = [];
+  const ticketingPortals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
 
   for (let i = 0; i < messages.length; i++) {
     const fromHeader = messages[i].getFrom();
@@ -1788,6 +1860,9 @@ function getIcsAttachmentTextsByMessage(thread) {
       continue;
     }
     if (isExcludedSender(fromHeader, ICS_CALENDAR_ACTION.config.excludeFrom)) {
+      continue;
+    }
+    if (isTicketingPortalSender(fromHeader, ticketingPortals)) {
       continue;
     }
 
@@ -1841,5 +1916,29 @@ if (typeof module !== 'undefined' && module.exports) {
     buildOrganizerAttendeesText: buildOrganizerAttendeesText,
     collapseBlankLines: collapseBlankLines,
     ICS_CALENDAR_ACTION: ICS_CALENDAR_ACTION,
+    // The structural ticketing-portal-sender exclusion (quick-261005-orv, D-07).
+    isTicketingPortalSender: isTicketingPortalSender,
   };
+}
+
+// Node/GAS environment bridge for src/07-action-ticketing-portals.js's
+// resolveTicketingPortal and TICKETING_PORTALS_ACTION (quick-261005-orv,
+// D-07). This file and 07-action-ticketing-portals.js now require EACH
+// OTHER (07 requires THIS file back, for parseIcs/isIcsAttachment — see its
+// own end-of-file bridge comment) — a genuine circular require. Deliberately
+// placed AFTER the module.exports block above, i.e. as the LAST statement in
+// this file: in Node CommonJS, a module required while it is still mid-load
+// hands back its PARTIAL module.exports (the original empty `{}`, since both
+// files assign `module.exports = {...}` at their own very end). Putting BOTH
+// bridges at end-of-file, after their own file's module.exports assignment,
+// is what makes EITHER load order safe — whichever of 05/07 loads second
+// sees the OTHER file's fully-assigned exports, regardless of which was
+// required first. Under GAS's shared global scope this block never runs
+// (`typeof module` is always 'undefined' there); the bare
+// `resolveTicketingPortal`/`TICKETING_PORTALS_ACTION` names resolve through
+// the concatenated global scope at call time instead.
+if (typeof module !== 'undefined' && module.exports) {
+  const ticketingModule = require('./07-action-ticketing-portals.js');
+  globalThis.resolveTicketingPortal = ticketingModule.resolveTicketingPortal;
+  globalThis.TICKETING_PORTALS_ACTION = ticketingModule.TICKETING_PORTALS_ACTION;
 }

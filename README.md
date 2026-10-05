@@ -8,7 +8,7 @@ Five actions ship today:
 
 - **ICS-to-Calendar import** — any sender, generic `.ics` calendar attachments
 - **Booking.com reservation management** — booking.com
-- **Ticketing-portal import** — enigoo.cz, Kino Art (kinoart.cz), Ticketmaster CZ (ticketmaster.cz), Entradio (app.entradio.cz)
+- **Ticketing-portal import** — enigoo.cz, Kino Art (kinoart.cz), Ticketmaster CZ (ticketmaster.cz), Entradio (app.entradio.cz), Fever (feverup.com), Ticketportal.cz (ticketportal.cz)
 - **Transport ticket import** — RegioJet (regiojet.cz), IDOS.cz (idos.svt.cz)
 - **Meetings** — body-sourced meeting invites with no `.ics` attachment, matched by sender domain; Teamio (teamio.com) ships first
 
@@ -142,11 +142,16 @@ email qualifies unless explicitly excluded (see
    label and you get a notification — instead of silently labeling the
    thread processed with no event created.
 
-**Hand-off to a more specific action:** a sender with a more specialized
-action registered for it (e.g. the transport-tickets action) can be added to
-`ICS_ACTION_CONFIG.excludeFrom` so this generic action stands down for that
-sender instead of creating a second, competing event for the same `.ics`
-invite. See [Transport tickets](#transport-tickets).
+**Hand-off to a more specific action:** any sender configured in the
+ticketing-portals action's `ticketingPortals` list is skipped by this action
+automatically and unconditionally — no `excludeFrom` entry needed, and this
+holds regardless of whether the ticketing-portals action itself is enabled.
+A sender with some *other* more specialized action registered for it (e.g.
+the transport-tickets action) still needs to be added to
+`ICS_ACTION_CONFIG.excludeFrom` by hand so this generic action stands down
+for it instead of creating a second, competing event for the same `.ics`
+invite. See [Transport tickets](#transport-tickets) and
+[Security notes](#security-notes).
 
 ## Booking.com matching
 
@@ -221,8 +226,8 @@ exact required keys.
 ## Ticketing portals
 
 Ticketing portals disagree about where the event's real data lives, so this
-action supports **two processing modes** and each configured portal uses
-whichever one matches its emails. Both modes converge on the same
+action supports **three processing modes** and each configured portal uses
+whichever one matches its emails. All three modes converge on the same
 one-event-per-purchase creation, dedup, and PDF-attachment steps downstream —
 only the extraction differs.
 
@@ -232,6 +237,8 @@ only the extraction differs.
 | Kino Art (kinoart.cz) | body | the plain-text email body |
 | Ticketmaster CZ (ticketmaster.cz) | body | the plain-text email body |
 | Entradio (app.entradio.cz) | body | the plain-text email body |
+| Fever (feverup.com) | body | the plain-text email body (event name from the subject line) |
+| Ticketportal.cz (ticketportal.cz) | ics | the confirmation's own `.ics` attachment |
 
 A portal is assigned a mode implicitly, by which parser registry its sender
 address is registered in — there is no `mode` config field here (unlike the
@@ -272,6 +279,17 @@ own emails, never on line positions — email-to-plain-text rendering reflows
 text unpredictably, and a layout-position parser breaks the first time a
 template shifts.
 
+**Fever** (`hello@feverup.com`) is worth calling out: unlike every other
+body-mode portal, the event name is read from the email's **Subject line**
+first (a literal-prefix match, never a colon split, since a real Fever event
+name can carry its own internal colon), falling back to the body's own first
+surviving line only if the subject doesn't yield one. That body fallback is
+hardened against Gmail's own `[image: <alt text>]` placeholder lines, which
+Gmail's `getPlainBody()` rendering can leave as the apparent "first line" in
+place of the real text. Fever also sends ordinary marketing mail from the
+same address, so a content detector gates admission on purchase-detail
+markers actually being present, never on sender address alone.
+
 **Entradio** (`no-reply@app.entradio.cz`) is worth calling out: it is a
 white-label platform many venues send through, not a venue itself, so the one
 sender address covers every venue on it and its parser anchors purely on
@@ -288,6 +306,33 @@ attachment is never allowed to block the event — and you get a one-off
 e-mail only if literally nothing could be attached. The created event gets
 the order number, the venue address, and a description listing each seat
 (section/row/seat) from the order.
+
+### ICS mode
+
+Ticketportal.cz's confirmation email carries a genuine `.ics` attachment with
+clean, structured event data — `SUMMARY`, `LOCATION`, and a real `DTSTART`/
+`DTEND` resolved through the attachment's own `VTIMEZONE`, unlike every other
+portal above, which has nothing to parse but Gmail's rendered body text. This
+mode reuses the ICS action's own `.ics` parser directly (see
+[ICS-to-Calendar import](#ics-to-calendar-import)) rather than regexing
+anything, so it inherits that parser's mislabeled-encoding recovery for free
+and needs no portal-specific date/time parsing at all. The event's end time
+comes from the `.ics`'s real `DTEND`, not the fixed 2-hour default every
+body/PDF-mode portal falls back to when its source carries no end time.
+
+The confirmation's ticket PDF is found by filename among several attachments
+(a fee receipt and the general terms-and-conditions PDF are also attached but
+are not tickets) and, when `insertPdfIntoEvent` is on, attached to the event
+exactly like every other portal. The dedup identifier comes from that PDF's
+own filename (the order number), deliberately **not** from the `.ics`'s own
+`UID` — that UID identifies the performance/showing, not the individual
+order, and two different real orders for the same show would otherwise be
+wrongly treated as duplicates of each other.
+
+**No `excludeFrom` entry needed.** Unlike an `'ics'`-mode transport-tickets
+carrier (see [Transport tickets](#transport-tickets)), a ticketing-portals
+sender never needs to be added to `ICS_ACTION_CONFIG.excludeFrom` by hand —
+see [Security notes](#security-notes) for why.
 
 **Duplicate protection:** each created event is tagged with a stable
 identifier extracted from the ticket (its ticket or order number) via a
@@ -481,6 +526,15 @@ present) so the two never compete for the same email.
   yourself, rather than only folders the script created — be aware this
   scope grants the script access to your Drive generally, not just the
   folders this feature uses.
+- **The ICS action structurally refuses any sender configured in the
+  ticketing-portals action**, so a portal like Ticketportal.cz whose
+  confirmation carries a genuine `.ics` attachment can never get a second,
+  unlinked calendar event from the generic ICS action racing its own
+  ticket-specific one. This is deliberately **not** implemented as another
+  `excludeFrom` entry (empty by default, so an entry you forgot to add would
+  silently fail to protect you) — it's checked directly against the
+  ticketing-portals action's own configured sender list, so it holds with no
+  setup step and covers every current and future ticketing portal for free.
 ## Project layout
 
 Apps Script's editor lists files alphabetically with no manual reordering,
@@ -577,7 +631,7 @@ exact property key each one maps to.
 | `enabled` | Cross-cutting toggle — `false` skips this action entirely |
 | `notifyOnFailure` | Whether a failure notification email is sent when this action throws |
 | `importOnlyFrom` | Array of sender email addresses to restrict import to; empty (default) imports from any sender |
-| `excludeFrom` | Array of sender email addresses to skip entirely, regardless of `importOnlyFrom` — empty (default) excludes nobody. Use this to hand a sender off to a more specific action (e.g. the transport-tickets action) so the two don't both create an event for the same email |
+| `excludeFrom` | Array of sender email addresses to skip entirely, regardless of `importOnlyFrom` — empty (default) excludes nobody. Use this to hand a sender off to a more specific action that isn't the ticketing-portals action (e.g. an `'ics'`-mode transport-tickets carrier) so the two don't both create an event for the same email. A ticketing-portals sender needs no entry here — that hand-off is automatic and unconditional, see [Security notes](#security-notes) |
 | `calendarId` | Overrides `CONFIG.calendarId` for every ICS import, regardless of sender, unless a `calendarIdBySender` entry below also matches |
 | `calendarIdBySender` | Array of `{ from, calendarId }` — routes a specific sender's `.ics` invites to a specific calendar, taking priority over both this action's own `calendarId` and the global default. First match in list order wins. Independent of `importOnlyFrom` (a separate gate for whether a message is processed at all) |
 

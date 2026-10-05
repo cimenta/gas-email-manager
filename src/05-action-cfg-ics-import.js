@@ -71,7 +71,11 @@ const ICS_ACTION_CONFIG = {
   // case-insensitive extractEmailAddress comparison exactly) and its two
   // wiring points (findIcsAttachments, getIcsAttachmentTextsByMessage).
   // Never hardcode a real sender into this action's shipped default — the
-  // owner sets the real value out-of-band via Script Properties.
+  // owner sets the real value out-of-band via Script Properties. NOTE
+  // (quick-261005-orv, D-07): a sender CONFIGURED in TICKETING_PORTALS
+  // (src/07-action-cfg-ticketing-portals.js) is excluded STRUCTURALLY,
+  // unconditionally, independent of this field — it never needs an entry
+  // here. See src/05-action-ics-import.js's isTicketingPortalSender.
   // Script Property override: 05-action-ics-EXCLUDE_FROM (list,
   // comma-separated).
   // Script Properties value example: jizdenky@regiojet.cz
