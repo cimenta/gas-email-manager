@@ -138,7 +138,7 @@ test('buildRebuiltPropertiesMap: every registry entry ALWAYS gets a key in the b
   assert.ok(Object.prototype.hasOwnProperty.call(map, 'K_SET'));
 });
 
-test('buildRebuiltPropertiesMap: the real SETTINGS_REGISTRY, with no live overrides, always yields all 32 rows — empty-default fields get the sentinel, non-empty ones their real value', () => {
+test('buildRebuiltPropertiesMap: the real SETTINGS_REGISTRY, with no live overrides, always yields all 40 rows — empty-default fields get the sentinel, non-empty ones their real value', () => {
   // SETTINGS_REGISTRY's read() closures for the ICS/booking/ticketing/
   // transport-tickets/meetings entries reference
   // ICS_ACTION_CONFIG/BOOKING_ACTION_CONFIG/TICKETING_PORTALS_ACTION_CONFIG/
@@ -157,10 +157,13 @@ test('buildRebuiltPropertiesMap: the real SETTINGS_REGISTRY, with no live overri
   global.TICKETING_PORTALS_ACTION_CONFIG = require('../src/07-action-cfg-ticketing-portals.js').TICKETING_PORTALS_ACTION_CONFIG;
   global.TRANSPORT_TICKETS_ACTION_CONFIG = require('../src/08-action-cfg-transport-tickets.js').TRANSPORT_TICKETS_ACTION_CONFIG;
   global.MEETINGS_ACTION_CONFIG = require('../src/10-action-cfg-meetings.js').MEETINGS_ACTION_CONFIG;
+  // quick-261016-j0d: JOB_HUNTERS_ACTION_CONFIG's own 8 fields, same
+  // TEST-ONLY bridge technique as every sibling config above.
+  global.JOB_HUNTERS_ACTION_CONFIG = require('../src/11-action-cfg-job-hunters.js').JOB_HUNTERS_ACTION_CONFIG;
 
   try {
     const map = buildRebuiltPropertiesMap(SETTINGS_REGISTRY);
-    assert.equal(Object.keys(map).length, 32);
+    assert.equal(Object.keys(map).length, 40);
 
     // Optional-override fields whose code default is null/[] -> sentinel.
     assert.equal(map['05-action-ics-CALENDAR_ID'], SETTING_DEFAULT_SENTINEL);
@@ -206,18 +209,100 @@ test('buildRebuiltPropertiesMap: the real SETTINGS_REGISTRY, with no live overri
     assert.equal(map['10-action-meetings-NOTIFY_ON_FAILURE'], 'true');
     assert.equal(map['10-action-meetings-DEFAULT_DURATION_MINUTES'], '60');
     assert.equal(map['10-action-meetings-MEETING_SYSTEMS'], '[{"domainPattern":"*.teamio.com","calendarId":null}]');
+
+    // quick-261016-j0d: JOB_HUNTERS_ACTION_CONFIG's 8 fields -- D-02's exact
+    // code defaults. The internal LAST_RUN_AT_MS key is deliberately absent
+    // from this map (it is not in SETTINGS_REGISTRY, see
+    // INTERNAL_STATE_PROPERTY_KEYS below).
+    assert.equal(map['11-action-job-hunters-ENABLED'], 'true');
+    assert.equal(map['11-action-job-hunters-NOTIFY_ON_FAILURE'], 'true');
+    assert.equal(map['11-action-job-hunters-SPREADSHEET_ID'], 'REPLACE_WITH_JOBHUNTERS_SPREADSHEET_ID');
+    assert.equal(map['11-action-job-hunters-SHEET_NAME'], 'Emails');
+    assert.equal(map['11-action-job-hunters-JOB_HUNTER_LABEL_NAME'], 'jobHunter');
+    assert.equal(map['11-action-job-hunters-PROCESSED_LABEL_NAME'], 'jh');
+    assert.equal(map['11-action-job-hunters-OWN_ADDRESSES'], SETTING_DEFAULT_SENTINEL);
+    assert.equal(map['11-action-job-hunters-SEARCH_INTERVAL_MINUTES'], '60');
+    assert.equal(Object.prototype.hasOwnProperty.call(map, '11-action-job-hunters-LAST_RUN_AT_MS'), false);
   } finally {
     delete global.ICS_ACTION_CONFIG;
     delete global.BOOKING_ACTION_CONFIG;
     delete global.TICKETING_PORTALS_ACTION_CONFIG;
     delete global.TRANSPORT_TICKETS_ACTION_CONFIG;
     delete global.MEETINGS_ACTION_CONFIG;
+    delete global.JOB_HUNTERS_ACTION_CONFIG;
   }
 });
 const { ICS_ACTION_CONFIG } = require('../src/05-action-cfg-ics-import.js');
 const { BOOKING_ACTION_CONFIG } = require('../src/06-action-cfg-booking-com-management.js');
 const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
 const { MEETINGS_ACTION_CONFIG } = require('../src/10-action-cfg-meetings.js');
+
+test('CRITICAL: with PropertiesService absent (Node), every JOB_HUNTERS_ACTION_CONFIG field matches its exact code default (quick-261016-j0d)', () => {
+  // quick-261016-j0d: require() the NEW cfg module ONLY inside this test
+  // body (not at top level), so a missing module fails only this test, not
+  // the whole file -- same discipline as the rebuild-map test above.
+  const { JOB_HUNTERS_ACTION_CONFIG } = require('../src/11-action-cfg-job-hunters.js');
+
+  assert.equal(typeof PropertiesService, 'undefined');
+  assert.equal(JOB_HUNTERS_ACTION_CONFIG.enabled, true);
+  assert.equal(JOB_HUNTERS_ACTION_CONFIG.notifyOnFailure, true);
+  assert.equal(JOB_HUNTERS_ACTION_CONFIG.spreadsheetId, 'REPLACE_WITH_JOBHUNTERS_SPREADSHEET_ID');
+  assert.equal(JOB_HUNTERS_ACTION_CONFIG.sheetName, 'Emails');
+  assert.equal(JOB_HUNTERS_ACTION_CONFIG.jobHunterLabelName, 'jobHunter');
+  assert.equal(JOB_HUNTERS_ACTION_CONFIG.processedLabelName, 'jh');
+  assert.deepEqual(JOB_HUNTERS_ACTION_CONFIG.ownAddresses, []);
+  assert.equal(JOB_HUNTERS_ACTION_CONFIG.searchIntervalMinutes, 60);
+});
+
+// quick-261016-nu9: jobHuntersDefaultOwnAddresses resolves the running
+// account's own address via Session, so OWN_ADDRESSES needs no manual setup
+// for the common (no Gmail alias) case. Must never throw and must fall back
+// to [] on any GAS-side failure or absence.
+test('quick-261016-nu9: jobHuntersDefaultOwnAddresses -- no Session global (Node) gives []', () => {
+  const { jobHuntersDefaultOwnAddresses } = require('../src/11-action-cfg-job-hunters.js');
+  assert.equal(typeof Session, 'undefined');
+  assert.deepEqual(jobHuntersDefaultOwnAddresses(), []);
+});
+
+test('quick-261016-nu9: jobHuntersDefaultOwnAddresses -- a real Session email gives [thatEmail]', () => {
+  const { jobHuntersDefaultOwnAddresses } = require('../src/11-action-cfg-job-hunters.js');
+  global.Session = { getActiveUser: function () { return { getEmail: function () { return 'owner@example.invalid'; } }; } };
+  try {
+    assert.deepEqual(jobHuntersDefaultOwnAddresses(), ['owner@example.invalid']);
+  } finally {
+    delete global.Session;
+  }
+});
+
+test('quick-261016-nu9: jobHuntersDefaultOwnAddresses -- Session.getActiveUser().getEmail() returning "" gives []', () => {
+  const { jobHuntersDefaultOwnAddresses } = require('../src/11-action-cfg-job-hunters.js');
+  global.Session = { getActiveUser: function () { return { getEmail: function () { return ''; } }; } };
+  try {
+    assert.deepEqual(jobHuntersDefaultOwnAddresses(), []);
+  } finally {
+    delete global.Session;
+  }
+});
+
+test('quick-261016-nu9: jobHuntersDefaultOwnAddresses -- a throwing Session gives [] rather than throwing', () => {
+  const { jobHuntersDefaultOwnAddresses } = require('../src/11-action-cfg-job-hunters.js');
+  global.Session = { getActiveUser: function () { throw new Error('no active user in this context'); } };
+  try {
+    assert.deepEqual(jobHuntersDefaultOwnAddresses(), []);
+  } finally {
+    delete global.Session;
+  }
+});
+
+test('quick-261016-nu9: JOB_HUNTERS_ACTION_CONFIG.ownAddresses reflects jobHuntersDefaultOwnAddresses() when the Script Property is unset', () => {
+  const { JOB_HUNTERS_ACTION_CONFIG } = require('../src/11-action-cfg-job-hunters.js');
+  global.Session = { getActiveUser: function () { return { getEmail: function () { return 'owner@example.invalid'; } }; } };
+  try {
+    assert.deepEqual(JOB_HUNTERS_ACTION_CONFIG.ownAddresses, ['owner@example.invalid']);
+  } finally {
+    delete global.Session;
+  }
+});
 
 // --- parseBooleanSettingValue ------------------------------------------------
 
@@ -578,14 +663,71 @@ const EXPECTED_SETTINGS_REGISTRY = [
   { key: '10-action-meetings-NOTIFY_ON_FAILURE', type: 'boolean' },
   { key: '10-action-meetings-DEFAULT_DURATION_MINUTES', type: 'number' },
   { key: '10-action-meetings-MEETING_SYSTEMS', type: 'json' },
+  // quick-261016-j0d: JOB_HUNTERS_ACTION_CONFIG's own 8 fields (D-02). The
+  // internal LAST_RUN_AT_MS key is deliberately NOT here -- see
+  // INTERNAL_STATE_PROPERTY_KEYS below.
+  { key: '11-action-job-hunters-ENABLED', type: 'boolean' },
+  { key: '11-action-job-hunters-NOTIFY_ON_FAILURE', type: 'boolean' },
+  { key: '11-action-job-hunters-SPREADSHEET_ID', type: 'string' },
+  { key: '11-action-job-hunters-SHEET_NAME', type: 'string' },
+  { key: '11-action-job-hunters-JOB_HUNTER_LABEL_NAME', type: 'string' },
+  { key: '11-action-job-hunters-PROCESSED_LABEL_NAME', type: 'string' },
+  { key: '11-action-job-hunters-OWN_ADDRESSES', type: 'list' },
+  { key: '11-action-job-hunters-SEARCH_INTERVAL_MINUTES', type: 'number' },
 ];
 
-test('SETTINGS_REGISTRY: exactly the 32 approved keys, in the exact approved names and types, no more no fewer', () => {
-  assert.equal(SETTINGS_REGISTRY.length, 32);
+test('SETTINGS_REGISTRY: exactly the 40 approved keys, in the exact approved names and types, no more no fewer', () => {
+  assert.equal(SETTINGS_REGISTRY.length, 40);
   const actual = SETTINGS_REGISTRY.map(function (entry) {
     return { key: entry.key, type: entry.type };
   });
   assert.deepEqual(actual, EXPECTED_SETTINGS_REGISTRY);
+});
+
+// --- INTERNAL_STATE_PROPERTY_KEYS / mergePreservedInternalStateProperties ---
+// --- (D-03, P-13) -- the internal last-run bookkeeping key must survive ----
+// --- rebuildScriptProperties' deleteAllOthers write, yet never appear in ---
+// --- SETTINGS_REGISTRY or the settings editor. ------------------------------
+
+// Destructured from the EXISTING top-level 01-setup.js require (not a new
+// require call) -- both names are undefined until Task 3 adds them, so these
+// tests fail with a TypeError (calling undefined) rather than a module-not-
+// found error, per this task's own RED-phase expectation.
+const { INTERNAL_STATE_PROPERTY_KEYS, mergePreservedInternalStateProperties } = require('../src/01-setup.js');
+
+test('quick-261016-j0d (D-03): INTERNAL_STATE_PROPERTY_KEYS is exactly the one JobHunters last-run key, sharing no key with SETTINGS_REGISTRY', () => {
+  assert.deepEqual(INTERNAL_STATE_PROPERTY_KEYS, ['11-action-job-hunters-LAST_RUN_AT_MS']);
+  const registryKeys = SETTINGS_REGISTRY.map(function (entry) { return entry.key; });
+  INTERNAL_STATE_PROPERTY_KEYS.forEach(function (key) {
+    assert.equal(registryKeys.includes(key), false);
+  });
+});
+
+test('quick-261016-j0d (D-03, P-13): mergePreservedInternalStateProperties carries over a present internal key, drops stale unrelated keys, never mutates its input', () => {
+  const rebuiltMap = { a: '1' };
+  const currentProperties = { '11-action-job-hunters-LAST_RUN_AT_MS': '1760000000000', stale: 'x' };
+
+  const result = mergePreservedInternalStateProperties(rebuiltMap, currentProperties, INTERNAL_STATE_PROPERTY_KEYS);
+
+  assert.deepEqual(result, { a: '1', '11-action-job-hunters-LAST_RUN_AT_MS': '1760000000000' });
+  assert.deepEqual(rebuiltMap, { a: '1' });
+});
+
+test('quick-261016-j0d (P-13): mergePreservedInternalStateProperties -- an absent or empty-string internal value is not carried over', () => {
+  assert.deepEqual(mergePreservedInternalStateProperties({ a: '1' }, {}, INTERNAL_STATE_PROPERTY_KEYS), { a: '1' });
+  assert.deepEqual(
+    mergePreservedInternalStateProperties({ a: '1' }, { '11-action-job-hunters-LAST_RUN_AT_MS': '' }, INTERNAL_STATE_PROPERTY_KEYS),
+    { a: '1' }
+  );
+});
+
+test('quick-261016-j0d (P-13): mergePreservedInternalStateProperties -- a key already present in rebuiltMap keeps the rebuiltMap value', () => {
+  const result = mergePreservedInternalStateProperties(
+    { '11-action-job-hunters-LAST_RUN_AT_MS': 'rebuilt-value' },
+    { '11-action-job-hunters-LAST_RUN_AT_MS': 'current-value' },
+    INTERNAL_STATE_PROPERTY_KEYS
+  );
+  assert.equal(result['11-action-job-hunters-LAST_RUN_AT_MS'], 'rebuilt-value');
 });
 
 test('SETTINGS_REGISTRY: every json-typed entry carries its own jsonShapeValidator and jsonShapeDescription (quick-260731-tix generalization)', () => {

@@ -194,7 +194,8 @@
         '06-action-booking-com-',
         '07-action-ticketing-portals-',
         '08-action-transport-tickets-',
-        '10-action-meetings-'
+        '10-action-meetings-',
+        '11-action-job-hunters-'
       ];
 
       // Human-readable sub-tab labels (D-04), keyed by the same prefixes
@@ -206,8 +207,14 @@
         '06-action-booking-com-': 'Booking.com',
         '07-action-ticketing-portals-': 'Ticketing Portals',
         '08-action-transport-tickets-': 'Transport Tickets',
-        '10-action-meetings-': 'Meetings'
+        '10-action-meetings-': 'Meetings',
+        '11-action-job-hunters-': 'Job Hunters'
       };
+
+      // quick-261016-j0d (D-02, D-10, P-17): the Job Hunters sub-tab also
+      // gets a Run Now button + its OWN result box, rendered right after
+      // this group's fields in renderSettings below.
+      var JOB_HUNTERS_GROUP_PREFIX = '11-action-job-hunters-';
 
       function labelForGroup(group) {
         return GROUP_LABELS[group] || group;
@@ -300,6 +307,10 @@
             groupDiv.appendChild(renderSettingField(model));
           });
 
+          if (group === JOB_HUNTERS_GROUP_PREFIX) {
+            groupDiv.appendChild(renderJobHuntersRunNow());
+          }
+
           container.appendChild(groupDiv);
           settingsGroupPanels[group] = groupDiv;
         });
@@ -321,6 +332,78 @@
             settingsGroupTabButtons[g].classList.toggle('active', g === group);
           }
         });
+      }
+
+      // renderJobHuntersRunNow (D-02, D-10, P-17) -- builds the Job Hunters
+      // sub-tab's own Run Now button + its OWN result box (job-hunters-run-
+      // result), independent of the shared #run-result box on the Run tab.
+      // Rebuilt along with the rest of the settings DOM on each loadSettings
+      // (renderSettings), which is acceptable: a post-save reload simply
+      // clears the last run message. Uses textContent only -- the raw
+      // HTML-setting DOM property is never used anywhere in this file,
+      // since the message can echo error text derived from email content.
+      function renderJobHuntersRunNow() {
+        var wrapper = document.createElement('div');
+        wrapper.className = 'setting-group';
+
+        var hint = document.createElement('p');
+        hint.textContent = 'Runs the real JobHunters capture now using the SAVED settings (save first), ignoring the search interval.';
+        wrapper.appendChild(hint);
+
+        // quick-261016-nu9 round 3: next-scheduled-run display, loaded once
+        // when this sub-tab renders and refreshed after a Run Now click
+        // (which resets the clock, D-10) via refreshJobHuntersNextRun below.
+        // Uses textContent only, matching every other element in this file
+        // -- the message can echo a Script Property read, never raw email
+        // content, but there is no reason to special-case it.
+        var nextRun = document.createElement('p');
+        nextRun.id = 'job-hunters-next-run';
+        nextRun.textContent = 'Next scheduled run: loading...';
+        wrapper.appendChild(nextRun);
+
+        function refreshJobHuntersNextRun() {
+          nextRun.textContent = 'Next scheduled run: loading...';
+          google.script.run
+            .withSuccessHandler(function (result) {
+              nextRun.textContent = 'Next scheduled run: ' + (result.ok ? result.message : 'FAILED: ' + result.message);
+            })
+            .withFailureHandler(function (error) {
+              nextRun.textContent = 'Next scheduled run: FAILED: ' + error.message;
+            })
+            .webappGetJobHuntersNextRun();
+        }
+
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.id = 'run-job-hunters-now';
+        button.textContent = 'Run JobHunters now';
+        wrapper.appendChild(button);
+
+        var resultBox = document.createElement('div');
+        resultBox.id = 'job-hunters-run-result';
+        resultBox.className = 'result-box';
+        wrapper.appendChild(resultBox);
+
+        button.addEventListener('click', function () {
+          button.disabled = true;
+          resultBox.textContent = 'Running...';
+          google.script.run
+            .withSuccessHandler(function (result) {
+              button.disabled = false;
+              resultBox.textContent = result.ok ? result.message : 'FAILED: ' + result.message;
+              refreshJobHuntersNextRun();
+            })
+            .withFailureHandler(function (error) {
+              button.disabled = false;
+              resultBox.textContent = 'FAILED: ' + error.message;
+              refreshJobHuntersNextRun();
+            })
+            .webappRunJobHuntersNow();
+        });
+
+        refreshJobHuntersNextRun();
+
+        return wrapper;
       }
 
       function labelTextFor(model) {

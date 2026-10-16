@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { composeFailureBody, composeTicketAttachmentFailureBody } = require('../src/02-main.js');
+const { composeFailureBody, composeTicketAttachmentFailureBody, notifyOwnerOfFailure } = require('../src/02-main.js');
 
 test('composeFailureBody includes action name, thread subject, and error text as plain text', () => {
   const body = composeFailureBody(
@@ -75,4 +75,76 @@ test('composeTicketAttachmentFailureBody: a parser that extracted no ticket iden
 
   assert.ok(body.includes('ČERNO, VÍR'));
   assert.equal(body.includes('null'), false);
+});
+
+// --- notifyOwnerOfFailure: null-thread tolerance (quick-261016-j0d, D-11, --
+// --- P-14) -- JobHunters' run-level failure (D-11) has no single thread to
+// --- blame, so notifyOwnerOfFailure must accept thread=null and still send,
+// --- using a fixed placeholder subject line instead of crashing on
+// --- thread.getFirstMessageSubject(). ---------------------------------------
+
+function notificationFakeThread(subject) {
+  return {
+    getFirstMessageSubject: function () {
+      return subject;
+    },
+  };
+}
+
+function withNotifyOwnerOfFailureGlobals(fn) {
+  const sentEmails = [];
+
+  const savedSession = Object.prototype.hasOwnProperty.call(global, 'Session');
+  const previousSession = global.Session;
+  const savedMailApp = Object.prototype.hasOwnProperty.call(global, 'MailApp');
+  const previousMailApp = global.MailApp;
+
+  global.Session = {
+    getActiveUser: function () {
+      return { getEmail: function () { return 'owner@example.invalid'; } };
+    },
+  };
+  global.MailApp = {
+    sendEmail: function (recipient, subject, body) {
+      sentEmails.push({ recipient: recipient, subject: subject, body: body });
+    },
+  };
+
+  try {
+    fn(sentEmails);
+  } finally {
+    if (savedSession) {
+      global.Session = previousSession;
+    } else {
+      delete global.Session;
+    }
+    if (savedMailApp) {
+      global.MailApp = previousMailApp;
+    } else {
+      delete global.MailApp;
+    }
+  }
+}
+
+test('quick-261016-j0d (D-11, P-14): notifyOwnerOfFailure tolerates a null thread -- sends one email with the fixed run-level placeholder subject text', () => {
+  withNotifyOwnerOfFailureGlobals((sentEmails) => {
+    notifyOwnerOfFailure('JobHunters', null, new Error('Spreadsheet unreachable'));
+
+    assert.equal(sentEmails.length, 1);
+    assert.equal(sentEmails[0].recipient, 'owner@example.invalid');
+    assert.equal(sentEmails[0].subject, 'GAS Email Manager: action failed');
+    assert.ok(sentEmails[0].body.includes('Action: JobHunters'));
+    assert.ok(sentEmails[0].body.includes('Spreadsheet unreachable'));
+    assert.ok(sentEmails[0].body.includes('Email subject: (none -- run-level failure, not tied to a single email)'));
+  });
+});
+
+test('quick-261016-j0d (D-11): notifyOwnerOfFailure regression -- a real thread still reports its own subject', () => {
+  withNotifyOwnerOfFailureGlobals((sentEmails) => {
+    const thread = notificationFakeThread('Interview invitation');
+    notifyOwnerOfFailure('JobHunters', thread, new Error('boom'));
+
+    assert.equal(sentEmails.length, 1);
+    assert.ok(sentEmails[0].body.includes('Email subject: Interview invitation'));
+  });
 });

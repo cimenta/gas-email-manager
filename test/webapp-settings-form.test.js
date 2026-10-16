@@ -22,9 +22,9 @@ const {
 
 // --- webappBuildSettingsFormModel -------------------------------------------
 
-test('webappBuildSettingsFormModel: over the real 32-entry registry, returns 32 models with {key, type, fieldKind, rowFields}', () => {
+test('webappBuildSettingsFormModel: over the real 40-entry registry, returns 40 models with {key, type, fieldKind, rowFields}', () => {
   const models = webappBuildSettingsFormModel(SETTINGS_REGISTRY);
-  assert.equal(models.length, 32);
+  assert.equal(models.length, 40);
   models.forEach(function (model) {
     assert.equal(typeof model.key, 'string');
     assert.equal(typeof model.type, 'string');
@@ -51,6 +51,16 @@ test('webappBuildSettingsFormModel: fieldKind mapping is exactly string->text, n
   assert.equal(byKey['10-action-meetings-NOTIFY_ON_FAILURE'].fieldKind, 'checkbox');
   assert.equal(byKey['10-action-meetings-DEFAULT_DURATION_MINUTES'].fieldKind, 'number');
   assert.equal(byKey['10-action-meetings-MEETING_SYSTEMS'].fieldKind, 'rows');
+
+  // quick-261016-j0d: JobHunters' 8 keys (D-02).
+  assert.equal(byKey['11-action-job-hunters-ENABLED'].fieldKind, 'checkbox');
+  assert.equal(byKey['11-action-job-hunters-NOTIFY_ON_FAILURE'].fieldKind, 'checkbox');
+  assert.equal(byKey['11-action-job-hunters-SPREADSHEET_ID'].fieldKind, 'text');
+  assert.equal(byKey['11-action-job-hunters-SHEET_NAME'].fieldKind, 'text');
+  assert.equal(byKey['11-action-job-hunters-JOB_HUNTER_LABEL_NAME'].fieldKind, 'text');
+  assert.equal(byKey['11-action-job-hunters-PROCESSED_LABEL_NAME'].fieldKind, 'text');
+  assert.equal(byKey['11-action-job-hunters-OWN_ADDRESSES'].fieldKind, 'csv');
+  assert.equal(byKey['11-action-job-hunters-SEARCH_INTERVAL_MINUTES'].fieldKind, 'number');
 });
 
 test('webappBuildSettingsFormModel: the 4 json keys get fieldKind "rows" and rowFields with the exact expected field names', () => {

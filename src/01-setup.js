@@ -160,14 +160,18 @@ const CONFIG = {
 /**
  * rebuildScriptProperties — real, top-level, MANUALLY-INVOKED function
  * (run directly from the Apps Script editor's function picker, same
- * category as setup()). Builds the full 20-key map via
+ * category as setup()). Builds the full canonical-key map via
  * buildRebuiltPropertiesMap(SETTINGS_REGISTRY) (see that function's own
- * doc comment for the empty-string/sentinel handling — every one of the
- * 20 keys is ALWAYS included, never omitted), then writes it in ONE
- * atomic call:
- * `PropertiesService.getScriptProperties().setProperties(rebuiltMap, true)`
+ * doc comment for the empty-string/sentinel handling — every registry key
+ * is ALWAYS included, never omitted), then PRESERVES any currently-stored
+ * INTERNAL_STATE_PROPERTY_KEYS value via mergePreservedInternalStateProperties
+ * (D-03, P-13 — these keys are code-managed bookkeeping, never part of
+ * SETTINGS_REGISTRY, so buildRebuiltPropertiesMap alone would never seed or
+ * carry them), then writes the merged result in ONE atomic call:
+ * `PropertiesService.getScriptProperties().setProperties(mergedMap, true)`
  * — the `true` (deleteAllOthers) means the property store ends up holding
- * EXACTLY the canonical 20 keys, nothing stale left over; no separate
+ * EXACTLY the canonical registry keys PLUS any present
+ * INTERNAL_STATE_PROPERTY_KEYS, nothing else stale left over; no separate
  * deleteAllProperties() call is needed.
  *
  * This ONE function naturally serves BOTH purposes: first-time migration
@@ -180,14 +184,20 @@ const CONFIG = {
  * operation, not two different ones.
  *
  * GAS-only (PropertiesService) — not unit-tested directly; the map it
- * writes IS fully covered via buildRebuiltPropertiesMap's own pure-function
- * tests (which in turn exercise formatListSettingValue/formatJsonSettingValue/
+ * writes IS fully covered via buildRebuiltPropertiesMap's and
+ * mergePreservedInternalStateProperties' own pure-function tests (which in
+ * turn exercise formatListSettingValue/formatJsonSettingValue/
  * formatSettingValueForStorage).
  */
 function rebuildScriptProperties() {
-  const rebuiltMap = buildRebuiltPropertiesMap(SETTINGS_REGISTRY);
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const rebuiltMap = mergePreservedInternalStateProperties(
+    buildRebuiltPropertiesMap(SETTINGS_REGISTRY),
+    scriptProperties.getProperties(),
+    INTERNAL_STATE_PROPERTY_KEYS
+  );
 
-  PropertiesService.getScriptProperties().setProperties(rebuiltMap, true);
+  scriptProperties.setProperties(rebuiltMap, true);
 
   console.log(
     'rebuildScriptProperties: wrote ' + Object.keys(rebuiltMap).length + ' Script Properties (deleteAllOthers=true).'
@@ -266,6 +276,11 @@ function checkScriptPropertiesSyntax() {
  * lazily on first use). Trigger reconciliation is scoped strictly to
  * triggers whose handler is 'processEmails' — it must never touch triggers
  * belonging to any other handler.
+ *
+ * quick-261016-j0d (D-08): also eagerly provisions the two JobHunters
+ * labels (jobHunterLabelName, processedLabelName), so both are selectable
+ * in Gmail before the first capture run -- same create-if-absent pattern
+ * as the two labels above.
  */
 
 // GAS ScriptApp.newTrigger(...).timeBased().everyMinutes(n) only accepts
@@ -278,6 +293,12 @@ function setup() {
 
   getOrCreateLabel(CONFIG.failedLabelName);
   console.log('Failed label ready: ' + CONFIG.failedLabelName);
+
+  getOrCreateLabel(JOB_HUNTERS_ACTION_CONFIG.jobHunterLabelName);
+  console.log('JobHunters label ready: ' + JOB_HUNTERS_ACTION_CONFIG.jobHunterLabelName);
+
+  getOrCreateLabel(JOB_HUNTERS_ACTION_CONFIG.processedLabelName);
+  console.log('JobHunters processed label ready: ' + JOB_HUNTERS_ACTION_CONFIG.processedLabelName);
 
   reconcileProcessEmailsTrigger();
 }
@@ -941,7 +962,40 @@ const SETTINGS_REGISTRY = [
     ],
     read: function () { return MEETINGS_ACTION_CONFIG.meetingSystems; },
   },
+
+  // quick-261016-j0d: JOB_HUNTERS_ACTION_CONFIG's own fields (D-02) --
+  // registered here for the exact same reason every other action's config
+  // fields are: rebuildScriptProperties/checkScriptPropertiesSyntax manage
+  // them through the ONE established mechanism, not a parallel one. The
+  // internal LAST_RUN_AT_MS key is deliberately NOT here -- see
+  // INTERNAL_STATE_PROPERTY_KEYS below.
+  { key: '11-action-job-hunters-ENABLED', type: 'boolean', read: function () { return JOB_HUNTERS_ACTION_CONFIG.enabled; } },
+  { key: '11-action-job-hunters-NOTIFY_ON_FAILURE', type: 'boolean', read: function () { return JOB_HUNTERS_ACTION_CONFIG.notifyOnFailure; } },
+  { key: '11-action-job-hunters-SPREADSHEET_ID', type: 'string', read: function () { return JOB_HUNTERS_ACTION_CONFIG.spreadsheetId; } },
+  { key: '11-action-job-hunters-SHEET_NAME', type: 'string', read: function () { return JOB_HUNTERS_ACTION_CONFIG.sheetName; } },
+  { key: '11-action-job-hunters-JOB_HUNTER_LABEL_NAME', type: 'string', read: function () { return JOB_HUNTERS_ACTION_CONFIG.jobHunterLabelName; } },
+  { key: '11-action-job-hunters-PROCESSED_LABEL_NAME', type: 'string', read: function () { return JOB_HUNTERS_ACTION_CONFIG.processedLabelName; } },
+  { key: '11-action-job-hunters-OWN_ADDRESSES', type: 'list', read: function () { return JOB_HUNTERS_ACTION_CONFIG.ownAddresses; } },
+  { key: '11-action-job-hunters-SEARCH_INTERVAL_MINUTES', type: 'number', read: function () { return JOB_HUNTERS_ACTION_CONFIG.searchIntervalMinutes; } },
 ];
+
+/**
+ * INTERNAL_STATE_PROPERTY_KEYS (D-03, P-13) — Script Properties the CODE
+ * ITSELF manages (currently just JobHunters' last-run timestamp), never a
+ * user-facing setting. Deliberately absent from SETTINGS_REGISTRY, so
+ * neither the settings editor (webappBuildSettingsFormModel) nor
+ * checkScriptPropertiesSyntax ever sees it. It must still survive
+ * rebuildScriptProperties' own `setProperties(map, true)` (deleteAllOthers)
+ * write — see mergePreservedInternalStateProperties below, which carries
+ * these keys over from whatever is currently stored.
+ *
+ * The literal here must equal JOB_HUNTERS_LAST_RUN_AT_MS_PROPERTY_KEY in
+ * src/11-action-cfg-job-hunters.js; it is repeated rather than referenced
+ * because this file (01-setup.js) loads FIRST alphabetically, before that
+ * sibling config file exists to reference — test/script-properties.test.js
+ * pins the two literals together.
+ */
+const INTERNAL_STATE_PROPERTY_KEYS = ['11-action-job-hunters-LAST_RUN_AT_MS'];
 
 /**
  * buildRebuiltPropertiesMap — pure: walks `registry` (an array of
@@ -984,6 +1038,33 @@ function buildRebuiltPropertiesMap(registry) {
   return map;
 }
 
+/**
+ * mergePreservedInternalStateProperties — pure (D-03, P-13). Returns a NEW
+ * object: a copy of `rebuiltMap` plus every one of `internalKeys` whose
+ * `currentProperties` value is a non-empty string and is not already a key
+ * in `rebuiltMap`. Never mutates either input (works on a copy throughout).
+ * `currentProperties` null/undefined is treated as `{}`. This is what lets
+ * rebuildScriptProperties' own `setProperties(map, true)` (deleteAllOthers)
+ * write preserve JOB_HUNTERS_LAST_RUN_AT_MS_PROPERTY_KEY (and any future
+ * internal-state key) instead of deleting it.
+ */
+function mergePreservedInternalStateProperties(rebuiltMap, currentProperties, internalKeys) {
+  const merged = Object.assign({}, rebuiltMap);
+  const current = currentProperties || {};
+
+  (internalKeys || []).forEach(function (key) {
+    if (Object.prototype.hasOwnProperty.call(merged, key)) {
+      return;
+    }
+    const value = current[key];
+    if (typeof value === 'string' && value.length > 0) {
+      merged[key] = value;
+    }
+  });
+
+  return merged;
+}
+
 // GAS-safe Node export: `typeof module` is safely "undefined" in the Apps
 // Script runtime, so this line is inert there and only active under Node.
 // Exports CONFIG (for the duality regression test and for the sibling
@@ -1018,5 +1099,7 @@ if (typeof module !== 'undefined' && module.exports) {
     isValidTicketingPortalsShape: isValidTicketingPortalsShape,
     isValidMeetingSystemsShape: isValidMeetingSystemsShape,
     SETTINGS_REGISTRY: SETTINGS_REGISTRY,
+    INTERNAL_STATE_PROPERTY_KEYS: INTERNAL_STATE_PROPERTY_KEYS,
+    mergePreservedInternalStateProperties: mergePreservedInternalStateProperties,
   };
 }

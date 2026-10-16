@@ -6,7 +6,10 @@
  * generated from the existing SETTINGS_REGISTRY (src/01-setup.js) so every
  * tunable setting -- including the 3 JSON-typed ones, edited as structured
  * repeating rows rather than hand-typed JSON -- can be viewed and changed
- * without opening the Apps Script editor.
+ * without opening the Apps Script editor. quick-261016-j0d adds a FOURTH
+ * Run button (Job Hunters' own Run Now, webappRunJobHuntersNow), with its
+ * own result box inside the Job Hunters settings sub-tab rather than the
+ * shared Run-tab box.
  *
  * OWNER-ONLY (D-01): this file's own assertWebappOwner() guard is a
  * defense-in-depth layer on top of the appsscript.json webapp block
@@ -204,8 +207,58 @@ function webappRunCheckScriptPropertiesSyntax() {
 }
 
 /**
- * webappGetVersion — RPC handler: assertWebappOwner() first, same 6th entry
- * point into the owner-only boundary as the 5 handlers above (T-ou8-01) --
+ * webappRunJobHuntersNow — RPC handler (D-10, T-261016-03): assertWebappOwner()
+ * is the FIRST statement, the owner-only guard pinned by this task's own
+ * `wiring guard [webapp]` regex test. This is the 4th Run handler, same
+ * shape as the 3 above -- try/catch around the real top-level function,
+ * returning a plain result object, never rethrowing.
+ *
+ * UNLIKE the 3 handlers above, this one performs the REAL JobHunters
+ * capture (lock, search, write, relabel) via runJobHuntersCapture(true) --
+ * `force=true` bypasses ONLY the due-check (D-04), never `enabled` or the
+ * lock. It therefore resets LAST_RUN_AT_MS like any run (D-07 step 8), so
+ * the next SCHEDULED run still waits a full search interval afterward.
+ *
+ * `ok:false` is reserved for a thrown error. A non-throwing "did not run"
+ * outcome (disabled / not due / lock busy -- the last two are unlikely
+ * right after a manual click, but possible) is still `ok:true`, with its
+ * explanatory message built by the pure jobHuntersDescribeRunResult (P-15).
+ */
+function webappRunJobHuntersNow() {
+  assertWebappOwner();
+
+  try {
+    const result = runJobHuntersCapture(true);
+    return { ok: true, message: jobHuntersDescribeRunResult(result) };
+  } catch (err) {
+    return { ok: false, message: 'JobHunters run failed: ' + err.message };
+  }
+}
+
+/**
+ * webappGetJobHuntersNextRun — RPC handler (quick-261016-nu9 round 3):
+ * assertWebappOwner() first, same shape as the Run handlers above --
+ * try/catch, plain result object, never rethrows. Read-only: delegates to
+ * jobHuntersGetNextRunDescription (src/11-action-job-hunters.js), which
+ * reads the SAME LAST_RUN_AT_MS property and searchIntervalMinutes setting
+ * the real capture's own due-check consults, so the displayed time can
+ * never drift from the actual gate. Called once when the Job Hunters
+ * settings sub-tab renders, and again after a Run Now click (D-10) resets
+ * the clock.
+ */
+function webappGetJobHuntersNextRun() {
+  assertWebappOwner();
+
+  try {
+    return { ok: true, message: jobHuntersGetNextRunDescription() };
+  } catch (err) {
+    return { ok: false, message: 'Could not determine the next JobHunters run time: ' + err.message };
+  }
+}
+
+/**
+ * webappGetVersion — RPC handler: assertWebappOwner() first, same 7th entry
+ * point into the owner-only boundary as the 6 handlers above (T-ou8-01) --
  * it is independently reachable over google.script.run regardless of doGet,
  * so the guard is not optional here either. Exists purely so the page can
  * display the running build next to its title (D-01); deliberately returns

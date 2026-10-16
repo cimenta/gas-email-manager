@@ -1,4 +1,4 @@
-// Version: 0.18.0
+// Version: 0.19.0
 /**
  * APP_VERSION — the running application version, rendered next to the admin
  * web app's page title via webappGetVersion (src/00-webapp.js, D-01). This
@@ -10,7 +10,7 @@
  * future release -- test/app-version.test.js is the guard that fails the
  * whole suite the moment they ever drift apart.
  */
-const APP_VERSION = '0.18.0';
+const APP_VERSION = '0.19.0';
 
 /**
  * orderThreadsForProcessing — CAUSAL ORDERING GUARANTEE (live-reported bug
@@ -92,6 +92,12 @@ function threadLastMessageTime(thread) {
  * inherited from GmailApp.search's undocumented order). Ordering changes only
  * the sequence, never the membership: every selected thread is still
  * processed exactly once and labeled exactly as before.
+ *
+ * quick-261016-j0d: the STANDALONE JobHunters capture step
+ * (src/11-action-job-hunters.js) runs AFTER this dispatch loop, in its own
+ * try/catch, so it can never delay or break the loop above. It has its own
+ * interval gate and its own Gmail search (D-01) -- it is never added to
+ * getRegisteredActions/dispatchActions.
  */
 function processEmails() {
   const query = 'newer_than:' + CONFIG.daysBack + 'd -label:"' + CONFIG.labelName + '"';
@@ -106,6 +112,15 @@ function processEmails() {
       thread.addLabel(getOrCreateLabel(CONFIG.failedLabelName));
     }
   });
+
+  try {
+    runJobHuntersCapture(false);
+  } catch (jobHuntersError) {
+    console.error('JobHunters capture step failed: ' + jobHuntersError);
+    if (JOB_HUNTERS_ACTION_CONFIG.notifyOnFailure === true) {
+      notifyOwnerOfFailure('JobHunters', null, jobHuntersError);
+    }
+  }
 }
 
 /**
@@ -163,6 +178,13 @@ function composeFailureBody(actionName, threadSubject, errorMessage) {
  * the owner. The send is wrapped in its own try/catch so a mail failure can
  * never break dispatchActions' per-action isolation invariant; if the
  * recipient resolves empty, the send is skipped.
+ *
+ * quick-261016-j0d (D-11, P-14): `thread` may be null for a RUN-LEVEL
+ * failure with no single email to blame (the JobHunters capture step's own
+ * whole-run errors, e.g. an unreachable spreadsheet). A null thread uses
+ * the fixed placeholder subject text below instead of calling
+ * thread.getFirstMessageSubject(), which would otherwise throw and, caught
+ * by this function's own try/catch, silently swallow the notification.
  */
 function notifyOwnerOfFailure(actionName, thread, error) {
   try {
@@ -171,7 +193,7 @@ function notifyOwnerOfFailure(actionName, thread, error) {
       return;
     }
 
-    const threadSubject = thread.getFirstMessageSubject();
+    const threadSubject = thread ? thread.getFirstMessageSubject() : '(none -- run-level failure, not tied to a single email)';
     const subject = 'GAS Email Manager: action failed';
     const body = composeFailureBody(actionName, threadSubject, String(error));
 
@@ -284,6 +306,7 @@ if (typeof module !== 'undefined' && module.exports) {
     composeFailureBody: composeFailureBody,
     composeTicketAttachmentFailureBody: composeTicketAttachmentFailureBody,
     orderThreadsForProcessing: orderThreadsForProcessing,
+    notifyOwnerOfFailure: notifyOwnerOfFailure,
     APP_VERSION: APP_VERSION,
   };
 }
