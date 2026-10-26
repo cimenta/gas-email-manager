@@ -17,8 +17,9 @@ const {
   JOB_HUNTERS_DRY_RUN_BODY_PREVIEW_CHARS,
   JOB_HUNTERS_LOCK_TIMEOUT_MS,
   jobHuntersIsDue,
+  jobHuntersNextRunInfo,
   jobHuntersDescribeNextRun,
-  jobHuntersGetNextRunDescription,
+  jobHuntersGetNextRunInfo,
   jobHuntersParseFromHeader,
   jobHuntersNormalizeAddressList,
   cleanJobHunterBodyText,
@@ -501,9 +502,43 @@ test('quick-261016-nu9: jobHuntersDescribeNextRun -- garbage interval is due now
   assert.equal(jobHuntersDescribeNextRun(1000000, 'abc', 1760000000000), 'Due now.');
 });
 
-// --- jobHuntersGetNextRunDescription (GAS-only read, harness test) -----
+// --- jobHuntersNextRunInfo (quick-261016-nu9 round 4, structured form) -
+//
+// round 4 fix: the webapp must never bake a server-side time string into
+// its response (round 3's bug -- see jobHuntersDescribeNextRun's own doc).
+// jobHuntersNextRunInfo is the structured data BOTH the UTC-text describer
+// above and the webapp RPC (via jobHuntersGetNextRunInfo below) are built
+// on, so `nextRunAtMs` can travel to the browser as a plain number and be
+// rendered in the VIEWER's own local timezone there.
 
-test('quick-261016-nu9: jobHuntersGetNextRunDescription reads the real LAST_RUN_AT_MS property and searchIntervalMinutes setting', () => {
+test('quick-261016-nu9: jobHuntersNextRunInfo -- never run yet (lastRunAtMs 0) gives hasRunBefore:false, due:true, nextRunAtMs:null', () => {
+  assert.deepEqual(jobHuntersNextRunInfo(0, 60, 1760000000000), { hasRunBefore: false, due: true, nextRunAtMs: null });
+});
+
+test('quick-261016-nu9: jobHuntersNextRunInfo -- overdue gives hasRunBefore:true, due:true, and the real nextRunAtMs (not null)', () => {
+  assert.deepEqual(jobHuntersNextRunInfo(1000000, 60, 4600000), { hasRunBefore: true, due: true, nextRunAtMs: 4600000 });
+});
+
+test('quick-261016-nu9: jobHuntersNextRunInfo -- not yet due gives due:false and the exact nextRunAtMs', () => {
+  assert.deepEqual(jobHuntersNextRunInfo(1000000, 60, 4600000 - 90000), { hasRunBefore: true, due: false, nextRunAtMs: 4600000 });
+});
+
+test('quick-261016-nu9: jobHuntersNextRunInfo -- agrees with jobHuntersIsDue on every case (never disagree)', () => {
+  const cases = [
+    [0, 60, 1760000000000],
+    [1000000, 60, 4600000],
+    [1000000, 60, 4599999],
+    [5000000, 60, 1000000],
+    [1000000, 'abc', 1760000000000],
+  ];
+  cases.forEach(function (args) {
+    assert.equal(jobHuntersNextRunInfo.apply(null, args).due, jobHuntersIsDue.apply(null, args));
+  });
+});
+
+// --- jobHuntersGetNextRunInfo (GAS-only read, harness test) ------------
+
+test('quick-261016-nu9: jobHuntersGetNextRunInfo reads the real LAST_RUN_AT_MS property and searchIntervalMinutes setting', () => {
   const lastRunAtMs = 1000000;
   withJobHuntersRunGlobals(
     {
@@ -513,17 +548,15 @@ test('quick-261016-nu9: jobHuntersGetNextRunDescription reads the real LAST_RUN_
       }),
     },
     () => {
-      const before = Date.now();
-      const message = jobHuntersGetNextRunDescription();
-      assert.equal(message, 'Due now.');
-      assert.ok(Date.now() >= before);
+      const info = jobHuntersGetNextRunInfo();
+      assert.deepEqual(info, { hasRunBefore: true, due: true, nextRunAtMs: lastRunAtMs + 60 * 60000 });
     }
   );
 });
 
-test('quick-261016-nu9: jobHuntersGetNextRunDescription -- LAST_RUN_AT_MS absent (never run) says so', () => {
+test('quick-261016-nu9: jobHuntersGetNextRunInfo -- LAST_RUN_AT_MS absent (never run) gives hasRunBefore:false, nextRunAtMs:null', () => {
   withJobHuntersRunGlobals({ properties: defaultJobHuntersProperties() }, () => {
-    assert.equal(jobHuntersGetNextRunDescription(), 'Never run yet -- due now.');
+    assert.deepEqual(jobHuntersGetNextRunInfo(), { hasRunBefore: false, due: true, nextRunAtMs: null });
   });
 });
 
@@ -1425,18 +1458,21 @@ test('quick-261016-j0d wiring guard [webapp]: (D-02, D-10, P-17) the admin UI wi
   assert.equal(innerHtmlCount, 0);
 });
 
-test('quick-261016-nu9 wiring guard [webapp]: webappGetJobHuntersNextRun asserts ownership first and delegates to the pure describer', () => {
+test('quick-261016-nu9 wiring guard [webapp]: webappGetJobHuntersNextRun asserts ownership first and returns the structured info, never a pre-rendered time string', () => {
   const source = readSrcFile('src/00-webapp.js');
   assert.ok(/function webappGetJobHuntersNextRun\(\)\s*\{\s*assertWebappOwner\(\);/.test(source));
 
   const body = sliceFunctionBody(source, 'webappGetJobHuntersNextRun');
-  assert.ok(body.includes('jobHuntersGetNextRunDescription()'));
+  assert.ok(body.includes('jobHuntersGetNextRunInfo()'));
+  assert.ok(body.includes('nextRunAtMs'));
+  assert.ok(!body.includes('toISOString'), 'round 4: the server must never format the next-run time itself');
 });
 
-test('quick-261016-nu9 wiring guard [webapp]: the Job Hunters sub-tab displays and refreshes the next-run time around Run Now', () => {
+test('quick-261016-nu9 wiring guard [webapp]: the Job Hunters sub-tab displays and refreshes the next-run time (rendered client-side, local timezone)', () => {
   const html = readSrcFile('src/00-webapp-ui.html');
   assert.ok(html.includes('job-hunters-next-run'));
   assert.ok(html.includes('.webappGetJobHuntersNextRun()'));
+  assert.ok(html.includes('toLocaleString'), 'round 4: the browser must render nextRunAtMs in its own local timezone');
 
   const innerHtmlCount = (html.match(/innerHTML/g) || []).length;
   assert.equal(innerHtmlCount, 0);

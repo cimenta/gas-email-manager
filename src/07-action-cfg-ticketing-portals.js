@@ -19,7 +19,9 @@
  * design, why all portal-specific parsers live in that ONE file rather
  * than one file per portal, etc.) — including, since quick-260731-kar,
  * the SECOND body-sourced processing mode (Kino Art) alongside the
- * original PDF/OCR-sourced mode (enigoo.cz).
+ * original PDF/OCR-sourced mode (enigoo.cz). Since quick-261026-ma6,
+ * body-sourced portals whose plain-text part is empty (smsticket.cz) are
+ * parsed from a plain-text rendering of the HTML body instead.
  */
 const TICKETING_PORTALS_ACTION_CONFIG = {
   // Cross-cutting per-action enable/disable toggle, same convention as
@@ -50,7 +52,7 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // whether it then survives in the permanent folder + becomes a real
   // Calendar attachment, or is deleted).
   //
-  // The shipped default seeds SIX entries: enigoo.cz (the original portal
+  // The shipped default seeds SEVEN entries: enigoo.cz (the original portal
   // this feature was built from, PDF/OCR-sourced — see the sibling action
   // file's parseEnigooTicketText), Kino Art (kinoart.cz, a Czech cinema,
   // added quick-260731-kar, BODY-SOURCED — see the sibling action file's
@@ -62,18 +64,20 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // also BODY-SOURCED — see the sibling action file's
   // parseEntradioTicketText), Fever (hello@feverup.com, added
   // quick-260921-gj0, also BODY-SOURCED — see the sibling action file's
-  // parseFeverTicketText), and Ticketportal.cz (vstupenky@ticketportal.cz,
+  // parseFeverTicketText), Ticketportal.cz (vstupenky@ticketportal.cz,
   // added quick-261005-orv, ICS-SOURCED — see the sibling action file's
-  // processTicketFromIcsAttachment). The first five entries ship with
-  // calendarId left null and insertPdfIntoEvent left false — the owner
-  // fills in the real calendar ID and decides the attachment toggle live,
-  // per entry, via rebuildScriptProperties() + Script Properties, matching
-  // the now-established settings workflow (never committed to git — same
-  // placeholder-calendar-ID convention as CONFIG.calendarId itself). The
-  // SIXTH (Ticketportal.cz) entry ships with insertPdfIntoEvent TRUE — an
-  // owner decision, not a placeholder: its eTicket PDF also supplies the
-  // dedup ticketIdentifier (see TICKETPORTAL.CZ below), so there is no
-  // reason to ship it off.
+  // processTicketFromIcsAttachment), and smsticket.cz (info@smsticket.cz,
+  // added quick-261026-ma6, also BODY-SOURCED — see the sibling action
+  // file's parseSmsticketTicketText). The first five entries and the
+  // seventh ship with calendarId left null and insertPdfIntoEvent left
+  // false — the owner fills in the real calendar ID and decides the
+  // attachment toggle live, per entry, via rebuildScriptProperties() +
+  // Script Properties, matching the now-established settings workflow
+  // (never committed to git — same placeholder-calendar-ID convention as
+  // CONFIG.calendarId itself). The SIXTH (Ticketportal.cz) entry ships with
+  // insertPdfIntoEvent TRUE — an owner decision, not a placeholder: its
+  // eTicket PDF also supplies the dedup ticketIdentifier (see
+  // TICKETPORTAL.CZ below), so there is no reason to ship it off.
   //
   // FEVER (hello@feverup.com): the sender also sends ordinary marketing
   // mail, which is why a content detector (feverTextHasPurchaseDetails) is
@@ -133,6 +137,22 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // so the same .ics can never be imported twice through two unlinked
   // paths.
   //
+  // SMSTICKET.CZ (info@smsticket.cz, quick-261026-ma6): BODY-SOURCED, the
+  // SEVENTH portal. Its real confirmation's text/plain MIME part is PRESENT
+  // but EMPTY, so its body text comes from ticketingMessageBodyText's HTML
+  // fallback (the sibling action file's own "SHARED BODY-TEXT SOURCE"
+  // section) rather than message.getPlainBody() directly. A content
+  // detector (smsticketTextHasPurchaseDetails) is registered because
+  // info@smsticket.cz also sends newsletters/weekly-promo mail from the
+  // same address — its own real confirmation's footer advertises them.
+  // Dedup is keyed on the FIRST entry code found in the purchase's body
+  // (see TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL's parseSmsticketTicketText
+  // in the sibling action file). A PDF finder IS registered
+  // (findSmsticketTicketPdfAttachment), but insertPdfIntoEvent ships FALSE
+  // below — unlike Ticketportal.cz, this portal's PDF filename carries no
+  // per-order identifier, so there is no reason tied to dedup to ship it
+  // on; the owner decides live.
+  //
   // Script Property override: 07-action-ticketing-portals-TICKETING_PORTALS
   // (json — array of {identifyingEmail, calendarId, insertPdfIntoEvent}
   // objects).
@@ -142,7 +162,7 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // src/05-action-cfg-ics-import.js for the exact same JSON-vs-JS-object-
   // literal pitfall a real owner mistake already hit once for that other
   // JSON-typed setting):
-  // [{"identifyingEmail":"no-reply@enigoo.cz","calendarId":"abc123@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":"def456@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"noreply@ticketmaster.cz","calendarId":"ghi789@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"no-reply@app.entradio.cz","calendarId":"jkl012@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"hello@feverup.com","calendarId":"mno345@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"vstupenky@ticketportal.cz","calendarId":"pqr678@group.calendar.google.com","insertPdfIntoEvent":true}]
+  // [{"identifyingEmail":"no-reply@enigoo.cz","calendarId":"abc123@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":"def456@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"noreply@ticketmaster.cz","calendarId":"ghi789@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"no-reply@app.entradio.cz","calendarId":"jkl012@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"hello@feverup.com","calendarId":"mno345@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"vstupenky@ticketportal.cz","calendarId":"pqr678@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"info@smsticket.cz","calendarId":"stu901@group.calendar.google.com","insertPdfIntoEvent":false}]
   get ticketingPortals() {
     return getJsonSetting(
       '07-action-ticketing-portals-TICKETING_PORTALS',
@@ -153,6 +173,7 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
         { identifyingEmail: 'no-reply@app.entradio.cz', calendarId: null, insertPdfIntoEvent: false },
         { identifyingEmail: 'hello@feverup.com', calendarId: null, insertPdfIntoEvent: false },
         { identifyingEmail: 'vstupenky@ticketportal.cz', calendarId: null, insertPdfIntoEvent: true },
+        { identifyingEmail: 'info@smsticket.cz', calendarId: null, insertPdfIntoEvent: false },
       ],
       isValidTicketingPortalsShape
     );

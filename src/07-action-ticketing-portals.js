@@ -15,7 +15,13 @@
  *     Drive's PDF-to-Google-Docs OCR conversion, since Apps Script has no
  *     native PDF text parser.
  *   - Body-sourced (e.g. Kino Art, Ticketmaster CZ): the event data is
- *     parsed directly from the email's plain-text body.
+ *     parsed directly from the email's plain-text body. When that body is
+ *     BLANK (smsticket.cz, quick-261026-ma6: its real text/plain MIME part
+ *     is present but empty), the body text instead comes from
+ *     ticketingHtmlToPlainText's own rendering of the HTML body, via the
+ *     shared ticketingMessageBodyText helper (see this file's "SHARED
+ *     BODY-TEXT SOURCE" section) — every portal whose plain body is
+ *     non-blank is unaffected.
  *   - ICS-sourced (Ticketportal.cz, quick-261005-orv): the event data comes
  *     from the confirmation email's OWN `.ics` attachment, parsed by the
  *     EXISTING parseIcs (src/05-action-ics-import.js) — the only mode with
@@ -32,7 +38,8 @@
  * rather than trying to guess ahead of time which message/attachment to
  * trust as the source. A portal parser that cannot extract any stable
  * identifier (documented per-parser limitation, not a silent gap) simply
- * does not get this protection.
+ * does not get this protection. For smsticket.cz (quick-261026-ma6) that
+ * identifier is the purchase's FIRST entry code (extractSmsticketTicketCodes).
  *
  * ALL PORTAL-SPECIFIC PARSING LOGIC LIVES IN THIS ONE FILE: every parser is
  * a clearly-separated, well-named function/section within THIS file (e.g.
@@ -2150,6 +2157,326 @@ function extractTicketportalCzOrderNumber(pdfName) {
   return match ? match[1] : null;
 }
 
+// =============================================================================
+// SMSTICKET.CZ (info@smsticket.cz) — the SEVENTH supported portal, the FIFTH
+// body-sourced one (quick-261026-ma6)
+// =============================================================================
+//
+// STRUCTURAL FACTS (from the real sample .eml, decoded by the planner):
+//   - The confirmation's text/plain MIME part is PRESENT but EMPTY (0 bytes).
+//     message.getPlainBody() hands this parser NOTHING, which is exactly
+//     what forces the generic D-02 fallback (ticketingMessageBodyText /
+//     ticketingHtmlToPlainText, defined above ticketBodyLooksProcessable
+//     below) — this portal is the reason that fallback exists at all.
+//   - The template is in English (the owner's account language); only the
+//     venue/seat data is Czech.
+//   - The body carries its own four-digit YEAR, unlike Fever — no reference-
+//     date inference is needed. There is no end time, so
+//     DEFAULT_EVENT_DURATION_MINUTES (120) applies.
+//   - Per-seat block layout: a seat label, then its price ("590 Kč"), then
+//     its entry code ("NNN-NNN-N"), then an "Add to Apple Wallet" link, then
+//     a QR <img> whose alt repeats the entry code.
+//   - Entry codes are BEARER CREDENTIALS: whoever first shows a valid code
+//     gets in. One purchase can cover multiple seats; ONE PDF holds every
+//     ticket of the purchase.
+//
+// This parser must work on BOTH ticketingHtmlToPlainText's own rendering AND
+// Gmail's own getPlainBody() rendering, should Gmail ever return one for this
+// sender (D-03) — hence every read below is structural or anchored on
+// "surviving lines" (smsticketSurvivingLines), never on a fixed line
+// position.
+
+// SMSTICKET_SUBJECT_PREFIX (D-04) — the fixed template text smsticket.cz's
+// confirmation-email Subject header starts with, decoded from the real
+// sample's own Subject header. Matched as a PREFIX ONLY (indexOf === 0) and
+// NEVER split on a colon, the same discipline FEVER_SUBJECT_PREFIX documents
+// for itself: the event name can carry its own internal colon.
+const SMSTICKET_SUBJECT_PREFIX = 'smsticket: Tickets purchase ';
+
+// SMSTICKET_DATE_TIME_PATTERN (D-05) — day digits, a dot, month digits, a
+// dot, a four-digit year, each dot TOLERANT of surrounding whitespace;
+// whitespace; ONE OPTIONAL non-digit word token followed by whitespace (the
+// observed "at"; a Czech-template "v" passes the same shape, confirmed
+// against the marketing fixture); then H(H):MM. Anchoring on the day digits
+// is what skips a leading weekday word ("Sunday") without needing to match
+// it. Non-global: a single `.exec()` always returns the FIRST match from the
+// start of the string, which is what "use the FIRST match" (D-05) means in
+// practice — no `g` flag, no `lastIndex` state to manage.
+const SMSTICKET_DATE_TIME_PATTERN = /(\d{1,2})\s*\.\s*(\d{1,2})\s*\.\s*(\d{4})\s+(?:[^\s\d]+\s+)?(\d{1,2}):(\d{2})/;
+
+// SMSTICKET_TICKET_CODE_PATTERN (D-07) — a word-bounded "NNN-NNN-N" entry
+// code. `g`-flagged and used ONLY via extractSmsticketTicketCodes below,
+// which resets `lastIndex` to 0 before every scan — the same discipline
+// FEVER_TICKET_CODE_PATTERN documents for itself, so no state leaks between
+// calls.
+const SMSTICKET_TICKET_CODE_PATTERN = /\b\d{3}-\d{3}-\d\b/g;
+
+// SMSTICKET_TICKET_CODE_LINE_PATTERN (D-08) — a surviving line that is
+// NOTHING BUT one entry code, anchored both ends. Used to recognize the
+// per-seat code's OWN line so it can be enriched with its seat/price
+// neighbours; a code sharing a line with other text (e.g. its price) simply
+// never matches this, which is the documented graceful-degradation path
+// (the bare code is still used, just without enrichment).
+const SMSTICKET_TICKET_CODE_LINE_PATTERN = /^\d{3}-\d{3}-\d$/;
+
+// SMSTICKET_PRICE_LINE_PATTERN (D-08) — a surviving line that is NOTHING BUT
+// a Kč price: digits, optional inner spaces (a thousands separator),
+// optional decimal part, optional whitespace, then the literal "Kč",
+// anchored both ends.
+const SMSTICKET_PRICE_LINE_PATTERN = /^\d[\d ]*(?:[.,]\d+)?\s*Kč$/;
+
+// SMSTICKET_BOLD_WRAPPED_LINE_PATTERN (D-03) — ONE wrapping pair of asterisks
+// around a non-asterisk run, Entradio's own plain-text bold convention
+// (ENTRADIO_BOLD_VALUE_PATTERN), reused here because Gmail's own rendering of
+// this portal's HTML is assumed to use the identical convention for the
+// `<strong>`/`<b>` seat and code labels (D-03's "two renderings" contract).
+const SMSTICKET_BOLD_WRAPPED_LINE_PATTERN = /^\*([^*]+)\*$/;
+
+/**
+ * smsticketSurvivingLines — pure; splits `text` on CR, LF or CRLF AFTER
+ * normalizing it with feverNormalizeBodyText (folding U+00A0 and stripping
+ * invisible padding characters — reused by name per this file's Fever
+ * section, never duplicated). Each line is trimmed, has ONE wrapping pair of
+ * SMSTICKET_BOLD_WRAPPED_LINE_PATTERN asterisks removed and is re-trimmed,
+ * then dropped if it is empty or is ONLY a Gmail image-placeholder (via
+ * feverLineIsOnlyImagePlaceholders, also reused by name). Returns the
+ * surviving lines, in order. Never throws.
+ */
+function smsticketSurvivingLines(text) {
+  const normalized = feverNormalizeBodyText(text);
+  const lines = normalized.split(/\r\n|\r|\n/);
+  const survivors = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    let trimmed = lines[i].trim();
+    const boldMatch = SMSTICKET_BOLD_WRAPPED_LINE_PATTERN.exec(trimmed);
+    if (boldMatch) {
+      trimmed = boldMatch[1].trim();
+    }
+    if (trimmed && !feverLineIsOnlyImagePlaceholders(trimmed)) {
+      survivors.push(trimmed);
+    }
+  }
+
+  return survivors;
+}
+
+/**
+ * smsticketEventNameFromSubject (D-04) — pure; NEVER THROWS. Returns the
+ * trimmed remainder of `subject` after SMSTICKET_SUBJECT_PREFIX when
+ * `subject` is a string that starts with that exact prefix (matched as a
+ * PREFIX via indexOf === 0 — never split on a colon) AND something
+ * non-whitespace remains after stripping it. Returns `null` for a subject
+ * that is missing, not a string, does not start with the prefix, or leaves
+ * nothing but whitespace — each of those is the documented FALLBACK
+ * condition to the body-sourced read in parseSmsticketTicketText below, not
+ * an error. Same contract as feverEventNameFromSubject.
+ */
+function smsticketEventNameFromSubject(subject) {
+  if (typeof subject !== 'string' || subject.indexOf(SMSTICKET_SUBJECT_PREFIX) !== 0) {
+    return null;
+  }
+  const remainder = subject.slice(SMSTICKET_SUBJECT_PREFIX.length).trim();
+  return remainder || null;
+}
+
+/**
+ * extractSmsticketTicketCodes (D-07) — pure; resets
+ * SMSTICKET_TICKET_CODE_PATTERN's `lastIndex` to 0, then collects every
+ * DISTINCT match in `region` in FIRST-SEEN order (Gmail can repeat a code as
+ * a QR placeholder's own alt text, which is why distinctness matters rather
+ * than raw match count). Never throws; `null`, `undefined` or `''` all
+ * return `[]`.
+ */
+function extractSmsticketTicketCodes(region) {
+  if (!region) {
+    return [];
+  }
+
+  SMSTICKET_TICKET_CODE_PATTERN.lastIndex = 0;
+  const seen = [];
+  const seenLookup = {};
+  let match = SMSTICKET_TICKET_CODE_PATTERN.exec(region);
+  while (match !== null) {
+    const code = match[0];
+    if (!seenLookup[code]) {
+      seenLookup[code] = true;
+      seen.push(code);
+    }
+    match = SMSTICKET_TICKET_CODE_PATTERN.exec(region);
+  }
+
+  return seen;
+}
+
+/**
+ * parseSmsticketTicketText (D-03 through D-08) — the info@smsticket.cz
+ * ticket-BODY parser. `text` is the rendered body text (either
+ * ticketingHtmlToPlainText's own rendering of the HTML body, since the real
+ * text/plain part is empty, or Gmail's own getPlainBody() rendering, should
+ * Gmail ever return one for this sender — D-03). `referenceDate` is accepted
+ * for the BODY-PARSER CONTRACT (processTicketFromMessageBody always passes
+ * it) but IGNORED: the year comes from the body itself, unlike Fever.
+ * `subject` is the message's Subject header, used as the PRIMARY event-name
+ * source (D-04).
+ *
+ * EXTRACTION SEQUENCE:
+ *   1. Normalize `text` (feverNormalizeBodyText) and find the FIRST
+ *      SMSTICKET_DATE_TIME_PATTERN match — day/month/year/hour/minute, each
+ *      range-validated (month 1-12, day 1-31, hour 0-23, minute 0-59).
+ *   2. `dateTimeText` is the matched substring with internal whitespace
+ *      collapsed to single spaces.
+ *   3. `location` (D-06) is the FIRST surviving line STRICTLY AFTER the
+ *      match's end index — correct whether or not Gmail ever joins the
+ *      venue onto the date line, since smsticketSurvivingLines still finds
+ *      it as the first surviving line of whatever remains.
+ *   4. `eventName` (D-04): the subject-derived name
+ *      (smsticketEventNameFromSubject) when available, otherwise the LAST
+ *      surviving line of the text BEFORE THE START OF THE LINE containing
+ *      the date/time match — cutting at the LINE START rather than the
+ *      match index is what keeps a leading weekday token ("Sunday") from
+ *      ever being read as the event name.
+ *   5. Entry codes (D-07, extractSmsticketTicketCodes) are scanned ONLY in
+ *      the region strictly after the date/time match. `ticketIdentifier` is
+ *      the FIRST code, or `null` when there are none — this is the DEDUP
+ *      SAFETY NET's key for this portal (an entry code is unique per
+ *      ticket, so the first ticket's code identifies the whole purchase,
+ *      stably across re-processing of the same email).
+ *   6. Per-seat description lines (D-08): over the surviving lines after the
+ *      date/time match, each DISTINCT code (in D-07's order) is enriched
+ *      to `<seat> | <price> | <code>` when it occupies its OWN surviving
+ *      line (SMSTICKET_TICKET_CODE_LINE_PATTERN) AND the line immediately
+ *      before that is a bare price (SMSTICKET_PRICE_LINE_PATTERN) AND a
+ *      line two before it exists (the seat label) — otherwise the BARE code
+ *      is used (graceful degradation, e.g. a code sharing its line with its
+ *      price). `description` is `[eventName, location, dateTimeText,
+ *      ticketLines joined by '\n']` joined by `'\n\n'`, OMITTING the 4th
+ *      paragraph entirely when there are no codes at all.
+ *
+ * Return shape: exactly `{ eventName, location, year, month, day, hour,
+ * minute, ticketIdentifier, description }` — no `ticketCodes` field; the
+ * seat count never multiplies the event (one event per purchase, D-08).
+ *
+ * Every thrown message starts with "Unrecognized smsticket.cz ticket text:"
+ * (no date/time, no event name or no location) or "<Field> out of range
+ * (<value>) in smsticket.cz ticket date/time match." (an invalid month, day,
+ * hour or minute), and ALWAYS ends with ". Full extracted text:\n" followed
+ * by the full ORIGINAL raw text — this file's DIAGNOSTIC-ON-FAILURE
+ * convention, so the owner's failure email always carries enough context to
+ * fix the next real-world variant.
+ */
+function parseSmsticketTicketText(text, referenceDate, subject) {
+  const rawText = String(text || '');
+  const normalizedText = feverNormalizeBodyText(rawText);
+
+  const dateMatch = SMSTICKET_DATE_TIME_PATTERN.exec(normalizedText);
+  if (!dateMatch) {
+    throw new Error('Unrecognized smsticket.cz ticket text: no date/time found. Full extracted text:\n' + rawText);
+  }
+
+  const day = parseInt(dateMatch[1], 10);
+  const month = parseInt(dateMatch[2], 10);
+  const year = parseInt(dateMatch[3], 10);
+  const hour = parseInt(dateMatch[4], 10);
+  const minute = parseInt(dateMatch[5], 10);
+
+  if (month < 1 || month > 12) {
+    throw new Error('Month out of range (' + month + ') in smsticket.cz ticket date/time match. Full extracted text:\n' + rawText);
+  }
+  if (day < 1 || day > 31) {
+    throw new Error('Day out of range (' + day + ') in smsticket.cz ticket date/time match. Full extracted text:\n' + rawText);
+  }
+  if (hour < 0 || hour > 23) {
+    throw new Error('Hour out of range (' + hour + ') in smsticket.cz ticket date/time match. Full extracted text:\n' + rawText);
+  }
+  if (minute < 0 || minute > 59) {
+    throw new Error('Minute out of range (' + minute + ') in smsticket.cz ticket date/time match. Full extracted text:\n' + rawText);
+  }
+
+  const dateTimeText = dateMatch[0].replace(/\s+/g, ' ').trim();
+  const matchEndIndex = dateMatch.index + dateMatch[0].length;
+  const afterDateText = normalizedText.slice(matchEndIndex);
+  const linesAfterDate = smsticketSurvivingLines(afterDateText);
+
+  if (linesAfterDate.length === 0) {
+    throw new Error('Unrecognized smsticket.cz ticket text: no location found. Full extracted text:\n' + rawText);
+  }
+  const location = linesAfterDate[0];
+
+  let eventName = smsticketEventNameFromSubject(subject);
+  if (!eventName) {
+    const lastNewlineBeforeMatch = normalizedText.lastIndexOf('\n', Math.max(dateMatch.index - 1, 0));
+    const startOfDateLineIndex = dateMatch.index === 0 ? 0 : lastNewlineBeforeMatch === -1 ? 0 : lastNewlineBeforeMatch + 1;
+    const linesBeforeDate = smsticketSurvivingLines(normalizedText.slice(0, startOfDateLineIndex));
+
+    if (linesBeforeDate.length === 0) {
+      throw new Error('Unrecognized smsticket.cz ticket text: no event name found. Full extracted text:\n' + rawText);
+    }
+    eventName = linesBeforeDate[linesBeforeDate.length - 1];
+  }
+
+  const codes = extractSmsticketTicketCodes(afterDateText);
+  const ticketIdentifier = codes.length > 0 ? codes[0] : null;
+
+  const ticketLines = codes.map(function (code) {
+    const codeLineIndex = linesAfterDate.indexOf(code);
+    if (
+      codeLineIndex >= 2 &&
+      SMSTICKET_TICKET_CODE_LINE_PATTERN.test(linesAfterDate[codeLineIndex]) &&
+      SMSTICKET_PRICE_LINE_PATTERN.test(linesAfterDate[codeLineIndex - 1])
+    ) {
+      return linesAfterDate[codeLineIndex - 2] + ' | ' + linesAfterDate[codeLineIndex - 1] + ' | ' + code;
+    }
+    return code;
+  });
+
+  const descriptionParagraphs = [eventName, location, dateTimeText];
+  if (ticketLines.length > 0) {
+    descriptionParagraphs.push(ticketLines.join('\n'));
+  }
+
+  return {
+    eventName: eventName,
+    location: location,
+    year: year,
+    month: month - 1,
+    day: day,
+    hour: hour,
+    minute: minute,
+    ticketIdentifier: ticketIdentifier,
+    description: descriptionParagraphs.join('\n\n'),
+  };
+}
+
+/**
+ * smsticketTextHasPurchaseDetails (D-09) — the REQUIRED content detector for
+ * info@smsticket.cz: `info@` is the sender's general address, and the real
+ * confirmation's own footer advertises its newsletter and weekly
+ * promotions, so sender alone cannot distinguish a purchase confirmation
+ * from ordinary marketing mail (the same risk debug/ticketmaster-cz-order-
+ * confirm first caught). Returns a LITERAL boolean: `true` only when the
+ * normalized `text` has a SMSTICKET_DATE_TIME_PATTERN match AND
+ * extractSmsticketTicketCodes finds at least one code strictly AFTER that
+ * match. Structural and language-neutral (never an English phrase marker,
+ * unlike ticketmasterCzTextHasOrderDetails), so it survives the owner's
+ * English-template account and a hypothetical Czech-template one alike.
+ * Never throws on `null`, `undefined` or `''`.
+ */
+function smsticketTextHasPurchaseDetails(text) {
+  if (!text) {
+    return false;
+  }
+
+  const normalizedText = feverNormalizeBodyText(text);
+  const dateMatch = SMSTICKET_DATE_TIME_PATTERN.exec(normalizedText);
+  if (!dateMatch) {
+    return false;
+  }
+
+  const afterDateText = normalizedText.slice(dateMatch.index + dateMatch[0].length);
+  return extractSmsticketTicketCodes(afterDateText).length > 0;
+}
+
 /**
  * TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL — the local (single-file)
  * registry mapping a BODY-SOURCED ticketing portal's `identifyingEmail`
@@ -2163,12 +2490,16 @@ function extractTicketportalCzOrderNumber(pdfName) {
 // (quick-261005-orv). Ticketportal.cz is ICS-SOURCED -- its event data comes
 // from its order confirmation's own .ics attachment, parsed by the generic
 // parseIcs, never by a per-portal body parser. See TICKET_ICS_MODE_SENDERS
-// below.
+// below. smsticket.cz (quick-261026-ma6) IS body-sourced and DOES have a key
+// here (see below) -- it is NOT ICS-sourced, since the real confirmation
+// carries no .ics attachment at all.
 const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
   'rezervace@kinoart.cz': parseKinoArtTicketText,
   'noreply@ticketmaster.cz': parseTicketmasterCzTicketText,
   'no-reply@app.entradio.cz': parseEntradioTicketText,
   'hello@feverup.com': parseFeverTicketText,
+  // The seventh portal, smsticket.cz (quick-261026-ma6).
+  'info@smsticket.cz': parseSmsticketTicketText,
 };
 
 /**
@@ -2183,7 +2514,10 @@ const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
 // is body-sourced -- everything the calendar event needs is already in the
 // email body, so no Drive upload and no OCR conversion is needed for it.
 // Also NO 'vstupenky@ticketportal.cz' key (quick-261005-orv) -- it is
-// ICS-SOURCED, not OCR-sourced; see TICKET_ICS_MODE_SENDERS below.
+// ICS-SOURCED, not OCR-sourced; see TICKET_ICS_MODE_SENDERS below. Also NO
+// 'info@smsticket.cz' key (D-01, quick-261026-ma6) -- same reason as Fever:
+// everything smsticket.cz's event needs is already in its body (or its HTML
+// body's own rendering, see ticketingMessageBodyText), so no OCR is needed.
 const TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL = {
   'no-reply@enigoo.cz': parseEnigooTicketText,
 };
@@ -2588,6 +2922,41 @@ function findTicketportalCzTicketPdfAttachment(message) {
 }
 
 /**
+ * findSmsticketTicketPdfAttachment (D-10, quick-261026-ma6) —
+ * smsticket.cz's own ticket-PDF finder, for the OPTIONAL
+ * `insertPdfIntoEvent` attachment path. The real observed confirmation
+ * carries exactly ONE PDF attachment, filename "smsticket - <event name>
+ * .pdf" (note the real space before ".pdf") — holding EVERY ticket of the
+ * purchase, not one PDF per seat. Returns the FIRST qualifying PDF
+ * attachment whose name contains the literal "smsticket", or `null` — same
+ * discipline as findKinoArtTicketPdfAttachment/
+ * findTicketmasterCzTicketPdfAttachment/findFeverTicketPdfAttachment/
+ * findTicketportalCzTicketPdfAttachment above.
+ *
+ * LIVE CAVEAT: the real filename arrives only via an RFC 2047
+ * `Content-Type name=` MIME parameter (the `Content-Disposition` is a bare
+ * `attachment` with no filename there at all). If GAS's `getName()` ever
+ * returned that undecoded, this finder returns `null` and
+ * processTicketFromMessageBody already logs and creates the event without
+ * an attachment — never a thrown error.
+ *
+ * SCOPE LIMITATION: a differently-named attachment would need handling
+ * THEN, with real data. Pure, no GAS globals.
+ */
+function findSmsticketTicketPdfAttachment(message) {
+  const pdfAttachments = findTicketPdfAttachments(message);
+
+  for (let i = 0; i < pdfAttachments.length; i++) {
+    const name = pdfAttachments[i].getName() || '';
+    if (name.indexOf('smsticket') !== -1) {
+      return pdfAttachments[i];
+    }
+  }
+
+  return null;
+}
+
+/**
  * TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL — the local
  * (single-file) registry mapping a BODY-SOURCED ticketing portal's
  * `identifyingEmail` to its own ticket-PDF-finder function, kept as a
@@ -2614,6 +2983,7 @@ const TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL = {
   'noreply@ticketmaster.cz': findTicketmasterCzTicketPdfAttachment,
   'hello@feverup.com': findFeverTicketPdfAttachment,
   'vstupenky@ticketportal.cz': findTicketportalCzTicketPdfAttachment,
+  'info@smsticket.cz': findSmsticketTicketPdfAttachment,
 };
 
 /**
@@ -2638,7 +3008,11 @@ const TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL = {
  */
 // DELIBERATE ABSENCE: there is NO 'hello@feverup.com' key here (D-11). The
 // per-seat codes fold into `description` only; this portal makes no
-// outbound HTTP call and needs no new OAuth scope.
+// outbound HTTP call and needs no new OAuth scope. Also NO
+// 'info@smsticket.cz' key (D-01, quick-261026-ma6) -- same reason: its
+// entry codes fold into `description` only, its ticket PDF (when wanted)
+// travels WITH the message and is found by findSmsticketTicketPdfAttachment
+// above, and it makes no outbound HTTP call and needs no new OAuth scope.
 const TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL = {
   'no-reply@app.entradio.cz': fetchEntradioAttachments,
 };
@@ -2668,13 +3042,126 @@ const TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL = {
   // hello@feverup.com also sends ordinary marketing mail (D-08) -- applied
   // here from day one rather than discovered live, unlike Ticketmaster CZ.
   'hello@feverup.com': feverTextHasPurchaseDetails,
+  // info@smsticket.cz also sends newsletters/weekly-promo mail from the same
+  // address (its own real confirmation's footer advertises them) -- applied
+  // here from day one too (D-09, quick-261026-ma6).
+  'info@smsticket.cz': smsticketTextHasPurchaseDetails,
 };
+
+// =============================================================================
+// SHARED BODY-TEXT SOURCE (quick-261026-ma6)
+// =============================================================================
+//
+// Built for smsticket.cz (D-02), whose real confirmation's text/plain MIME
+// part is PRESENT but EMPTY — but applied GENERICALLY, to every body-sourced
+// portal's two existing message.getPlainBody() read sites below, because it
+// can only ever turn a guaranteed failure (an empty string handed to a
+// parser/detector that expects real content) into an attempt. Every portal
+// whose plain body is non-blank (all six pre-existing portals, as observed
+// live) sees BYTE-IDENTICAL input to before this change.
+
+/**
+ * ticketingHtmlToPlainText (D-02) — pure; deterministically renders an HTML
+ * email body down to plain text, for the body-sourced parsing pipeline's
+ * fallback when a portal's own message.getPlainBody() comes back blank.
+ * Never throws; `null`/`undefined`/`''` all return `''`. Algorithm, in
+ * order (every pattern below is non-greedy, bounded by a literal closing
+ * tag, or built from a negated character class — never a nested quantifier,
+ * per this file's threat model, T-261026-03):
+ *   1. String-coerce `html`, with `null`/`undefined` becoming `''`.
+ *   2. Replace the whole `<head>...</head>` element with a newline
+ *      (case-insensitive, non-greedy).
+ *   3. Replace each `<style>...</style>` and `<script>...</script>` element
+ *      with a newline.
+ *   4. Remove every HTML comment.
+ *   5. Remove every `<img>` tag ENTIRELY — alt text is never rendered.
+ *   6. Replace every `<br>` tag (any form) with a newline.
+ *   7. Replace every opening/closing tag of p, div, tr, td, th, li, ul, ol,
+ *      table, tbody, thead, tfoot and h1-h6 with a newline.
+ *   8. Remove every remaining tag.
+ *   9. Decode numeric character references — hexadecimal (`&#xHHHH;`) THEN
+ *      decimal (`&#DDDD;`) — via `String.fromCodePoint`, leaving any
+ *      reference above `0x10FFFF` untouched rather than throwing.
+ *   10. Decode the named entities `nbsp` (to U+00A0), `lt`, `gt`, `quot` and
+ *      `apos`, THEN `amp` LAST — so an already-decoded `&lt;` et al. is
+ *      never double-decoded (e.g. the literal source text `&amp;lt;`
+ *      decodes to the literal text `&lt;`, not `<`).
+ *   11. Split on CR, LF or CRLF; collapse each run of spaces, tabs and
+ *      U+00A0 to ONE space; trim; drop lines left empty by that collapse;
+ *      join the survivors with a single newline.
+ */
+function ticketingHtmlToPlainText(html) {
+  let text = String(html || '');
+
+  text = text.replace(/<head\b[^>]*>[\s\S]*?<\/head>/gi, '\n');
+  text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '\n');
+  text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '\n');
+  text = text.replace(/<!--[\s\S]*?-->/g, '');
+  text = text.replace(/<img\b[^>]*>/gi, '');
+  text = text.replace(/<br\s*\/?>/gi, '\n');
+  text = text.replace(/<\/?(?:p|div|tr|td|th|li|ul|ol|table|tbody|thead|tfoot|h[1-6])\b[^>]*>/gi, '\n');
+  text = text.replace(/<[^>]+>/g, '');
+
+  text = text.replace(/&#x([0-9a-f]+);/gi, function (match, hex) {
+    const codePoint = parseInt(hex, 16);
+    return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : match;
+  });
+  text = text.replace(/&#(\d+);/g, function (match, dec) {
+    const codePoint = parseInt(dec, 10);
+    return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : match;
+  });
+
+  text = text.replace(/&nbsp;/gi, ' ');
+  text = text.replace(/&lt;/gi, '<');
+  text = text.replace(/&gt;/gi, '>');
+  text = text.replace(/&quot;/gi, '"');
+  text = text.replace(/&apos;/gi, "'");
+  text = text.replace(/&amp;/gi, '&');
+
+  const lines = text
+    .split(/\r\n|\r|\n/)
+    .map(function (line) {
+      return line.replace(/[ \t ]+/g, ' ').trim();
+    })
+    .filter(function (line) {
+      return line !== '';
+    });
+
+  return lines.join('\n');
+}
+
+/**
+ * ticketingMessageBodyText (D-02) — pure-over-its-argument (calls only
+ * methods ON `message`, no GAS global). Returns `message.getPlainBody()`
+ * UNCHANGED when that has any non-whitespace content. Otherwise, when
+ * `typeof message.getBody === 'function'`, returns
+ * `ticketingHtmlToPlainText(message.getBody())`; otherwise returns `''`.
+ * The `typeof` guard keeps this never-throwing for a duck-typed fake (or a
+ * hypothetical future GAS object) that lacks `getBody` entirely. Never
+ * calls `message.getBody()` when the plain body already has content — the
+ * fallback is BLANK-TRIGGERED ONLY.
+ */
+function ticketingMessageBodyText(message) {
+  const plainBody = message.getPlainBody();
+  if (plainBody && String(plainBody).trim() !== '') {
+    return plainBody;
+  }
+
+  if (typeof message.getBody === 'function') {
+    return ticketingHtmlToPlainText(message.getBody());
+  }
+
+  return '';
+}
 
 /**
  * ticketBodyLooksProcessable — the shared body-content gate behind both
  * admission points. Returns true when `senderKey` has no registered detector
  * (fail-open, see the registry's JSDoc), otherwise the detector's verdict on
- * `message.getPlainBody()`. Pure, no GAS globals.
+ * `ticketingMessageBodyText(message)` (quick-261026-ma6: previously
+ * `message.getPlainBody()` directly — every portal whose plain body is
+ * non-blank still sees byte-identical input, since the fallback only
+ * triggers when that is blank). Pure, no GAS globals.
  */
 function ticketBodyLooksProcessable(message, senderKey) {
   const detector = TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL[senderKey];
@@ -2682,7 +3169,7 @@ function ticketBodyLooksProcessable(message, senderKey) {
     return true;
   }
 
-  return detector(message.getPlainBody()) === true;
+  return detector(ticketingMessageBodyText(message)) === true;
 }
 
 /**
@@ -3060,11 +3547,17 @@ function processTicketPdfAttachment(attachment, portal) {
 /**
  * processTicketFromMessageBody — the BODY-SOURCED processing mode,
  * alongside the existing PDF/OCR-sourced processTicketPdfAttachment
- * above: for a portal whose event data comes entirely from the email BODY
- * (`message.getPlainBody()`), never from a PDF at all. The Drive/OCR
- * pipeline built for enigoo.cz is NOT used here in any way. Flow:
- *   1. Parse the plain body text via the matched portal's body parser
- *      (TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL).
+ * above: for a portal whose event data comes entirely from the email BODY,
+ * never from a PDF at all. The Drive/OCR pipeline built for enigoo.cz is NOT
+ * used here in any way. Flow:
+ *   1. Parse the body text — `ticketingMessageBodyText(message)`
+ *      (quick-261026-ma6, D-02): `message.getPlainBody()` when that has any
+ *      content, otherwise a plain-text rendering of `message.getBody()` for
+ *      a portal whose plain-text part is empty (smsticket.cz) — via the
+ *      matched portal's body parser (TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL).
+ *      When the plain body was blank and the HTML rendering was used
+ *      instead, one console.log line names the portal, so the Executions
+ *      log shows which path ran live.
  *   2. DEDUP SAFETY NET (shared with the PDF-sourced mode via
  *      isDuplicateTicketPurchase) — if a duplicate, silent no-op, no
  *      Drive/Calendar writes at all.
@@ -3110,7 +3603,16 @@ function processTicketPdfAttachment(attachment, portal) {
  */
 function processTicketFromMessageBody(message, portal) {
   const calendarId = resolveTicketingCalendarId(portal, CONFIG.calendarId);
-  const bodyText = message.getPlainBody();
+  const rawPlainBody = message.getPlainBody();
+  const plainBodyIsBlank = !rawPlainBody || String(rawPlainBody).trim() === '';
+  const bodyText = ticketingMessageBodyText(message);
+
+  if (plainBodyIsBlank && typeof message.getBody === 'function') {
+    console.log(
+      'Ticketing portal: message.getPlainBody() was blank for ' + portal.identifyingEmail +
+        "; parsing the HTML body's own text rendering instead."
+    );
+  }
 
   const parseTicketBody = TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL[ticketingExtractEmailAddress(portal.identifyingEmail)];
   if (!parseTicketBody) {
@@ -3497,6 +3999,15 @@ if (typeof module !== 'undefined' && module.exports) {
     ticketInstantToWallClockComponents: ticketInstantToWallClockComponents,
     buildTicketportalCzParsedTicket: buildTicketportalCzParsedTicket,
     processTicketFromIcsAttachment: processTicketFromIcsAttachment,
+    // The seventh portal, smsticket.cz (quick-261026-ma6).
+    parseSmsticketTicketText: parseSmsticketTicketText,
+    smsticketTextHasPurchaseDetails: smsticketTextHasPurchaseDetails,
+    extractSmsticketTicketCodes: extractSmsticketTicketCodes,
+    findSmsticketTicketPdfAttachment: findSmsticketTicketPdfAttachment,
+    // The shared D-02 body-text source (also used by every pre-existing
+    // body-sourced portal's two message.getPlainBody() read sites).
+    ticketingHtmlToPlainText: ticketingHtmlToPlainText,
+    ticketingMessageBodyText: ticketingMessageBodyText,
   };
 }
 

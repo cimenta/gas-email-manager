@@ -113,17 +113,20 @@ function testJobHuntersDryRun() {
  */
 
 /**
- * jobHuntersGetNextRunDescription — GAS-only (quick-261016-nu9 round 3): reads
- * the SAME LAST_RUN_AT_MS property and searchIntervalMinutes setting
- * runJobHuntersCapture's own due-check consults, and describes the next
- * scheduled run via the pure jobHuntersDescribeNextRun. Read-only -- never
+ * jobHuntersGetNextRunInfo — GAS-only (quick-261016-nu9 round 4, replaces
+ * round 3's jobHuntersGetNextRunDescription). Reads the SAME LAST_RUN_AT_MS
+ * property and searchIntervalMinutes setting runJobHuntersCapture's own
+ * due-check consults, and returns the STRUCTURED jobHuntersNextRunInfo --
+ * deliberately NOT a pre-rendered string, so the webapp RPC can hand
+ * `nextRunAtMs` straight to the browser for local-timezone rendering
+ * instead of baking in a server-side (UTC) time string. Read-only -- never
  * touches PropertiesService beyond a single getProperty, never acquires the
  * lock, never searches Gmail. Exported for the Node global-injection
  * harness, same precedent as runJobHuntersCapture itself.
  */
-function jobHuntersGetNextRunDescription() {
+function jobHuntersGetNextRunInfo() {
   const lastRunRaw = PropertiesService.getScriptProperties().getProperty(JOB_HUNTERS_LAST_RUN_AT_MS_PROPERTY_KEY);
-  return jobHuntersDescribeNextRun(lastRunRaw, JOB_HUNTERS_ACTION_CONFIG.searchIntervalMinutes, Date.now());
+  return jobHuntersNextRunInfo(lastRunRaw, JOB_HUNTERS_ACTION_CONFIG.searchIntervalMinutes, Date.now());
 }
 
 function runJobHuntersCapture(force) {
@@ -320,25 +323,54 @@ function jobHuntersIsDue(lastRunAtMs, intervalMinutes, nowMs) {
 }
 
 /**
- * jobHuntersDescribeNextRun — pure (quick-261016-nu9 round 3: "next search
- * time" display in the Job Hunters settings tab). Human-readable string for
- * when the NEXT scheduled run becomes due, built on the exact same
+ * jobHuntersNextRunInfo — pure (quick-261016-nu9 round 4). The STRUCTURED
+ * form behind both jobHuntersDescribeNextRun (below, a UTC-text form kept
+ * for log/console use) and the webapp RPC (which sends `nextRunAtMs` to the
+ * BROWSER to render in the viewer's OWN local timezone -- see round 4's fix
+ * note on jobHuntersDescribeNextRun: a server-rendered time string can only
+ * ever be in ONE fixed zone, never the viewer's). Built on the exact same
  * due-check jobHuntersIsDue already uses, so the two can never disagree.
- * Never throws -- reuses jobHuntersIsDue's own sanitization (a garbage/never
- * -run lastRunAtMs, or a garbage intervalMinutes, both read as "due now").
+ * `nextRunAtMs` is `null` exactly when `hasRunBefore` is false (never run
+ * yet -- there is no previous run to add the interval to). Never throws.
+ */
+function jobHuntersNextRunInfo(lastRunAtMs, intervalMinutes, nowMs) {
+  const last = Number(lastRunAtMs);
+  const hasRunBefore = Number.isFinite(last) && last > 0;
+  const due = jobHuntersIsDue(lastRunAtMs, intervalMinutes, nowMs);
+  const nextRunAtMs = hasRunBefore ? last + Number(intervalMinutes) * 60000 : null;
+
+  return { hasRunBefore: hasRunBefore, due: due, nextRunAtMs: nextRunAtMs };
+}
+
+/**
+ * jobHuntersDescribeNextRun — pure (quick-261016-nu9 round 3: "next search
+ * time" display). Human-readable, UTC-text string for when the NEXT
+ * scheduled run becomes due, built on jobHuntersNextRunInfo above.
+ *
+ * ROUND 4 FIX NOTE: this is NO LONGER what the webapp's Job Hunters tab
+ * displays -- a live-reported issue found that its `toISOString()` (always
+ * UTC) read as "the script's timezone" to the owner, which is misleading:
+ * it is unrelated to appsscript.json's configured timeZone and, more to the
+ * point, is not the OWNER's own timezone either. The webapp RPC
+ * (webappGetJobHuntersNextRun, src/00-webapp.js) now sends the raw
+ * `nextRunAtMs` from jobHuntersNextRunInfo to the browser instead, which
+ * renders it via the viewer's own local Date#toLocaleString(). This
+ * function is kept as a pure, independently tested UTC-text form for any
+ * future server-side log/console use, where UTC is the right and
+ * unambiguous choice. Never throws.
  */
 function jobHuntersDescribeNextRun(lastRunAtMs, intervalMinutes, nowMs) {
-  if (jobHuntersIsDue(lastRunAtMs, intervalMinutes, nowMs)) {
-    const last = Number(lastRunAtMs);
-    return Number.isFinite(last) && last > 0 ? 'Due now.' : 'Never run yet -- due now.';
+  const info = jobHuntersNextRunInfo(lastRunAtMs, intervalMinutes, nowMs);
+
+  if (info.due) {
+    return info.hasRunBefore ? 'Due now.' : 'Never run yet -- due now.';
   }
 
-  const nextRunAtMs = Number(lastRunAtMs) + Number(intervalMinutes) * 60000;
-  const minutesRemaining = Math.max(1, Math.ceil((nextRunAtMs - Number(nowMs)) / 60000));
+  const minutesRemaining = Math.max(1, Math.ceil((info.nextRunAtMs - Number(nowMs)) / 60000));
 
   return (
     'Next due ' +
-    new Date(nextRunAtMs).toISOString() +
+    new Date(info.nextRunAtMs).toISOString() +
     ' (in about ' +
     minutesRemaining +
     (minutesRemaining === 1 ? ' minute).' : ' minutes).')
@@ -792,7 +824,8 @@ if (typeof module !== 'undefined' && module.exports) {
     jobHuntersDescribeRunResult: jobHuntersDescribeRunResult,
     jobHuntersIsSpreadsheetIdConfigured: jobHuntersIsSpreadsheetIdConfigured,
     runJobHuntersCapture: runJobHuntersCapture,
+    jobHuntersNextRunInfo: jobHuntersNextRunInfo,
     jobHuntersDescribeNextRun: jobHuntersDescribeNextRun,
-    jobHuntersGetNextRunDescription: jobHuntersGetNextRunDescription,
+    jobHuntersGetNextRunInfo: jobHuntersGetNextRunInfo,
   };
 }

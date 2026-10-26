@@ -361,11 +361,39 @@
         nextRun.textContent = 'Next scheduled run: loading...';
         wrapper.appendChild(nextRun);
 
+        // quick-261016-nu9 round 4: the server sends raw `nextRunAtMs`
+        // (epoch ms), never a pre-rendered time string -- a live owner
+        // report found the round-3 version's server-built UTC string
+        // reading like a fixed "script timezone" rather than the owner's
+        // own. Date#toLocaleString() with no arguments renders in the
+        // BROWSER's own local timezone, which is what a human reading this
+        // page actually wants.
+        function describeJobHuntersNextRun(result) {
+          if (!result.ok) {
+            return 'FAILED: ' + result.message;
+          }
+          if (!result.hasRunBefore) {
+            return 'Never run yet -- due now.';
+          }
+          if (result.due) {
+            return 'Due now.';
+          }
+
+          var minutesRemaining = Math.max(1, Math.ceil((result.nextRunAtMs - Date.now()) / 60000));
+          return (
+            'Next due ' +
+            new Date(result.nextRunAtMs).toLocaleString() +
+            ' (in about ' +
+            minutesRemaining +
+            (minutesRemaining === 1 ? ' minute).' : ' minutes).')
+          );
+        }
+
         function refreshJobHuntersNextRun() {
           nextRun.textContent = 'Next scheduled run: loading...';
           google.script.run
             .withSuccessHandler(function (result) {
-              nextRun.textContent = 'Next scheduled run: ' + (result.ok ? result.message : 'FAILED: ' + result.message);
+              nextRun.textContent = 'Next scheduled run: ' + describeJobHuntersNextRun(result);
             })
             .withFailureHandler(function (error) {
               nextRun.textContent = 'Next scheduled run: FAILED: ' + error.message;

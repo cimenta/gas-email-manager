@@ -8,7 +8,7 @@ Five actions ship today:
 
 - **ICS-to-Calendar import** — any sender, generic `.ics` calendar attachments
 - **Booking.com reservation management** — booking.com
-- **Ticketing-portal import** — enigoo.cz, Kino Art (kinoart.cz), Ticketmaster CZ (ticketmaster.cz), Entradio (app.entradio.cz), Fever (feverup.com), Ticketportal.cz (ticketportal.cz)
+- **Ticketing-portal import** — enigoo.cz, Kino Art (kinoart.cz), Ticketmaster CZ (ticketmaster.cz), Entradio (app.entradio.cz), Fever (feverup.com), Ticketportal.cz (ticketportal.cz), smsticket (smsticket.cz)
 - **Transport ticket import** — RegioJet (regiojet.cz), IDOS.cz (idos.svt.cz)
 - **Meetings** — body-sourced meeting invites with no `.ics` attachment, matched by sender domain; Teamio (teamio.com) ships first
 
@@ -35,10 +35,11 @@ in addition to processed, so nothing is lost silently.
   confirmation email's sender address), extracts the event name, date/time,
   and venue either from the attached PDF ticket via Google Drive's
   PDF-to-Docs OCR conversion (Apps Script has no native PDF text parser) or
-  straight from the plain-text email body, depending on where that portal
-  actually puts the data. Either way it creates one calendar event per
-  purchase regardless of how many tickets it contains, and can optionally
-  attach the original ticket PDF to the event. See
+  straight from the email body (its plain-text part, or for portals whose
+  plain-text part is empty a plain-text rendering of its HTML), depending
+  on where that portal actually puts the data. Either way it creates one
+  calendar event per purchase regardless of how many tickets it contains,
+  and can optionally attach the original ticket PDF to the event. See
   [Ticketing portals](#ticketing-portals).
 - **Transport ticket import (train/bus)** — for a configured carrier
   (identified by its confirmation email's sender address), builds the
@@ -239,6 +240,7 @@ only the extraction differs.
 | Entradio (app.entradio.cz) | body | the plain-text email body |
 | Fever (feverup.com) | body | the plain-text email body (event name from the subject line) |
 | Ticketportal.cz (ticketportal.cz) | ics | the confirmation's own `.ics` attachment |
+| smsticket (smsticket.cz) | body | the email's HTML body (its plain-text part is empty; event name from the subject line) |
 
 A portal is assigned a mode implicitly, by which parser registry its sender
 address is registered in — there is no `mode` config field here (unlike the
@@ -269,10 +271,11 @@ no native PDF text parser, this mode:
 
 Other portals put everything in the email body itself. This mode reads
 `message.getPlainBody()` and never touches Drive or OCR at all — no temp
-folder, no Doc conversion. If that portal's `insertPdfIntoEvent` is on and it
-has a ticket PDF worth keeping, the PDF is moved straight into your permanent
-Drive folder and attached; there is nothing to clean up otherwise, because
-nothing was ever uploaded.
+folder, no Doc conversion. When that comes back blank, the action renders
+the HTML body to plain text itself and parses that instead. If that
+portal's `insertPdfIntoEvent` is on and it has a ticket PDF worth keeping,
+the PDF is moved straight into your permanent Drive folder and attached;
+there is nothing to clean up otherwise, because nothing was ever uploaded.
 
 Each body-mode portal anchors on literal markers that actually appear in its
 own emails, never on line positions — email-to-plain-text rendering reflows
@@ -289,6 +292,20 @@ Gmail's `getPlainBody()` rendering can leave as the apparent "first line" in
 place of the real text. Fever also sends ordinary marketing mail from the
 same address, so a content detector gates admission on purchase-detail
 markers actually being present, never on sender address alone.
+
+**smsticket.cz** (`info@smsticket.cz`) is worth calling out: its
+confirmation carries a plain-text part that is present but empty, so the
+action reads its own rendering of the HTML body instead. The event name
+comes from the subject line first (a literal-prefix match, never a colon
+split), falling back to the body. The date, time and venue come from the
+body; there is no end time, so the 2-hour default applies. One event
+covers the whole purchase however many seats it contains, and the
+description lists each seat, its price and its entry code. Dedup is keyed
+on the purchase's first entry code. smsticket.cz also sends newsletters
+from the same address, so a content detector admits a message only when it
+carries both an event date and at least one entry code. The single PDF
+holding every ticket of the purchase can be attached when
+`insertPdfIntoEvent` is on (shipped off).
 
 **Entradio** (`no-reply@app.entradio.cz`) is worth calling out: it is a
 white-label platform many venues send through, not a venue itself, so the one
@@ -335,7 +352,8 @@ sender never needs to be added to `ICS_ACTION_CONFIG.excludeFrom` by hand —
 see [Security notes](#security-notes) for why.
 
 **Duplicate protection:** each created event is tagged with a stable
-identifier extracted from the ticket (its ticket or order number) via a
+identifier extracted from the ticket (its ticket or order number — for
+smsticket.cz, the purchase's first entry code) via a
 private `extendedProperties` tag, checked against existing calendar events
 before creating a new one — the same tag-before-create pattern the
 booking.com action already uses, so reprocessing the same email can never

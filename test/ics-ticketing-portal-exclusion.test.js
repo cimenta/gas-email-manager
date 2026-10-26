@@ -246,7 +246,7 @@ test('quick-261005-orv: run() on a ticketportal-ONLY thread throws the existing 
 
 test('quick-261005-orv: EVERY shipped TICKETING_PORTALS entry is structurally excluded -- a one-message thread with the real .ics gives appliesTo false for each (D-07, generality)', () => {
   const shippedPortals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
-  assert.equal(shippedPortals.length, 6);
+  assert.equal(shippedPortals.length, 7);
 
   shippedPortals.forEach(function (portal) {
     const thread = fakeThread([fakeIcsMessage('"Some Sender" <' + portal.identifyingEmail + '>', REAL_TICKETPORTAL_CZ_ICS_TEXT)]);

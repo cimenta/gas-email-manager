@@ -57,6 +57,14 @@ const {
   processTicketFromIcsAttachment,
   TICKET_ICS_MODE_SENDERS,
   DEFAULT_EVENT_DURATION_MINUTES,
+  // quick-261026-ma6: the SEVENTH portal, smsticket.cz, BODY-SOURCED with an
+  // EMPTY text/plain part.
+  parseSmsticketTicketText,
+  smsticketTextHasPurchaseDetails,
+  extractSmsticketTicketCodes,
+  ticketingHtmlToPlainText,
+  ticketingMessageBodyText,
+  findSmsticketTicketPdfAttachment,
 } = require('../src/07-action-ticketing-portals.js');
 
 // Separately required so tests derive the real event objects from the real
@@ -1465,11 +1473,11 @@ test('TICKETING_PORTALS_ACTION_CONFIG: the shipped default seeds a THIRD entry f
   assert.equal(resolveTicketingCalendarId(thirdPortal, 'DEFAULT_CAL'), 'DEFAULT_CAL');
 });
 
-test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are still the unchanged enigoo.cz and Kino Art entries, array length is 6 (updated quick-261005-orv)', () => {
+test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are still the unchanged enigoo.cz and Kino Art entries, array length is 7 (updated quick-261026-ma6)', () => {
   const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
   const portals = TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals;
 
-  assert.equal(portals.length, 6);
+  assert.equal(portals.length, 7);
   assert.deepEqual(portals[0], { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[1], { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false });
 });
@@ -1839,10 +1847,10 @@ test('TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL: noreply@ticketmaster.c
   assert.strictEqual(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL['noreply@ticketmaster.cz'], ticketmasterCzTextHasOrderDetails);
 });
 
-test('TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL: has NO entry for Kino Art or Entradio -- the fix is scoped to Ticketmaster CZ (and, since quick-260921-gj0, Fever) only, the Kino Art/Entradio variants are unverified', () => {
+test('TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL: has NO entry for Kino Art or Entradio -- the fix is scoped to Ticketmaster CZ (and, since quick-260921-gj0, Fever) only, the Kino Art/Entradio variants are unverified, and, since quick-261026-ma6, smsticket.cz', () => {
   assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL, 'rezervace@kinoart.cz'), false);
   assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL, 'no-reply@app.entradio.cz'), false);
-  assert.deepEqual(Object.keys(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL), ['noreply@ticketmaster.cz', 'hello@feverup.com']);
+  assert.deepEqual(Object.keys(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL), ['noreply@ticketmaster.cz', 'hello@feverup.com', 'info@smsticket.cz']);
 });
 
 test('FAIL-OPEN on a missing detector: a Kino Art message with an EMPTY body still yields exactly one "body"-mode job -- unchanged from before the fix', () => {
@@ -4258,9 +4266,9 @@ test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: the shipped default fift
   assert.equal(resolveTicketingCalendarId(portals[4], 'GLOBAL_DEFAULT_CAL'), 'GLOBAL_DEFAULT_CAL');
 });
 
-test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: regression guard -- entries 0-3 (enigoo.cz, Kino Art, Ticketmaster CZ, Entradio) are unchanged and the array length is 6 (updated quick-261005-orv)', () => {
+test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: regression guard -- entries 0-3 (enigoo.cz, Kino Art, Ticketmaster CZ, Entradio) are unchanged and the array length is 7 (updated quick-261026-ma6)', () => {
   const portals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
-  assert.equal(portals.length, 6);
+  assert.equal(portals.length, 7);
   assert.deepEqual(portals[0], { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[1], { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[2], { identifyingEmail: 'noreply@ticketmaster.cz', calendarId: null, insertPdfIntoEvent: false });
@@ -4943,4 +4951,699 @@ test('quick-261005-orv: TICKETING_PORTALS_ACTION.config.ticketingPortals[5] is t
   const portals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
   assert.deepEqual(portals[5], { identifyingEmail: 'vstupenky@ticketportal.cz', calendarId: null, insertPdfIntoEvent: true });
   assert.equal(resolveTicketingCalendarId(portals[5], 'GLOBAL_DEFAULT_CAL'), 'GLOBAL_DEFAULT_CAL');
+});
+
+// =============================================================================
+// quick-261026-ma6: smsticket.cz, the SEVENTH portal, BODY-SOURCED with an
+// EMPTY text/plain part
+// =============================================================================
+//
+// MIME FACTS (decoded by the planner from the real sample .eml):
+//   multipart/mixed
+//     multipart/alternative
+//       text/plain; charset=utf-8, base64, 0 BYTES (EMPTY)
+//       text/html; charset=utf-8, base64, 26803 bytes
+//     multipart/mixed
+//       application/pdf -- name arrives ONLY via the RFC 2047-encoded
+//       Content-Type `name=` parameter (bare `attachment` Content-Disposition,
+//       no filename there). Decodes to
+//       "smsticket - Rybova mše vánoční a Vánoce Karla Svobody .pdf" (note
+//       the space before .pdf). ONE PDF holds BOTH tickets of the purchase.
+//   No .ics attachment anywhere -- this portal is BODY-SOURCED.
+//   From: "smsticket" <info@smsticket.cz>. DKIM/SPF/DMARC pass, p=QUARANTINE.
+//   Subject (decoded): "smsticket: Tickets purchase Rybova mše vánoční a
+//   Vánoce Karla Svobody" (no trailing space).
+//
+// Because the real text/plain part is EMPTY, message.getPlainBody() hands
+// the parser nothing -- this is what forces the generic D-02 HTML fallback
+// (ticketingMessageBodyText/ticketingHtmlToPlainText) rather than a
+// smsticket-specific workaround.
+//
+// FIXTURE PROVENANCE (D-13): SMSTICKET_FIXTURE_HTML below is a real-structure
+// excerpt of the decoded HTML body -- markup, inline-style quirks, entities
+// and whitespace (including trailing spaces before <br />/</p>) are real.
+// Spacer rows are trimmed to one representative &nbsp; row. The two real
+// entry codes, the two real Apple Wallet pass GUIDs, the real email-preview
+// URL's GUID and the two real QR-code digit strings are LIVE BEARER
+// CREDENTIALS for an event on 6.12.2026 (whoever first shows a valid code
+// gets in) -- push-public.bat copies test/*.test.js into the PUBLIC repo, so
+// per this suite's existing FIXTURE PROVENANCE rule (see this file's
+// Ticketportal.cz section) those values are substituted with shape-identical
+// FICTIONAL values: entry codes 123-456-7 and 765-432-1; GUIDs
+// 00000000-0000-0000-0000-000000000000/...0001/...0002; QR digits
+// 1234567/7654321. Every other value (event name, venue, seat labels,
+// prices) is real.
+
+const SMSTICKET_FIXTURE_HTML = `<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" style="width:100%;">
+<head>
+    <meta http-equiv="Content-type" content="text/html;charset=UTF-8" />
+    <title>smsticket: Tickets purchase Rybova mše v&#225;nočn&#237; a V&#225;noce Karla Svobody </title>
+    <style type="text/css">
+        p a {
+            color: #009deb;
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body yahoo="fix" leftmargin="0" topmargin="0" marginwidth="0" marginheight="0">
+    <table width="100%" align="center" border="0" cellpadding="0" cellspacing="0">
+        <tr>
+            <td align="center" style="padding-left: 39px; padding-right: 39px;">
+                <p style="line-height: 14px; color: #b2b2b2; font-size:10px">
+                    Email does not display correctly? Click <a href="https://www.smsticket.cz/email/nahled/00000000-0000-0000-0000-000000000000">HERE</a>
+                </p>
+            </td>
+        </tr>
+        <tr>
+            <td height="8" width="600" style="font-size:8px; line-height:8px;">&nbsp;</td>
+        </tr>
+        <tr>
+            <td height="24" bgcolor="000000" width="600" align="left">
+                <a href="https://www.smsticket.cz/">
+                    <img src="http://www.smsticket.cz/Static/Images/emails/logo.gif" alt="smsticket" style="display:block;" />
+                </a>
+            </td>
+        </tr>
+        <tr>
+            <td align="center" width="600" bgcolor="330F00" valign="top" style="line-height: 22px;">
+                <img src="http://www.smsticket.cz/cdn/events/2026/69688/710-174b82090a944632901106440904334a.png" alt="Rybova mše v&#225;nočn&#237; a V&#225;noce Karla Svobody " />
+            </td>
+        </tr>
+        <tr>
+            <td align="left" width="600" bgcolor="330F00" style="padding-left: 39px; padding-right: 39px;">
+                <p style="line-height: 36px; color: #ffffff; font-size:24px; font-weight: bold;">
+                    Rybova mše v&#225;nočn&#237; a V&#225;noce Karla Svobody
+                </p>
+                <p style="line-height: 30px; color: #ffffff; font-size:18px;">
+Sunday 6.12.2026 at 17:00                                                <br />
+                    KD Rub&#237;n, Brno
+                </p>
+                <p style="line-height: 24px; color: #ffffff; font-size:15px;">
+                    <a href="https://www.smsticket.cz/vstupenky/69688-rybova-mse-vanocni-a-vanoce-karla-svobody-kd-rubin-brno-moravske-klavirni-trio" style="color: #724E3F; text-decoration: underline;">Event detail</a>
+                </p>
+            </td>
+        </tr>
+        <tr>
+            <td align="left" width="600" bgcolor="ffffff" style="font-size: 15px; padding-left: 39px; padding-right: 39px">
+                <p style="line-height: 24px; color: #666666;">
+                    Hello,<br><br>
+Thank you for your purchase. <br>We're sending you a code to show when entering the event. If you want to print your tickets we have included them as a PDF attachment. <br>Have a great time!
+                </p>
+            </td>
+        </tr>
+        <tr>
+            <td align="center" bgcolor="ffffff">
+                <p style="line-height: 24px; font-size: 21px; color: #010101;">
+                    <strong>Sezen&#237;, řada 19, m&#237;sto 8 / Z&#225;kladn&#237; cena</strong>
+                </p>
+            </td>
+        </tr>
+        <tr>
+            <td align="center" width="600" bgcolor="ffffff">
+                <p style="line-height: 24px; font-size: 18px; color: #666666;">
+590 Kč                                                </p>
+            </td>
+        </tr>
+        <tr>
+            <td align="center" width="600" bgcolor="ffffff">
+                <table border="0" width="88" bgcolor="ebebeb" align="center" cellpadding="0" cellspacing="0">
+                    <tbody>
+                        <tr>
+                            <td align="center" width="88" bgcolor="ebebeb">
+                                <p style="color: #010101; font-size: 15px;">
+                                    <b>123-456-7</b>
+                                </p>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </td>
+        </tr>
+        <tr>
+            <td align="center" class="left" bgcolor="ffffff">
+                <p style="line-height: 24px; font-size: 13px;">
+                    <a href="https://www.smsticket.cz/nakupy/vstupenky/00000000-0000-0000-0000-000000000001/apple-pass">Add to Apple Wallet</a>
+                </p>
+            </td>
+        </tr>
+        <tr>
+            <td align="center" bgcolor="ffffff">
+                <img src="http://www.smsticket.cz/api/widgets/qr/180/180/1234567" alt="123-456-7" />
+            </td>
+        </tr>
+        <tr>
+            <td align="center" bgcolor="ffffff">
+                <p style="line-height: 24px; font-size: 21px; color: #010101;">
+                    <strong>Sezen&#237;, řada 19, m&#237;sto 7 / Z&#225;kladn&#237; cena</strong>
+                </p>
+            </td>
+        </tr>
+        <tr>
+            <td align="center" width="600" bgcolor="ffffff">
+                <p style="line-height: 24px; font-size: 18px; color: #666666;">
+590 Kč                                                </p>
+            </td>
+        </tr>
+        <tr>
+            <td align="center" width="600" bgcolor="ffffff">
+                <table border="0" width="88" bgcolor="ebebeb" align="center" cellpadding="0" cellspacing="0">
+                    <tbody>
+                        <tr>
+                            <td align="center" width="88" bgcolor="ebebeb">
+                                <p style="color: #010101; font-size: 15px;">
+                                    <b>765-432-1</b>
+                                </p>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </td>
+        </tr>
+        <tr>
+            <td align="center" class="left" bgcolor="ffffff">
+                <p style="line-height: 24px; font-size: 13px;">
+                    <a href="https://www.smsticket.cz/nakupy/vstupenky/00000000-0000-0000-0000-000000000002/apple-pass">Add to Apple Wallet</a>
+                </p>
+            </td>
+        </tr>
+        <tr>
+            <td align="center" bgcolor="ffffff">
+                <img src="http://www.smsticket.cz/api/widgets/qr/180/180/7654321" alt="765-432-1" />
+            </td>
+        </tr>
+        <tr>
+            <td bgcolor="ffffff" width="600" style="padding-left: 39px; padding-right: 39px;">
+                <p style="line-height: 24px; color: #666666;">
+                    Your tickets are stored <a href="https://www.smsticket.cz/muj">on your account.</a>
+                </p>
+            </td>
+        </tr>
+        <tr>
+            <td align="center" width="600" bgcolor="ffffff" style="font-size: 15px; padding-left: 39px; padding-right: 39px">
+                <p style="line-height: 24px; color: #666666;">Follow us and get info on interesting events or play the Wheel of Fortune for free tickets every week! </p>
+            </td>
+        </tr>
+        <tr>
+            <td align="center" width="600" bgcolor="ffffff" style="padding-left: 39px; padding-right: 39px; font-size: 10px">
+                <p style="line-height: 15px; color: #b2b2b2;">
+                    You have received this email because you purchased a ticket(s) with smsticket.cz
+                </p>
+                <p style="line-height: 15px; color: #b2b2b2;">
+                    email: <a href="mailto:info@smsticket.cz" style="color: #009deb;">info@smsticket.cz</a>
+                </p>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>`;
+
+// SMSTICKET_EXPECTED_HELPER_LINES -- EXACTLY
+// ticketingHtmlToPlainText(SMSTICKET_FIXTURE_HTML).split('\n'), verified by
+// the planner against a Node prototype of the exact algorithm Task 1
+// implements. The full real 26 KB body produces the same lines, with the
+// real codes, plus four extra footer lines.
+const SMSTICKET_EXPECTED_HELPER_LINES = [
+  'Email does not display correctly? Click HERE',
+  'Rybova mše vánoční a Vánoce Karla Svobody',
+  'Sunday 6.12.2026 at 17:00',
+  'KD Rubín, Brno',
+  'Event detail',
+  'Hello,',
+  'Thank you for your purchase.',
+  "We're sending you a code to show when entering the event. If you want to print your tickets we have included them as a PDF attachment.",
+  'Have a great time!',
+  'Sezení, řada 19, místo 8 / Základní cena',
+  '590 Kč',
+  '123-456-7',
+  'Add to Apple Wallet',
+  'Sezení, řada 19, místo 7 / Základní cena',
+  '590 Kč',
+  '765-432-1',
+  'Add to Apple Wallet',
+  'Your tickets are stored on your account.',
+  'Follow us and get info on interesting events or play the Wheel of Fortune for free tickets every week!',
+  'You have received this email because you purchased a ticket(s) with smsticket.cz',
+  'email: info@smsticket.cz',
+];
+
+const SMSTICKET_FIXTURE_FROM = '"smsticket" <info@smsticket.cz>';
+const SMSTICKET_FIXTURE_SUBJECT = 'smsticket: Tickets purchase Rybova mše vánoční a Vánoce Karla Svobody';
+// The real filename arrives only via the RFC 2047-encoded Content-Type
+// `name=` parameter; note the real space before ".pdf".
+const SMSTICKET_FIXTURE_PDF_NAME = 'smsticket - Rybova mše vánoční a Vánoce Karla Svobody .pdf';
+const SMSTICKET_FIXTURE_RECEIVED_DATE = new Date(2026, 9, 26, 15, 9, 57);
+
+// EXPECTED_SMSTICKET_DESCRIPTION -- the four paragraphs
+// (eventName, location, dateTimeText, ticketLines) joined by '\n\n'; the
+// ticket-lines paragraph itself joins its two per-seat lines with a single
+// '\n' (D-08).
+const EXPECTED_SMSTICKET_DESCRIPTION = [
+  'Rybova mše vánoční a Vánoce Karla Svobody',
+  'KD Rubín, Brno',
+  '6.12.2026 at 17:00',
+  'Sezení, řada 19, místo 8 / Základní cena | 590 Kč | 123-456-7\nSezení, řada 19, místo 7 / Základní cena | 590 Kč | 765-432-1',
+].join('\n\n');
+
+// smsticketRealShapedMessage -- the real-shaped smsticket.cz confirmation:
+// EMPTY text/plain (the real structural fact that forces the D-02 HTML
+// fallback), real-structure HTML body, real subject/from, and one real-named
+// PDF attachment exposing copyBlob (needed by processTicketFromMessageBody's
+// insertPdfIntoEvent path). `overrides` may replace plainBody, htmlBody,
+// subject or attachments, for the hardening tests in the sibling Task 2
+// section below.
+function smsticketRealShapedMessage(overrides) {
+  const opts = overrides || {};
+  const attachments = Object.prototype.hasOwnProperty.call(opts, 'attachments')
+    ? opts.attachments
+    : [
+        Object.assign(fakeAttachment(SMSTICKET_FIXTURE_PDF_NAME, 'application/pdf'), {
+          copyBlob: function () {
+            return entradioFakeBlob('application/pdf');
+          },
+        }),
+      ];
+
+  return {
+    getFrom: function () {
+      return SMSTICKET_FIXTURE_FROM;
+    },
+    getPlainBody: function () {
+      return Object.prototype.hasOwnProperty.call(opts, 'plainBody') ? opts.plainBody : '';
+    },
+    getBody: function () {
+      return Object.prototype.hasOwnProperty.call(opts, 'htmlBody') ? opts.htmlBody : SMSTICKET_FIXTURE_HTML;
+    },
+    getSubject: function () {
+      return Object.prototype.hasOwnProperty.call(opts, 'subject') ? opts.subject : SMSTICKET_FIXTURE_SUBJECT;
+    },
+    getDate: function () {
+      return SMSTICKET_FIXTURE_RECEIVED_DATE;
+    },
+    getAttachments: function () {
+      return attachments;
+    },
+  };
+}
+
+function smsticketOneMessageThread(message) {
+  return {
+    getMessages: function () {
+      return [message];
+    },
+  };
+}
+
+// --- THE TRACER: appliesTo + run, end to end --------------------------------
+
+test('quick-261026-ma6: TICKETING_PORTALS_ACTION.appliesTo is true for a real-shaped smsticket.cz confirmation with an EMPTY text/plain part (D-01, D-02, D-09)', () => {
+  const thread = smsticketOneMessageThread(smsticketRealShapedMessage());
+  assert.equal(TICKETING_PORTALS_ACTION.appliesTo(thread), true);
+});
+
+test('quick-261026-ma6: TICKETING_PORTALS_ACTION.run on the real-shaped smsticket.cz thread gives exactly ONE insert with the full expected resource, tagged by the first entry code, with NO attachments key and ZERO outbound fetches (D-01, D-02, D-04, D-05, D-06, D-07, D-08, D-11)', () => {
+  withTicketBodyRunGlobals({}, function (calls) {
+    const listCalls = [];
+    const originalList = global.Calendar.Events.list;
+    global.Calendar.Events.list = function (calendarId, options) {
+      listCalls.push({ calendarId: calendarId, options: options });
+      return originalList(calendarId, options);
+    };
+
+    const thread = smsticketOneMessageThread(smsticketRealShapedMessage());
+    TICKETING_PORTALS_ACTION.run(thread);
+
+    assert.equal(calls.inserted.length, 1);
+    const insertCall = calls.inserted[0];
+    assert.equal(insertCall.calendarId, 'DEFAULT_CAL');
+    assert.deepEqual(insertCall.resource, {
+      summary: 'Rybova mše vánoční a Vánoce Karla Svobody',
+      location: 'KD Rubín, Brno',
+      start: { dateTime: '2026-12-06T17:00:00', timeZone: 'Europe/Prague' },
+      end: { dateTime: '2026-12-06T19:00:00', timeZone: 'Europe/Prague' },
+      description: EXPECTED_SMSTICKET_DESCRIPTION,
+      extendedProperties: { private: { ticketIdentifier: '123-456-7' } },
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(insertCall.resource, 'attachments'), false);
+    assert.equal(calls.fetched.length, 0);
+
+    assert.equal(listCalls.length, 1);
+    assert.equal(listCalls[0].options.privateExtendedProperty, 'ticketIdentifier=123-456-7');
+  });
+});
+
+// --- ticketingHtmlToPlainText / parseSmsticketTicketText --------------------
+
+test('quick-261026-ma6: ticketingHtmlToPlainText renders the real-structure smsticket.cz HTML into the exact expected plain-text lines, and never throws on null/undefined/empty input (D-02)', () => {
+  assert.deepEqual(ticketingHtmlToPlainText(SMSTICKET_FIXTURE_HTML).split('\n'), SMSTICKET_EXPECTED_HELPER_LINES);
+  assert.equal(ticketingHtmlToPlainText(null), '');
+  assert.equal(ticketingHtmlToPlainText(undefined), '');
+  assert.equal(ticketingHtmlToPlainText(''), '');
+});
+
+test('quick-261026-ma6: parseSmsticketTicketText on the HTML-derived text yields the exact expected shape, in one assertion (D-03 through D-08)', () => {
+  const text = ticketingHtmlToPlainText(SMSTICKET_FIXTURE_HTML);
+  const parsed = parseSmsticketTicketText(text, SMSTICKET_FIXTURE_RECEIVED_DATE, SMSTICKET_FIXTURE_SUBJECT);
+
+  assert.deepEqual(parsed, {
+    eventName: 'Rybova mše vánoční a Vánoce Karla Svobody',
+    location: 'KD Rubín, Brno',
+    year: 2026,
+    month: 11,
+    day: 6,
+    hour: 17,
+    minute: 0,
+    ticketIdentifier: '123-456-7',
+    description: EXPECTED_SMSTICKET_DESCRIPTION,
+  });
+});
+
+// --- ticketingMessageBodyText -------------------------------------------------
+
+test('quick-261026-ma6: ticketingMessageBodyText returns a non-blank plain body verbatim, and getBody is NEVER called (D-02)', () => {
+  const message = {
+    getPlainBody: function () {
+      return 'real plain text';
+    },
+    getBody: function () {
+      throw new Error('getBody must not be called when the plain body is non-blank');
+    },
+  };
+  assert.equal(ticketingMessageBodyText(message), 'real plain text');
+});
+
+test('quick-261026-ma6: ticketingMessageBodyText falls back to the HTML rendering when the plain body is blank -- empty string, whitespace/CRLF-only, and null all qualify (D-02)', () => {
+  ['', '   \r\n\r\n   ', null].forEach(function (blankPlainBody) {
+    const message = {
+      getPlainBody: function () {
+        return blankPlainBody;
+      },
+      getBody: function () {
+        return '<p>Rendered</p>';
+      },
+    };
+    assert.equal(ticketingMessageBodyText(message), 'Rendered');
+  });
+});
+
+test('quick-261026-ma6: ticketingMessageBodyText returns an empty string for a blank plain body on a message with no getBody at all (D-02)', () => {
+  const message = {
+    getPlainBody: function () {
+      return '';
+    },
+  };
+  assert.equal(ticketingMessageBodyText(message), '');
+});
+
+// --- Registry wiring / absence proofs ---------------------------------------
+
+test('quick-261026-ma6: info@smsticket.cz is wired to the exported body parser and content detector (D-01, D-09)', () => {
+  assert.equal(typeof parseSmsticketTicketText, 'function');
+  assert.equal(typeof smsticketTextHasPurchaseDetails, 'function');
+  assert.strictEqual(TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL['info@smsticket.cz'], parseSmsticketTicketText);
+  assert.strictEqual(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL['info@smsticket.cz'], smsticketTextHasPurchaseDetails);
+});
+
+test('quick-261026-ma6: ABSENCE PROOF -- info@smsticket.cz is registered in NEITHER the OCR text-parser registry NOR the attachment-fetcher registry, and is NOT an ICS-mode sender (D-01)', () => {
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL, 'info@smsticket.cz'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL, 'info@smsticket.cz'), false);
+  assert.equal(TICKET_ICS_MODE_SENDERS.indexOf('info@smsticket.cz'), -1);
+});
+
+// --- Config -------------------------------------------------------------------
+
+test('quick-261026-ma6: TICKETING_PORTALS_ACTION.config.ticketingPortals[6] is the shipped smsticket.cz entry, and resolveTicketingCalendarId on it returns the passed default (D-11, D-12)', () => {
+  const portals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
+  assert.deepEqual(portals[6], { identifyingEmail: 'info@smsticket.cz', calendarId: null, insertPdfIntoEvent: false });
+  assert.equal(resolveTicketingCalendarId(portals[6], 'GLOBAL_DEFAULT_CAL'), 'GLOBAL_DEFAULT_CAL');
+});
+
+// =============================================================================
+// quick-261026-ma6, Task 2 (expansion): the ticket-PDF finder, and hardening
+// against Gmail's own plain-text rendering, missing fields, graceful
+// degradation and marketing mail
+// =============================================================================
+
+// SMSTICKET_FIXTURE_GMAIL_RENDERING_LINES -- a SIMULATION, not an
+// observation: Gmail's own getPlainBody() rendering of this HTML cannot be
+// observed from the .eml (the same lesson quick-260921-gj0/Fever learned).
+// This simulation applies two conventions already evidenced elsewhere in
+// this codebase: `[image: alt]` placeholder lines (observed live for Fever,
+// D-18 of quick-260921-gj0) and `*bold*` wrapping (Entradio's own plain-text
+// bold convention, ENTRADIO_BOLD_VALUE_PATTERN). Joined with '\r\n' by the
+// test below.
+const SMSTICKET_FIXTURE_GMAIL_RENDERING_LINES = [
+  'Email does not display correctly? Click HERE <https://www.smsticket.cz/email/nahled/00000000-0000-0000-0000-000000000000>',
+  '[image: smsticket] <https://www.smsticket.cz/>',
+  '[image: Rybova mše vánoční a Vánoce Karla Svobody ]',
+  'Rybova mše vánoční a Vánoce Karla Svobody',
+  'Sunday 6.12.2026 at 17:00',
+  'KD Rubín, Brno',
+  'Event detail <https://www.smsticket.cz/vstupenky/69688-rybova-mse-vanocni-a-vanoce-karla-svobody-kd-rubin-brno-moravske-klavirni-trio>',
+  '',
+  'Hello,',
+  '',
+  'Thank you for your purchase.',
+  "We're sending you a code to show when entering the event. If you want to print your tickets we have included them as a PDF attachment.",
+  'Have a great time!',
+  '*Sezení, řada 19, místo 8 / Základní cena*',
+  '590 Kč',
+  '*123-456-7*',
+  'Add to Apple Wallet <https://www.smsticket.cz/nakupy/vstupenky/00000000-0000-0000-0000-000000000001/apple-pass>',
+  '[image: 123-456-7]',
+  '*Sezení, řada 19, místo 7 / Základní cena*',
+  '590 Kč',
+  '*765-432-1*',
+  'Add to Apple Wallet <https://www.smsticket.cz/nakupy/vstupenky/00000000-0000-0000-0000-000000000002/apple-pass>',
+  '[image: 765-432-1]',
+  'Your tickets are stored on your account. <https://www.smsticket.cz/muj>',
+];
+
+// SMSTICKET_FIXTURE_MARKETING_HTML -- a fictional newsletter carrying an
+// event date in the portal's own format but NO entry code, used to prove
+// the content detector rejects routine marketing mail (D-09).
+const SMSTICKET_FIXTURE_MARKETING_HTML =
+  '<html><body><p>Nenechte si ujít: Vánoční koncert</p><p>Neděle 13.12.2026 v 19:00<br />KD Rubín, Brno</p><p>Vstupenky od 390 Kč na www.smsticket.cz</p></body></html>';
+
+const SMSTICKET_PORTAL_PDF_ON = {
+  identifyingEmail: 'info@smsticket.cz',
+  calendarId: 'SMS_CAL',
+  insertPdfIntoEvent: true,
+};
+
+// --- findSmsticketTicketPdfAttachment ---------------------------------------
+
+test('quick-261026-ma6: findSmsticketTicketPdfAttachment returns the named PDF by identity, null for an unrelated PDF, and null for a non-PDF attachment that happens to share the name substring (D-10)', () => {
+  const smsticketPdf = fakeAttachment(SMSTICKET_FIXTURE_PDF_NAME, 'application/pdf');
+  const termsPdf = fakeAttachment('terms.pdf', 'application/pdf');
+  const message = fakeMessage(SMSTICKET_FIXTURE_FROM, [termsPdf, smsticketPdf]);
+  assert.equal(findSmsticketTicketPdfAttachment(message), smsticketPdf);
+
+  const noMatchMessage = fakeMessage(SMSTICKET_FIXTURE_FROM, [termsPdf]);
+  assert.equal(findSmsticketTicketPdfAttachment(noMatchMessage), null);
+
+  // 'smsticket - x.txt' is text/plain and does not end in .pdf, so it is not
+  // even a qualifying PDF attachment (findTicketPdfAttachments excludes it
+  // before this finder's own name check ever runs).
+  const nonPdfMessage = fakeMessage(SMSTICKET_FIXTURE_FROM, [fakeAttachment('smsticket - x.txt', 'text/plain')]);
+  assert.equal(findSmsticketTicketPdfAttachment(nonPdfMessage), null);
+});
+
+test('quick-261026-ma6: findSmsticketTicketPdfAttachment is registered strictly in TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL (D-10)', () => {
+  assert.strictEqual(TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL['info@smsticket.cz'], findSmsticketTicketPdfAttachment);
+});
+
+// --- processTicketFromMessageBody with insertPdfIntoEvent true --------------
+
+test('quick-261026-ma6: processTicketFromMessageBody with insertPdfIntoEvent true attaches the real smsticket ticket PDF, renamed by the shared convention, with zero fetches and zero notifications (D-10)', () => {
+  withTicketBodyRunGlobals({}, function (calls) {
+    processTicketFromMessageBody(smsticketRealShapedMessage(), SMSTICKET_PORTAL_PDF_ON);
+
+    assert.equal(calls.inserted.length, 1);
+    const insertCall = calls.inserted[0];
+    assert.equal(insertCall.calendarId, 'SMS_CAL');
+    assert.equal(insertCall.resource.attachments.length, 1);
+    assert.equal(insertCall.resource.attachments[0].mimeType, 'application/pdf');
+    assert.equal(insertCall.resource.attachments[0].title, 'Rybova mše vánoční a Vánoce Karla Svobody - 2026-12-06 - 123-456-7.pdf');
+    assert.equal(insertCall.optionalArgs.supportsAttachments, true);
+    assert.equal(calls.fetched.length, 0);
+    assert.equal(calls.notified.length, 0);
+  });
+});
+
+// --- DEDUP -------------------------------------------------------------------
+
+test('quick-261026-ma6: TICKETING_PORTALS_ACTION.run -- when the spy list returns an existing tagged event, there are 0 inserts (D-07 dedup)', () => {
+  withTicketBodyRunGlobals({}, function (calls) {
+    global.Calendar.Events.list = function () {
+      return { items: [{ id: 'existing-event' }] };
+    };
+
+    const thread = smsticketOneMessageThread(smsticketRealShapedMessage());
+    TICKETING_PORTALS_ACTION.run(thread);
+
+    assert.equal(calls.inserted.length, 0);
+  });
+});
+
+// --- THE LINE-LAYOUT PROOF ---------------------------------------------------
+
+test('quick-261026-ma6: parseSmsticketTicketText on the Gmail-rendering SIMULATION yields the SAME fields as the HTML-derived text, and a venue sharing the date line still resolves the correct location (D-03, D-06)', () => {
+  const gmailText = SMSTICKET_FIXTURE_GMAIL_RENDERING_LINES.join('\r\n');
+  const parsedGmail = parseSmsticketTicketText(gmailText, SMSTICKET_FIXTURE_RECEIVED_DATE, undefined);
+
+  assert.deepEqual(parsedGmail, {
+    eventName: 'Rybova mše vánoční a Vánoce Karla Svobody',
+    location: 'KD Rubín, Brno',
+    year: 2026,
+    month: 11,
+    day: 6,
+    hour: 17,
+    minute: 0,
+    ticketIdentifier: '123-456-7',
+    description: EXPECTED_SMSTICKET_DESCRIPTION,
+  });
+
+  const text = ticketingHtmlToPlainText(SMSTICKET_FIXTURE_HTML);
+  const variantText = text.replace('Sunday 6.12.2026 at 17:00\nKD Rubín, Brno', 'Sunday 6.12.2026 at 17:00 KD Rubín, Brno');
+  const parsedVariant = parseSmsticketTicketText(variantText, SMSTICKET_FIXTURE_RECEIVED_DATE, SMSTICKET_FIXTURE_SUBJECT);
+  assert.equal(parsedVariant.location, 'KD Rubín, Brno');
+});
+
+// --- Subject handling ---------------------------------------------------------
+
+test('quick-261026-ma6: a subject with a different event name containing an internal colon wins verbatim, colon included (D-04)', () => {
+  const text = ticketingHtmlToPlainText(SMSTICKET_FIXTURE_HTML);
+  const parsed = parseSmsticketTicketText(text, SMSTICKET_FIXTURE_RECEIVED_DATE, 'smsticket: Tickets purchase Event: With Colon');
+  assert.equal(parsed.eventName, 'Event: With Colon');
+});
+
+test('quick-261026-ma6: event-name fallback to the body holds for subject undefined, null, a non-string (42), empty, a prefix-less marketing subject, and the bare prefix (D-04)', () => {
+  const text = ticketingHtmlToPlainText(SMSTICKET_FIXTURE_HTML);
+
+  [undefined, null, 42, '', 'marketing subject with no prefix at all', 'smsticket: Tickets purchase '].forEach(function (subject) {
+    const parsed = parseSmsticketTicketText(text, SMSTICKET_FIXTURE_RECEIVED_DATE, subject);
+    assert.equal(parsed.eventName, 'Rybova mše vánoční a Vánoce Karla Svobody');
+  });
+});
+
+// --- Throws, each with its specific phrase AND the full raw text -----------
+
+test('quick-261026-ma6: parseSmsticketTicketText throws a specific, diagnosable message for each malformed input, always ending with the full raw text (D-05)', () => {
+  function assertThrowsExactMessage(rawText, expectedMessage) {
+    assert.throws(
+      function () {
+        parseSmsticketTicketText(rawText, null, undefined);
+      },
+      function (err) {
+        assert.equal(err.message, expectedMessage);
+        return true;
+      }
+    );
+  }
+
+  assertThrowsExactMessage(
+    'nothing recognizable here',
+    'Unrecognized smsticket.cz ticket text: no date/time found. Full extracted text:\nnothing recognizable here'
+  );
+  assertThrowsExactMessage(
+    '6.12.2026 at 17:00\nVenue',
+    'Unrecognized smsticket.cz ticket text: no event name found. Full extracted text:\n6.12.2026 at 17:00\nVenue'
+  );
+  assertThrowsExactMessage(
+    'Event\n6.12.2026 at 17:00',
+    'Unrecognized smsticket.cz ticket text: no location found. Full extracted text:\nEvent\n6.12.2026 at 17:00'
+  );
+  assertThrowsExactMessage(
+    'Event\n6.13.2026 at 17:00\nVenue',
+    'Month out of range (13) in smsticket.cz ticket date/time match. Full extracted text:\nEvent\n6.13.2026 at 17:00\nVenue'
+  );
+  assertThrowsExactMessage(
+    'Event\n32.12.2026 at 17:00\nVenue',
+    'Day out of range (32) in smsticket.cz ticket date/time match. Full extracted text:\nEvent\n32.12.2026 at 17:00\nVenue'
+  );
+  assertThrowsExactMessage(
+    'Event\n6.12.2026 at 24:00\nVenue',
+    'Hour out of range (24) in smsticket.cz ticket date/time match. Full extracted text:\nEvent\n6.12.2026 at 24:00\nVenue'
+  );
+  assertThrowsExactMessage(
+    'Event\n6.12.2026 at 17:60\nVenue',
+    'Minute out of range (60) in smsticket.cz ticket date/time match. Full extracted text:\nEvent\n6.12.2026 at 17:60\nVenue'
+  );
+});
+
+// --- Graceful degradation ------------------------------------------------------
+
+test('quick-261026-ma6: graceful degradation -- no codes at all still parses with ticketIdentifier null and a 3-paragraph description; a code sharing its line with its price still becomes the ticketIdentifier, enriched as the bare code (D-07, D-08)', () => {
+  const text = ticketingHtmlToPlainText(SMSTICKET_FIXTURE_HTML);
+
+  const noCodesText = text
+    .split('\n')
+    .filter(function (line) {
+      return !/^\d{3}-\d{3}-\d$/.test(line);
+    })
+    .join('\n');
+  const parsedNoCodes = parseSmsticketTicketText(noCodesText, SMSTICKET_FIXTURE_RECEIVED_DATE, SMSTICKET_FIXTURE_SUBJECT);
+  assert.equal(parsedNoCodes.ticketIdentifier, null);
+  assert.equal(parsedNoCodes.description.split('\n\n').length, 3);
+
+  const sharedLineText = text.replace('590 Kč\n123-456-7', '590 Kč 123-456-7');
+  const parsedShared = parseSmsticketTicketText(sharedLineText, SMSTICKET_FIXTURE_RECEIVED_DATE, SMSTICKET_FIXTURE_SUBJECT);
+  assert.equal(parsedShared.ticketIdentifier, '123-456-7');
+  assert.equal(parsedShared.description.split('\n\n')[3].split('\n')[0], '123-456-7');
+});
+
+test('quick-261026-ma6: a code repeated (a bold line plus a Gmail image-placeholder alt) counts once (D-07)', () => {
+  const gmailText = SMSTICKET_FIXTURE_GMAIL_RENDERING_LINES.join('\r\n');
+  const codes = extractSmsticketTicketCodes(gmailText);
+  assert.equal(
+    codes.filter(function (code) {
+      return code === '123-456-7';
+    }).length,
+    1
+  );
+});
+
+// --- Detector ------------------------------------------------------------------
+
+test('quick-261026-ma6: smsticketTextHasPurchaseDetails is true on the HTML-derived text and the Gmail simulation, false on marketing/event-date-only/code-only text, and never throws on null/undefined/empty (D-09)', () => {
+  const text = ticketingHtmlToPlainText(SMSTICKET_FIXTURE_HTML);
+  const gmailText = SMSTICKET_FIXTURE_GMAIL_RENDERING_LINES.join('\r\n');
+
+  assert.equal(smsticketTextHasPurchaseDetails(text), true);
+  assert.equal(smsticketTextHasPurchaseDetails(gmailText), true);
+  assert.equal(smsticketTextHasPurchaseDetails(ticketingHtmlToPlainText(SMSTICKET_FIXTURE_MARKETING_HTML)), false);
+  assert.equal(smsticketTextHasPurchaseDetails('Váš kód 123-456-7'), false);
+  assert.equal(smsticketTextHasPurchaseDetails(null), false);
+  assert.equal(smsticketTextHasPurchaseDetails(undefined), false);
+  assert.equal(smsticketTextHasPurchaseDetails(''), false);
+});
+
+// --- Jobs ------------------------------------------------------------------------
+
+test('quick-261026-ma6: resolveTicketProcessingJobs admits exactly ONE body-mode job for a real-shaped smsticket.cz message even with a PDF attached, and ZERO jobs/appliesTo false for a marketing message with a blank plain body (D-01, D-09)', () => {
+  const portals = [{ identifyingEmail: 'info@smsticket.cz', calendarId: 'SMS_CAL', insertPdfIntoEvent: true }];
+
+  const jobs = resolveTicketProcessingJobs([smsticketRealShapedMessage()], portals);
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'body');
+
+  const marketingMessage = smsticketRealShapedMessage({ htmlBody: SMSTICKET_FIXTURE_MARKETING_HTML });
+  const marketingJobs = resolveTicketProcessingJobs([marketingMessage], portals);
+  assert.equal(marketingJobs.length, 0);
+
+  const thread = smsticketOneMessageThread(marketingMessage);
+  assert.equal(TICKETING_PORTALS_ACTION.appliesTo(thread), false);
+});
+
+// --- ticketingHtmlToPlainText entity/structure checks -------------------------
+
+test('quick-261026-ma6: ticketingHtmlToPlainText entity decoding (amp decoded LAST, no double-decode; hex numeric refs decode) and structural stripping (an nbsp-only cell produces no line; head/style/script/img content never appears) (D-02)', () => {
+  assert.equal(ticketingHtmlToPlainText('&amp;lt;'), '&lt;');
+  assert.equal(ticketingHtmlToPlainText('&#x159;'), 'ř');
+  assert.equal(ticketingHtmlToPlainText('<td>&nbsp;</td><td>Real</td>'), 'Real');
+  assert.equal(ticketingHtmlToPlainText('<head><title>Hidden</title></head><body>Visible</body>').indexOf('Hidden'), -1);
+  assert.equal(ticketingHtmlToPlainText('<style>.x{color:red}</style><p>Visible</p>').indexOf('color'), -1);
+  assert.equal(ticketingHtmlToPlainText('<script>var x=1;</script><p>Visible</p>').indexOf('var x'), -1);
+  assert.equal(ticketingHtmlToPlainText('<img src="x.png" alt="Hidden Alt" /><p>Visible</p>').indexOf('Hidden Alt'), -1);
 });

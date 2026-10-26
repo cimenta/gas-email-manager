@@ -236,21 +236,32 @@ function webappRunJobHuntersNow() {
 }
 
 /**
- * webappGetJobHuntersNextRun — RPC handler (quick-261016-nu9 round 3):
- * assertWebappOwner() first, same shape as the Run handlers above --
- * try/catch, plain result object, never rethrows. Read-only: delegates to
- * jobHuntersGetNextRunDescription (src/11-action-job-hunters.js), which
- * reads the SAME LAST_RUN_AT_MS property and searchIntervalMinutes setting
- * the real capture's own due-check consults, so the displayed time can
- * never drift from the actual gate. Called once when the Job Hunters
- * settings sub-tab renders, and again after a Run Now click (D-10) resets
- * the clock.
+ * webappGetJobHuntersNextRun — RPC handler (quick-261016-nu9, round 4
+ * revision): assertWebappOwner() first, same shape as the Run handlers
+ * above -- try/catch, plain result object, never rethrows. Read-only:
+ * delegates to jobHuntersGetNextRunInfo (src/11-action-job-hunters.js),
+ * which reads the SAME LAST_RUN_AT_MS property and searchIntervalMinutes
+ * setting the real capture's own due-check consults, so the displayed time
+ * can never drift from the actual gate.
+ *
+ * Returns the STRUCTURED `{ok, hasRunBefore, due, nextRunAtMs}` rather than
+ * a pre-rendered string -- round 3's version sent a server-built UTC
+ * (`toISOString()`) string, which a live owner report correctly flagged as
+ * reading like a fixed "script timezone" rather than the owner's own. Epoch
+ * milliseconds survive the google.script.run JSON round-trip exactly (a
+ * plain number), and the UI (src/00-webapp-ui.html) renders it via the
+ * browser's own `Date#toLocaleString()`, which is the viewer's local
+ * timezone by definition.
+ *
+ * Called once when the Job Hunters settings sub-tab renders, and again
+ * after a Run Now click (D-10) resets the clock.
  */
 function webappGetJobHuntersNextRun() {
   assertWebappOwner();
 
   try {
-    return { ok: true, message: jobHuntersGetNextRunDescription() };
+    const info = jobHuntersGetNextRunInfo();
+    return { ok: true, hasRunBefore: info.hasRunBefore, due: info.due, nextRunAtMs: info.nextRunAtMs };
   } catch (err) {
     return { ok: false, message: 'Could not determine the next JobHunters run time: ' + err.message };
   }
