@@ -22,10 +22,17 @@
  *     shared ticketingMessageBodyText helper (see this file's "SHARED
  *     BODY-TEXT SOURCE" section) — every portal whose plain body is
  *     non-blank is unaffected.
- *   - ICS-sourced (Ticketportal.cz, quick-261005-orv): the event data comes
- *     from the confirmation email's OWN `.ics` attachment, parsed by the
- *     EXISTING parseIcs (src/05-action-ics-import.js) — the only mode with
- *     no portal-specific parser FUNCTION, since parseIcs is itself generic.
+ *   - ICS-sourced (Ticketportal.cz, quick-261005-orv; WebTicket.cz,
+ *     quick-261028-h1n): the event data comes from the confirmation
+ *     email's OWN `.ics` attachment, parsed by the EXISTING parseIcs
+ *     (src/05-action-ics-import.js) — still never a SECOND `.ics` parser.
+ *     Each ICS-sourced portal instead registers a small parsed-ticket
+ *     BUILDER in TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL
+ *     that only post-processes what parseIcs already returned. WebTicket.cz's
+ *     own builder (buildWebticketParsedTicket) also reads the message body
+ *     for its description, via parseWebticketOrderText — an ENRICHMENT
+ *     source layered on top of the `.ics`'s core event fields, never a
+ *     replacement for them.
  *
  * DEDUP SAFETY NET: a portal parser extracts a stable `ticketIdentifier`
  * where one exists; the created event is tagged at creation time via
@@ -40,6 +47,11 @@
  * identifier (documented per-parser limitation, not a silent gap) simply
  * does not get this protection. For smsticket.cz (quick-261026-ma6) that
  * identifier is the purchase's FIRST entry code (extractSmsticketTicketCodes).
+ * WebTicket.cz's (quick-261028-h1n) identifier is the order number read
+ * from its ticket PDF's own filename, falling back to the body's own
+ * "Zakázka #" number, never the per-email `.ics` UID (WebTicket mints a
+ * fresh UID for every sent email, so a re-send would otherwise duplicate
+ * the event).
  *
  * ALL PORTAL-SPECIFIC PARSING LOGIC LIVES IN THIS ONE FILE: every parser is
  * a clearly-separated, well-named function/section within THIS file (e.g.
@@ -2477,6 +2489,299 @@ function smsticketTextHasPurchaseDetails(text) {
   return extractSmsticketTicketCodes(afterDateText).length > 0;
 }
 
+// =============================================================================
+// WEBTICKET.CZ (automat@webticket.cz) — the EIGHTH supported portal, the
+// SECOND ICS-sourced one (quick-261028-h1n)
+// =============================================================================
+//
+// STRUCTURAL FACTS (from the real sample .eml, decoded by the planner):
+//   - The confirmation's text/plain MIME part is NON-EMPTY but renders the
+//     event name/date line in ALL CAPS ("PO 28. 12. 2026 19:00 - BIOGRAF
+//     LÁSKA 2: NOVÝ PŘÍBĚH") — correct Czech casing cannot be recovered
+//     from capitals, which is why this portal is ICS-sourced rather than
+//     body-sourced (D-01), despite the body being non-empty.
+//   - The confirmation ALSO carries its own genuine `.ics` attachment,
+//     whose SUMMARY and LOCATION keep the proper case, and whose DTSTART is
+//     an exact UTC instant. That `.ics`'s DTEND equals its DTSTART (a
+//     zero-length VEVENT) — this is also why, before this change, the
+//     generic ICS_CALENDAR_ACTION was already importing this sender's
+//     `.ics` as a zero-length event (importOnlyFrom defaults to every
+//     sender); registering this portal structurally ends that (D-01, D-07).
+//   - The `.ics` UID is a PHP `uniqid()` minted PER SENT EMAIL (its 8-hex
+//     seconds prefix equals the message's own DKIM `t=` timestamp) — a
+//     re-sent confirmation would carry a fresh UID, so it is never used for
+//     dedup (D-05).
+//   - ONE plain-ASCII-named ticket PDF (`webticket_<order>.pdf`) carries the
+//     order number in its FILENAME — the primary dedup source, same
+//     precedent as Ticketportal.cz's eTicket PDF (D-05, D-06).
+//   - The body's "Zobraz zakázku" order-status link and its two Wallet
+//     links share one URL that is a BEARER LINK (opens the order page,
+//     which hands out wallet passes) — never followed, never fetched
+//     (D-01, D-09, D-11).
+//   - The body also carries a weekday-prefixed date format ("PO 28. 12.
+//     2026 19:00") — observed, but deliberately NEVER parsed: the `.ics`
+//     DTSTART is already the exact instant (D-10).
+//   - WebTicket sells tickets ON BEHALF OF MANY VENUES (this sample:
+//     Divadlo Kalich) — the ONE sender address `automat@webticket.cz`
+//     covers every venue, the same platform-sender shape as Entradio.
+
+// WEBTICKET_ORDER_NUMBER_FROM_PDF_NAME_PATTERN — the digit run between the
+// literal `webticket_` prefix and the `.pdf` extension in the real ticket
+// filename (e.g. "webticket_3064785.pdf" -> "3064785"). Case-insensitive,
+// since nothing about the filename's casing is guaranteed to survive every
+// mail client. OBSERVED (the real sample) VERSUS TOLERANCE: only this one
+// filename shape has been seen live; a differently-shaped WebTicket filename
+// would need handling then, with real data — see
+// extractWebticketOrderNumberFromPdfName's own SCOPE LIMITATION below.
+const WEBTICKET_ORDER_NUMBER_FROM_PDF_NAME_PATTERN = /^webticket_(\d+)\.pdf$/i;
+
+/**
+ * extractWebticketOrderNumberFromPdfName (D-05) — reads the per-ORDER
+ * WebTicket number from the ticket PDF's own FILENAME. Returns the digit
+ * string, or `null` when `pdfName` is null/undefined/empty or does not
+ * match. Never throws. Pure, no GAS globals.
+ *
+ * WHY THE FILENAME, NEVER THE .ics UID, NEVER kal: — the .ics UID is a PHP
+ * `uniqid()` minted PER SENT EMAIL (see this section's banner): a re-sent
+ * confirmation would carry a brand-new UID, so keying dedup on it would let
+ * a re-send create a second event for the SAME purchase. The body's
+ * "kal:00795453" number is the VENUE's own booking number (its prefix names
+ * the venue, e.g. "kal" for Divadlo Kalich) — it is venue-scoped, not
+ * order-scoped, so two different orders at different venues could
+ * legitimately collide on their own "kal:"-equivalent numbers. The order
+ * number baked into the ticket PDF's filename (same digits as the Subject's
+ * "#3064785" and the order-status URL's path segment) is per-ORDER and
+ * stable across re-processing and re-sends, which is what this portal's
+ * dedup safety net must key on instead.
+ */
+function extractWebticketOrderNumberFromPdfName(pdfName) {
+  const match = WEBTICKET_ORDER_NUMBER_FROM_PDF_NAME_PATTERN.exec(String(pdfName || ''));
+  return match ? match[1] : null;
+}
+
+// WEBTICKET_ORDER_NUMBER_PATTERN (D-08, quick-261028-h1n Task 2) — the
+// literal "ZAKÁZKA #<digits>" marker (case-insensitive, so it matches the
+// real plain part's "ZAKÁZKA #" and the HTML rendering's "zakázka #"/
+// "Zakázka #" alike), accepting either the diacritic Á or the plain ASCII A
+// (observed shapes only; a differently-rendered variant would need handling
+// then, with real data). Anchored on the literal `#` is what keeps this from
+// ever matching the order-status URL's "zakazka/3064785" path segment,
+// which has `/` where this pattern requires `#`.
+const WEBTICKET_ORDER_NUMBER_PATTERN = /ZAK[AÁ]ZKA\s*#\s*(\d+)/i;
+
+// WEBTICKET_ORDER_REFERENCE_PATTERN (D-08) — the venue's own booking
+// reference immediately after the order number, separated by " / "
+// (e.g. "ZAKÁZKA #3064785 / KAL:00795453" -> "kal:00795453", lowercased for
+// a stable, predictable description). Observed shape only: one
+// alphabetic-prefix-then-colon-then-digits token.
+const WEBTICKET_ORDER_REFERENCE_PATTERN = /ZAK[AÁ]ZKA\s*#\s*\d+\s*\/\s*([A-Za-z]+:\d+)/i;
+
+// WEBTICKET_WRAPPED_LINE_PATTERN (D-08) — ONE wrapping pair of `*` or `_`
+// around a non-`*`/`_` run, the real plain part's own markdown-ish
+// emphasis convention around the seat-count and the "V případě
+// nesrovnalostí..." disclaimer lines (e.g. "_1 ks, 849 Kč_ ").
+const WEBTICKET_WRAPPED_LINE_PATTERN = /^([*_])([^*_]+)\1$/;
+
+/**
+ * webticketSurvivingLines (D-08) — pure; splits `text` on CR, LF or CRLF
+ * AFTER normalizing it with feverNormalizeBodyText (folding U+00A0 and
+ * stripping invisible padding characters — reused by name per this file's
+ * Fever section, never duplicated). Each line is trimmed, has ONE wrapping
+ * pair of WEBTICKET_WRAPPED_LINE_PATTERN `*`/`_` removed and is re-trimmed,
+ * then dropped if it is empty. Returns the surviving lines, in order. Never
+ * throws.
+ */
+function webticketSurvivingLines(text) {
+  const normalized = feverNormalizeBodyText(text);
+  const lines = normalized.split(/\r\n|\r|\n/);
+  const survivors = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    let trimmed = lines[i].trim();
+    const wrappedMatch = WEBTICKET_WRAPPED_LINE_PATTERN.exec(trimmed);
+    if (wrappedMatch) {
+      trimmed = wrappedMatch[2].trim();
+    }
+    if (trimmed) {
+      survivors.push(trimmed);
+    }
+  }
+
+  return survivors;
+}
+
+/**
+ * parseWebticketOrderText (D-08, quick-261028-h1n Task 2) — the
+ * automat@webticket.cz ticket-BODY ENRICHMENT parser: unlike every
+ * body-sourced portal's parser, this does NOT supply the core event fields
+ * (those come from the `.ics`, see buildWebticketParsedTicket) — it only
+ * extracts the description/dedup-fallback material the body carries. Works
+ * identically on the real all-caps plain part, its CRLF-ending variant, and
+ * ticketingHtmlToPlainText's own rendering of the HTML part — every anchor
+ * below is a literal marker, never a line position. NEVER throws: `null`,
+ * `undefined`, a non-string or `''` all return
+ * `{ orderNumber: null, orderReference: null, seatLines: [], totalPriceLine: null }`.
+ *
+ * EXTRACTION SEQUENCE:
+ *   1. Normalize `text` (feverNormalizeBodyText) and find the FIRST
+ *      WEBTICKET_ORDER_NUMBER_PATTERN match -> `orderNumber`.
+ *   2. `orderReference` is group 1 of the first
+ *      WEBTICKET_ORDER_REFERENCE_PATTERN match, LOWERCASED, or `null` when
+ *      there is none.
+ *   3. `seatLines` is every webticketSurvivingLines(text) line containing
+ *      the literal separator " ... " whose text after the LAST " ... "
+ *      fully matches the reused SMSTICKET_PRICE_LINE_PATTERN (by name, same
+ *      reuse discipline smsticket.cz already established for the Fever
+ *      helpers) — kept verbatim, in order.
+ *   4. `totalPriceLine` is the first surviving line that starts with
+ *      "Cena:" and whose remainder, trimmed, fully matches
+ *      SMSTICKET_PRICE_LINE_PATTERN — kept verbatim, or `null` when none
+ *      qualifies.
+ *
+ * Return shape: exactly `{ orderNumber, orderReference, seatLines,
+ * totalPriceLine }`.
+ */
+function parseWebticketOrderText(text) {
+  if (typeof text !== 'string' || !text) {
+    return { orderNumber: null, orderReference: null, seatLines: [], totalPriceLine: null };
+  }
+
+  const normalizedText = feverNormalizeBodyText(text);
+
+  const orderNumberMatch = WEBTICKET_ORDER_NUMBER_PATTERN.exec(normalizedText);
+  const orderNumber = orderNumberMatch ? orderNumberMatch[1] : null;
+
+  const orderReferenceMatch = WEBTICKET_ORDER_REFERENCE_PATTERN.exec(normalizedText);
+  const orderReference = orderReferenceMatch ? orderReferenceMatch[1].toLowerCase() : null;
+
+  const survivingLines = webticketSurvivingLines(normalizedText);
+
+  const seatLines = survivingLines.filter(function (line) {
+    const lastSeparatorIndex = line.lastIndexOf(' ... ');
+    if (lastSeparatorIndex === -1) {
+      return false;
+    }
+    return SMSTICKET_PRICE_LINE_PATTERN.test(line.slice(lastSeparatorIndex + ' ... '.length).trim());
+  });
+
+  let totalPriceLine = null;
+  for (let i = 0; i < survivingLines.length; i++) {
+    const line = survivingLines[i];
+    if (line.indexOf('Cena:') === 0 && SMSTICKET_PRICE_LINE_PATTERN.test(line.slice('Cena:'.length).trim())) {
+      totalPriceLine = line;
+      break;
+    }
+  }
+
+  return {
+    orderNumber: orderNumber,
+    orderReference: orderReference,
+    seatLines: seatLines,
+    totalPriceLine: totalPriceLine,
+  };
+}
+
+/**
+ * buildWebticketParsedTicket (D-03, D-04, D-05; body enrichment added in
+ * quick-261028-h1n Task 2, D-08) — builds the `parsedTicket` shape from a
+ * single parseIcs-returned event (`icsEvent`), the matched ticket PDF's
+ * filename (`ticketPdfName`, nullable), the target calendar's own
+ * `timeZone`, an injected `formatDate` (see
+ * ticketInstantToWallClockComponents), and `bodyText` (the shared
+ * ticketingMessageBodyText(message) rendering — ICS BUILDER CONTRACT, see
+ * processTicketFromIcsAttachment's own JSDoc). Pure.
+ *
+ * `eventName` = `String(icsEvent.summary || '').trim()` VERBATIM — UNLIKE
+ * Ticketportal.cz's own builder, this does NOT strip any baked-in date
+ * suffix: WebTicket's SUMMARY carries no such tail (D-03). Throws a clear
+ * Error naming the portal when that comes back empty — a blank SUMMARY is
+ * not a usable event name.
+ * `location` (D-04) = the text of `icsEvent.location` BEFORE its first `|`,
+ * trimmed — the venue/address segment only, since Google Calendar turns
+ * `location` into a Maps lookup and the `| website | tel: ...` tail is
+ * contact info, not an address. Falls back to the whole trimmed LOCATION
+ * when that first segment is empty, and to `''` when LOCATION is absent
+ * entirely. The FULL trimmed LOCATION line is still kept in the
+ * description (D-08), so nothing is lost.
+ * Start comes from `ticketInstantToWallClockComponents(icsEvent.start,
+ * timeZone, formatDate)`.
+ * `end` is set ONLY when `icsEvent.end` is a Date strictly LATER than
+ * `icsEvent.start` — the same rule as buildTicketportalCzParsedTicket. The
+ * real DTEND equals DTSTART, so `end` is omitted here and
+ * buildTicketCalendarEventResource's existing DEFAULT_EVENT_DURATION_MINUTES
+ * fallback applies (19:00-21:00) — copying the zero-length span would
+ * reproduce the very zero-length event the generic ICS import used to
+ * create.
+ * `ticketIdentifier` (D-05) = extractWebticketOrderNumberFromPdfName(ticketPdfName)
+ * when truthy, else `parseWebticketOrderText(bodyText).orderNumber` (the
+ * body fallback), else `null`.
+ * `description` (D-08) — built from parseWebticketOrderText(bodyText),
+ * paragraphs joined by `'\n\n'`:
+ *   1. eventName
+ *   2. the FULL trimmed LOCATION, only if non-empty
+ *   3. seatLines joined by `'\n'`, only if any
+ *   4. the order lines joined by `'\n'`, only if any — `'Zakázka #' +
+ *      ticketIdentifier + (orderReference ? ' / ' + orderReference : '')`
+ *      when ticketIdentifier is truthy, then totalPriceLine when present.
+ *      The "Zakázka" label is written in proper case regardless of which
+ *      body rendering supplied the digits.
+ *
+ * Return shape: `{ eventName, location, year, month, day, hour, minute,
+ * ticketIdentifier, description }`, plus `end` only per the rule above.
+ */
+function buildWebticketParsedTicket(icsEvent, ticketPdfName, timeZone, formatDate, bodyText) {
+  const eventName = String(icsEvent.summary || '').trim();
+  if (!eventName) {
+    throw new Error('WebTicket.cz: .ics SUMMARY is empty, no usable event name. Raw summary: "' + icsEvent.summary + '"');
+  }
+
+  const rawLocation = String(icsEvent.location || '');
+  const firstSegment = rawLocation.split('|')[0].trim();
+  const location = firstSegment || rawLocation.trim();
+  const trimmedFullLocation = rawLocation.trim();
+
+  const startComponents = ticketInstantToWallClockComponents(icsEvent.start, timeZone, formatDate);
+
+  const orderText = parseWebticketOrderText(bodyText);
+  const ticketIdentifier = extractWebticketOrderNumberFromPdfName(ticketPdfName) || orderText.orderNumber || null;
+
+  const descriptionParagraphs = [eventName];
+  if (trimmedFullLocation) {
+    descriptionParagraphs.push(trimmedFullLocation);
+  }
+  if (orderText.seatLines.length > 0) {
+    descriptionParagraphs.push(orderText.seatLines.join('\n'));
+  }
+  const orderLines = [];
+  if (ticketIdentifier) {
+    orderLines.push('Zakázka #' + ticketIdentifier + (orderText.orderReference ? ' / ' + orderText.orderReference : ''));
+  }
+  if (orderText.totalPriceLine) {
+    orderLines.push(orderText.totalPriceLine);
+  }
+  if (orderLines.length > 0) {
+    descriptionParagraphs.push(orderLines.join('\n'));
+  }
+
+  const parsedTicket = {
+    eventName: eventName,
+    location: location,
+    year: startComponents.year,
+    month: startComponents.month,
+    day: startComponents.day,
+    hour: startComponents.hour,
+    minute: startComponents.minute,
+    ticketIdentifier: ticketIdentifier,
+    description: descriptionParagraphs.join('\n\n'),
+  };
+
+  if (icsEvent.end instanceof Date && icsEvent.end.getTime() > icsEvent.start.getTime()) {
+    parsedTicket.end = ticketInstantToWallClockComponents(icsEvent.end, timeZone, formatDate);
+  }
+
+  return parsedTicket;
+}
+
 /**
  * TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL — the local (single-file)
  * registry mapping a BODY-SOURCED ticketing portal's `identifyingEmail`
@@ -2492,7 +2797,11 @@ function smsticketTextHasPurchaseDetails(text) {
 // parseIcs, never by a per-portal body parser. See TICKET_ICS_MODE_SENDERS
 // below. smsticket.cz (quick-261026-ma6) IS body-sourced and DOES have a key
 // here (see below) -- it is NOT ICS-sourced, since the real confirmation
-// carries no .ics attachment at all.
+// carries no .ics attachment at all. Also NO 'automat@webticket.cz' key
+// (quick-261028-h1n, D-01) -- WebTicket.cz is ALSO ICS-SOURCED, like
+// Ticketportal.cz; its body is read only as an ENRICHMENT source inside
+// buildWebticketParsedTicket (parseWebticketOrderText), never via this
+// registry, which would otherwise route it to the body branch FIRST.
 const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
   'rezervace@kinoart.cz': parseKinoArtTicketText,
   'noreply@ticketmaster.cz': parseTicketmasterCzTicketText,
@@ -2518,14 +2827,18 @@ const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
 // 'info@smsticket.cz' key (D-01, quick-261026-ma6) -- same reason as Fever:
 // everything smsticket.cz's event needs is already in its body (or its HTML
 // body's own rendering, see ticketingMessageBodyText), so no OCR is needed.
+// Also NO 'automat@webticket.cz' key (quick-261028-h1n, D-01) -- same reason
+// as Ticketportal.cz: WebTicket.cz's event data comes from its own .ics
+// attachment, never Drive/OCR.
 const TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL = {
   'no-reply@enigoo.cz': parseEnigooTicketText,
 };
 
 /**
  * TICKET_ICS_MODE_SENDERS — the ICS-SOURCED counterpart to the two parser
- * registries above (quick-261005-orv, D-02). A portal in this list has its
- * event data extracted from its own `.ics` attachment via the generic,
+ * registries above (quick-261005-orv, D-02; a second portal, WebTicket.cz,
+ * added quick-261028-h1n, D-01). A portal in this list has its event data
+ * extracted from its own `.ics` attachment via the generic,
  * already-existing parseIcs (src/05-action-ics-import.js) — there is
  * deliberately NO per-portal parser FUNCTION for this mode, since parseIcs
  * is itself the parser. A message's sender resolving into this list AND
@@ -2533,7 +2846,42 @@ const TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL = {
  * (findTicketIcsAttachments) is what admits the `mode: 'ics'` job (see
  * resolveTicketProcessingJobs / TICKETING_PORTALS_ACTION.appliesTo/run).
  */
-const TICKET_ICS_MODE_SENDERS = ['vstupenky@ticketportal.cz'];
+const TICKET_ICS_MODE_SENDERS = ['vstupenky@ticketportal.cz', 'automat@webticket.cz'];
+
+/**
+ * TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL (quick-261028-h1n,
+ * D-02) — the local (single-file) registry mapping an ICS-SOURCED ticketing
+ * portal's `identifyingEmail` (lowercased) to its own parsed-ticket BUILDER
+ * function — the per-sender post-processing step that turns a single
+ * parseIcs-returned event into this file's shared `parsedTicket` shape.
+ *
+ * WHY A REGISTRY, NOT A HARDCODED CALL: before quick-261028-h1n,
+ * processTicketFromIcsAttachment hardcoded a single call to
+ * buildTicketportalCzParsedTicket — correct when Ticketportal.cz was the
+ * ONLY ics-mode portal, but wrong the moment a second one (WebTicket.cz)
+ * needed its own builder. This registry is keyed the SAME way as
+ * TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL / TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL
+ * above, so adding a future ICS-sourced portal means registering a new
+ * builder here, nothing else.
+ *
+ * parseIcs REMAINS THE ONLY `.ics` PARSER: every registered builder only
+ * POST-PROCESSES what parseIcs already returned (the `icsEvent` argument);
+ * none of them re-parses the `.ics` text itself.
+ *
+ * INVARIANT: `Object.keys(TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL)`
+ * ALWAYS deepEquals TICKET_ICS_MODE_SENDERS — a test pins this, so the
+ * admission array and the builder registry can never drift apart.
+ *
+ * Signature (quick-261028-h1n Task 2 extends this to FIVE arguments, D-08):
+ * `(icsEvent, ticketPdfName, timeZone, formatDate, bodyText) -> parsedTicket`.
+ * buildTicketportalCzParsedTicket takes only the first four and ignores a
+ * fifth — "extra trailing argument is inert" per this file's existing
+ * BODY-PARSER CONTRACT pattern.
+ */
+const TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL = {
+  'vstupenky@ticketportal.cz': buildTicketportalCzParsedTicket,
+  'automat@webticket.cz': buildWebticketParsedTicket,
+};
 
 /**
  * DEFAULT_EVENT_DURATION_MINUTES — the fixed default duration (2 hours)
@@ -2957,6 +3305,41 @@ function findSmsticketTicketPdfAttachment(message) {
 }
 
 /**
+ * findWebticketTicketPdfAttachment (D-06, quick-261028-h1n) —
+ * WebTicket.cz's own ticket-PDF finder. The real observed confirmation
+ * carries exactly ONE PDF attachment, filename "webticket_<order>.pdf", a
+ * plain ASCII filename (no RFC 2047 encoding, unlike smsticket.cz's own
+ * finder's LIVE CAVEAT above) — holding the purchase's real ticket(s).
+ * Returns the FIRST qualifying PDF attachment whose name contains the
+ * literal "webticket_", or `null` — same discipline as
+ * findKinoArtTicketPdfAttachment/findTicketmasterCzTicketPdfAttachment/
+ * findFeverTicketPdfAttachment/findTicketportalCzTicketPdfAttachment/
+ * findSmsticketTicketPdfAttachment above.
+ *
+ * ICS-MODE CONSULTS THIS FOR BOTH THE DEDUP IDENTIFIER AND THE ATTACHMENT:
+ * processTicketFromIcsAttachment looks this up via
+ * TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL REGARDLESS of
+ * `insertPdfIntoEvent`, since extractWebticketOrderNumberFromPdfName needs
+ * the matched PDF's filename even when the PDF itself will not be
+ * attached — the Ticketportal.cz D-08 precedent.
+ *
+ * SCOPE LIMITATION: a differently-named attachment would need handling
+ * THEN, with real data. Pure, no GAS globals.
+ */
+function findWebticketTicketPdfAttachment(message) {
+  const pdfAttachments = findTicketPdfAttachments(message);
+
+  for (let i = 0; i < pdfAttachments.length; i++) {
+    const name = pdfAttachments[i].getName() || '';
+    if (name.indexOf('webticket_') !== -1) {
+      return pdfAttachments[i];
+    }
+  }
+
+  return null;
+}
+
+/**
  * TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL — the local
  * (single-file) registry mapping a BODY-SOURCED ticketing portal's
  * `identifyingEmail` to its own ticket-PDF-finder function, kept as a
@@ -2974,8 +3357,9 @@ function findSmsticketTicketPdfAttachment(message) {
 // TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL registry
 // instead -- see that registry's JSDoc for why fetching and finding are
 // kept apart.
-// Ticketportal.cz (quick-261005-orv, D-08) is registered here too, despite
-// being ICS-SOURCED rather than body-sourced: this registry's attach-step
+// Ticketportal.cz (quick-261005-orv, D-08) and WebTicket.cz
+// (quick-261028-h1n, D-06) are registered here too, despite being
+// ICS-SOURCED rather than body-sourced: this registry's attach-step
 // consumer (processTicketFromIcsAttachment) reuses it exactly as the
 // body-sourced pipeline does, regardless of processing mode.
 const TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL = {
@@ -2984,6 +3368,7 @@ const TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL = {
   'hello@feverup.com': findFeverTicketPdfAttachment,
   'vstupenky@ticketportal.cz': findTicketportalCzTicketPdfAttachment,
   'info@smsticket.cz': findSmsticketTicketPdfAttachment,
+  'automat@webticket.cz': findWebticketTicketPdfAttachment,
 };
 
 /**
@@ -3013,6 +3398,11 @@ const TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL = {
 // entry codes fold into `description` only, its ticket PDF (when wanted)
 // travels WITH the message and is found by findSmsticketTicketPdfAttachment
 // above, and it makes no outbound HTTP call and needs no new OAuth scope.
+// Also NO 'automat@webticket.cz' key (quick-261028-h1n) -- its ticket PDF
+// travels WITH the message (findWebticketTicketPdfAttachment above); the
+// order-status/wallet links in its body are bearer links and are NEVER
+// followed, so this portal makes no outbound HTTP call and needs no new
+// OAuth scope either.
 const TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL = {
   'no-reply@app.entradio.cz': fetchEntradioAttachments,
 };
@@ -3047,6 +3437,16 @@ const TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL = {
   // here from day one too (D-09, quick-261026-ma6).
   'info@smsticket.cz': smsticketTextHasPurchaseDetails,
 };
+// DELIBERATE ABSENCE: there is NO 'automat@webticket.cz' key here
+// (D-09, quick-261028-h1n). This registry gates BODY-mode admission only;
+// WebTicket.cz is ICS-sourced, and ICS-mode admission already requires a
+// `.ics` attachment from this sender (TICKET_ICS_MODE_SENDERS +
+// findTicketIcsAttachments) -- that structural requirement is ITSELF the
+// gate. `automat@webticket.cz` is a transactional robot address
+// (X-Mailer: WebTicket Mailer); the real sample shows no marketing
+// callout, unlike smsticket.cz's own footer. Marketing mail does not carry
+// a `.ics`, so it is simply never admitted at all -- no detector is needed
+// to tell it apart from a real purchase confirmation.
 
 // =============================================================================
 // SHARED BODY-TEXT SOURCE (quick-261026-ma6)
@@ -3692,16 +4092,18 @@ function processTicketFromMessageBody(message, portal) {
 }
 
 /**
- * processTicketFromIcsAttachment (quick-261005-orv, D-04, D-08) — the
- * ICS-SOURCED processing mode, Ticketportal.cz's own: `message`'s own
- * `.ics` attachment supplies the event data (via the EXISTING parseIcs,
+ * processTicketFromIcsAttachment (quick-261005-orv, D-04, D-08; generalized
+ * to a per-sender builder registry in quick-261028-h1n, D-02) — the
+ * ICS-SOURCED processing mode, shared by BOTH ICS-sourced portals
+ * (Ticketportal.cz and, since quick-261028-h1n, WebTicket.cz): `message`'s
+ * own `.ics` attachment supplies the event data (via the EXISTING parseIcs,
  * reused through this file's end-of-file Node bridge / the shared GAS
  * global scope — D-01), never a portal-specific text/body parser. GAS-only
  * (CalendarApp/Calendar/DriveApp/Utilities globals) — not unit-tested
  * directly beyond this function's own GAS-shaped coordination; the pure
- * logic it depends on (buildTicketportalCzParsedTicket and friends) IS
- * fully unit-tested. Exported for the Node global-injection harness, same
- * as processTicketFromMessageBody.
+ * logic it depends on (the registered builders and friends) IS fully
+ * unit-tested. Exported for the Node global-injection harness, same as
+ * processTicketFromMessageBody.
  *
  * Flow:
  *   (a) icsAttachments = findTicketIcsAttachments(message). Throws if
@@ -3718,15 +4120,36 @@ function processTicketFromMessageBody(message, portal) {
  *       CalendarApp.getCalendarById round-trip, same pattern as
  *       createTicketCalendarEvent) and its live timeZone. Throws if the
  *       resolved calendarId does not resolve to a real calendar.
- *   (d) Resolve the matched eTicket PDF via the EXISTING
+ *   (d) Resolve the matched ticket PDF via the EXISTING
  *       TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL registry (D-08) —
  *       REGARDLESS of `portal.insertPdfIntoEvent`, since the dedup
  *       ticketIdentifier depends on the PDF's filename even when the PDF
  *       itself will not be attached.
- *   (e) parsedTicket = buildTicketportalCzParsedTicket(...). A null
- *       ticketIdentifier (no matched PDF) is logged — the dedup safety net
- *       simply cannot run for this message, same documented limitation as
- *       every other portal missing a stable identifier.
+ *   (e) Look up this portal's builder in
+ *       TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL (D-02) by
+ *       `senderKey`, throwing a clear Error naming the portal when none is
+ *       registered — this should not happen when TICKET_ICS_MODE_SENDERS
+ *       already gated admission, but guards against the two registries
+ *       drifting apart. parsedTicket = builder(events[0], ticketPdf ?
+ *       ticketPdf.getName() : null, timeZone, <Utilities.formatDate
+ *       wrapper>, ticketingMessageBodyText(message)). A null
+ *       ticketIdentifier (no matched PDF, and for WebTicket.cz also no body
+ *       fallback) is logged — the dedup safety net simply cannot run for
+ *       this message, same documented limitation as every other portal
+ *       missing a stable identifier.
+ *
+ *       ICS BUILDER CONTRACT (quick-261028-h1n, D-08): every registered
+ *       builder is called with this SAME fifth argument,
+ *       `ticketingMessageBodyText(message)` — the shared body-text source
+ *       (the plain body, or the HTML rendering fallback when that is
+ *       blank). Ticketportal.cz's own builder
+ *       (buildTicketportalCzParsedTicket) takes only FOUR parameters and
+ *       simply ignores a fifth, so its behavior is UNCHANGED — the same
+ *       "extra trailing argument is inert" pattern this file's
+ *       BODY-PARSER CONTRACT already establishes for body-sourced parsers.
+ *       WebTicket.cz's own builder (buildWebticketParsedTicket) reads this
+ *       argument to enrich its description and supply its dedup fallback
+ *       (see that function's own JSDoc).
  *   (f) DEDUP SAFETY NET (shared via isDuplicateTicketPurchase) — if a
  *       duplicate, silent no-op, no Drive/Calendar writes at all.
  *   (g) If `portal.insertPdfIntoEvent` AND a matched PDF exists: copy it
@@ -3769,16 +4192,22 @@ function processTicketFromIcsAttachment(message, portal) {
   const findPortalTicketPdfAttachment = TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL[senderKey];
   const ticketPdf = findPortalTicketPdfAttachment ? findPortalTicketPdfAttachment(message) : null;
 
-  const parsedTicket = buildTicketportalCzParsedTicket(
+  const buildParsedTicket = TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL[senderKey];
+  if (!buildParsedTicket) {
+    throw new Error('No .ics parsed-ticket builder registered for ticketing portal: ' + portal.identifyingEmail);
+  }
+
+  const parsedTicket = buildParsedTicket(
     events[0],
     ticketPdf ? ticketPdf.getName() : null,
     timeZone,
     function (date, timeZoneForFormat, pattern) {
       return Utilities.formatDate(date, timeZoneForFormat, pattern);
-    }
+    },
+    ticketingMessageBodyText(message)
   );
   if (!parsedTicket.ticketIdentifier) {
-    console.log('Ticketing portal (ics mode): no ticketIdentifier available (no matched eTicket PDF); dedup protection is unavailable for this message.');
+    console.log('Ticketing portal (ics mode): no ticketIdentifier available (no matched ticket PDF); dedup protection is unavailable for this message.');
   }
 
   if (isDuplicateTicketPurchase(parsedTicket.ticketIdentifier, calendarId)) {
@@ -3798,7 +4227,7 @@ function processTicketFromIcsAttachment(message, portal) {
     });
   } else if (portal.insertPdfIntoEvent) {
     console.log(
-      'Ticketing portal (ics mode): insertPdfIntoEvent is true but no matching eTicket PDF attachment was found on the message.'
+      'Ticketing portal (ics mode): insertPdfIntoEvent is true but no matching ticket PDF attachment was found on the message.'
     );
   }
 
@@ -4008,6 +4437,12 @@ if (typeof module !== 'undefined' && module.exports) {
     // body-sourced portal's two message.getPlainBody() read sites).
     ticketingHtmlToPlainText: ticketingHtmlToPlainText,
     ticketingMessageBodyText: ticketingMessageBodyText,
+    // The eighth portal, WebTicket.cz (quick-261028-h1n).
+    extractWebticketOrderNumberFromPdfName: extractWebticketOrderNumberFromPdfName,
+    buildWebticketParsedTicket: buildWebticketParsedTicket,
+    findWebticketTicketPdfAttachment: findWebticketTicketPdfAttachment,
+    TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL: TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL,
+    parseWebticketOrderText: parseWebticketOrderText,
   };
 }
 

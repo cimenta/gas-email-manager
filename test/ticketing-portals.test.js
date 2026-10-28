@@ -65,6 +65,13 @@ const {
   ticketingHtmlToPlainText,
   ticketingMessageBodyText,
   findSmsticketTicketPdfAttachment,
+  // quick-261028-h1n: the EIGHTH portal, WebTicket.cz, the SECOND
+  // ICS-SOURCED one (after Ticketportal.cz).
+  buildWebticketParsedTicket,
+  extractWebticketOrderNumberFromPdfName,
+  findWebticketTicketPdfAttachment,
+  TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL,
+  parseWebticketOrderText,
 } = require('../src/07-action-ticketing-portals.js');
 
 // Separately required so tests derive the real event objects from the real
@@ -1473,11 +1480,11 @@ test('TICKETING_PORTALS_ACTION_CONFIG: the shipped default seeds a THIRD entry f
   assert.equal(resolveTicketingCalendarId(thirdPortal, 'DEFAULT_CAL'), 'DEFAULT_CAL');
 });
 
-test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are still the unchanged enigoo.cz and Kino Art entries, array length is 7 (updated quick-261026-ma6)', () => {
+test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are still the unchanged enigoo.cz and Kino Art entries, array length is 8 (updated quick-261028-h1n)', () => {
   const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
   const portals = TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals;
 
-  assert.equal(portals.length, 7);
+  assert.equal(portals.length, 8);
   assert.deepEqual(portals[0], { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[1], { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false });
 });
@@ -4266,9 +4273,9 @@ test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: the shipped default fift
   assert.equal(resolveTicketingCalendarId(portals[4], 'GLOBAL_DEFAULT_CAL'), 'GLOBAL_DEFAULT_CAL');
 });
 
-test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: regression guard -- entries 0-3 (enigoo.cz, Kino Art, Ticketmaster CZ, Entradio) are unchanged and the array length is 7 (updated quick-261026-ma6)', () => {
+test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: regression guard -- entries 0-3 (enigoo.cz, Kino Art, Ticketmaster CZ, Entradio) are unchanged and the array length is 8 (updated quick-261028-h1n)', () => {
   const portals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
-  assert.equal(portals.length, 7);
+  assert.equal(portals.length, 8);
   assert.deepEqual(portals[0], { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[1], { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[2], { identifyingEmail: 'noreply@ticketmaster.cz', calendarId: null, insertPdfIntoEvent: false });
@@ -4635,8 +4642,8 @@ test('quick-261005-orv: pin -- parseIcs(REAL_TICKETPORTAL_CZ_ICS_TEXT) returns e
   assert.strictEqual(events[0].summary, 'HELENA Forever  19.10.2026 19:00');
 });
 
-test('quick-261005-orv: TICKET_ICS_MODE_SENDERS deepEquals [vstupenky@ticketportal.cz], and that sender is absent from both the text and body parser registries (D-02)', () => {
-  assert.deepEqual(TICKET_ICS_MODE_SENDERS, ['vstupenky@ticketportal.cz']);
+test('quick-261005-orv: TICKET_ICS_MODE_SENDERS deepEquals [vstupenky@ticketportal.cz, automat@webticket.cz], and that sender is absent from both the text and body parser registries (D-02) (updated quick-261028-h1n)', () => {
+  assert.deepEqual(TICKET_ICS_MODE_SENDERS, ['vstupenky@ticketportal.cz', 'automat@webticket.cz']);
   assert.equal(Object.prototype.hasOwnProperty.call(TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL, 'vstupenky@ticketportal.cz'), false);
   assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL, 'vstupenky@ticketportal.cz'), false);
 });
@@ -5646,4 +5653,512 @@ test('quick-261026-ma6: ticketingHtmlToPlainText entity decoding (amp decoded LA
   assert.equal(ticketingHtmlToPlainText('<style>.x{color:red}</style><p>Visible</p>').indexOf('color'), -1);
   assert.equal(ticketingHtmlToPlainText('<script>var x=1;</script><p>Visible</p>').indexOf('var x'), -1);
   assert.equal(ticketingHtmlToPlainText('<img src="x.png" alt="Hidden Alt" /><p>Visible</p>').indexOf('Hidden Alt'), -1);
+});
+
+// =============================================================================
+// quick-261028-h1n: WebTicket.cz, the EIGHTH portal, the SECOND ICS-SOURCED
+// one
+// =============================================================================
+//
+// MIME FACTS (decoded by the planner from the real sample
+// "WebTicket prodej #3064785 / kal:00795453 [emoji].eml"):
+//   multipart/mixed
+//     multipart/alternative
+//       text/plain; charset=UTF-8, quoted-printable, 1516 bytes. NON-EMPTY,
+//       but the event name/date line is rendered in ALL CAPS
+//       ("PO 28. 12. 2026 19:00 - BIOGRAF LÁSKA 2: NOVÝ PŘÍBĚH"). Correct
+//       Czech casing cannot be reconstructed from all-caps.
+//       text/html; charset=UTF-8, quoted-printable, 3391 bytes. Proper case.
+//     application/pdf; name=webticket_3064785.pdf, plain ASCII filename, ONE
+//     PDF.
+//     text/calendar; name=wt0.ics -- a GENUINE .ics attachment, carrying the
+//     proper-case SUMMARY, the venue LOCATION and an exact UTC DTSTART.
+//   From: "WebTicket.cz" <automat@webticket.cz>, X-Mailer "WebTicket Mailer".
+//   DKIM/SPF pass, DMARC p=NONE sp=QUARANTINE.
+//   Subject (decoded): "WebTicket prodej #3064785 / kal:00795453 [emoji]".
+//
+// WHY ICS-SOURCED, NOT BODY-SOURCED (D-01): the all-caps plain-text name
+// cannot supply the proper-case event name, and that name shares a line with
+// the date. The .ics carries BOTH the proper-case SUMMARY and the exact UTC
+// DTSTART, which ticketInstantToWallClockComponents already converts
+// correctly -- exactly the situation Ticketportal.cz's ICS mode was built
+// for. A new body-text parser (parseWebticketOrderText, Task 2) still
+// supplies the description/dedup-fallback enrichment, but never the core
+// event fields.
+//
+// THE UID IS MINTED PER SENT EMAIL (D-05): the real .ics UID
+// "6ae1ca363e827" is a PHP uniqid() whose 8-hex-digit seconds prefix
+// (6ae1ca36 = 1793182262) equals the DKIM signature's own `t=1793182262`
+// timestamp. A re-sent confirmation would carry a fresh UID, so dedup is
+// keyed on the WebTicket ORDER NUMBER (from the ticket PDF's filename, see
+// extractWebticketOrderNumberFromPdfName below) instead -- NEVER the UID,
+// and NEVER the venue-scoped "kal:" number printed alongside it.
+//
+// FIXTURE PROVENANCE (D-11): every value below is the real, decoded value.
+// The ONLY substitution is the order-status/wallet URL's 8-character access
+// key, replaced by the shape-identical FICTIONAL "A1B2C3D4" (3 occurrences)
+// -- push-public.bat copies test/*.test.js into the PUBLIC repo, and that
+// URL opens the order page and its Google/Apple Wallet passes. The ticket
+// PDF is represented ONLY by a ticketportalCzFakeAttachment name and
+// content-type; neither its bytes nor its entry barcode ever enter the
+// repo.
+
+// REAL_WEBTICKET_PLAIN_BODY_LINES -- generated mechanically from the
+// decoded text/plain part. Every leading tab, leading space and trailing
+// space is real. The ONLY change is the access-key substitution above.
+// Joining with '\n' reproduces the decoded part byte-for-byte (with that
+// substitution).
+const REAL_WEBTICKET_PLAIN_BODY_LINES = [
+  ' ',
+  '',
+  '\t\t [WEBTICKET] ',
+  '\t\t ZAKÁZKA #3064785',
+  'kal:00795453 ',
+  '',
+  ' Děkujeme za Váš nákup, zakázka byla uhrazena.',
+  '',
+  'Upozorňujeme, že dle obchodních podmínek není možné zakoupené vstupenky vrátit ani',
+  'vyměnit.',
+  '',
+  'Vstupenku ve formátu PDF si můžete uložit nebo vytisknout, je v příloze tohoto emailu.',
+  '',
+  'Aktuální stav této zakázky naleznete na serveru WebTicket, stačí kliknout na následující',
+  'odkaz:',
+  '',
+  'Zobraz zakázku [https://www.webticket.cz/wt4/zakazka/3064785/A1B2C3D4/305024]',
+  '',
+  'Na stránce zakázky si také můžete přidat vstupenku do Peněženky Google / Apple.',
+  '',
+  'Přidat do Peněženky Google [https://www.webticket.cz/wt4/zakazka/3064785/A1B2C3D4/305024#walletg]',
+  'Přidat do Peněženky Apple [https://www.webticket.cz/wt4/zakazka/3064785/A1B2C3D4/305024#walleta]',
+  '',
+  'ZAKÁZKA #3064785 / KAL:00795453',
+  '',
+  'PO 28. 12. 2026 19:00 - BIOGRAF LÁSKA 2: NOVÝ PŘÍBĚH',
+  ' Divadlo Kalich, Jungmannova 9, Praha 1 | www.divadlokalich.cz | tel: 722 922 070',
+  'Balkón, řada 2, sedadlo 19 (5. kategorie) ... 849 Kč',
+  '_1 ks, 849 Kč_ ',
+  '',
+  '\t\t Vytvořeno: 28.10.2026',
+  'Stav: prodáno',
+  'Cena: 849 Kč',
+  '',
+  '_V případě nesrovnalostí neprodleně kontaktujte administrátora nebo technickou podporu serveru',
+  'WebTicket._ ',
+  '',
+  '\t\t PROVOZOVATEL:',
+  '',
+  'WebTicket provozuje firma',
+  'ComNet, s.r.o.',
+  'U Uranie 44/3, 170 00 Praha 7',
+  'Copyright © 2005–2025 ',
+  '\t\t KONTAKTY:',
+  '',
+  'Ing. Jiří Duchek',
+  'administrátor serveru',
+  'e-mail: info@webticket.cz',
+  'tel: +420 777 578 326 ',
+  '',
+  'Jiří Frišauf',
+  'vývoj, technická podpora',
+  'e-mail: info@webticket.cz',
+  'tel: +420 776 197 915 ',
+  '',
+  ' ',
+];
+const REAL_WEBTICKET_PLAIN_BODY_TEXT = REAL_WEBTICKET_PLAIN_BODY_LINES.join('\n');
+
+// REAL_WEBTICKET_ICS_LINES -- the real decoded wt0.ics attachment, verbatim.
+const REAL_WEBTICKET_ICS_LINES = [
+  'BEGIN:VCALENDAR',
+  'VERSION:2.0',
+  'PRODID:-//WebTicket//NONSGML v1.0//EN',
+  'BEGIN:VEVENT',
+  'UID:6ae1ca363e827',
+  'DTSTAMP:20261028T101102Z',
+  'DTSTART:20261228T180000Z',
+  'DTEND:20261228T180000Z',
+  'SUMMARY:Biograf láska 2: Nový příběh',
+  'LOCATION:Divadlo Kalich, Jungmannova 9, Praha 1 | www.divadlokalich.cz | tel: 722 922 070',
+  'END:VEVENT',
+  'END:VCALENDAR',
+];
+const REAL_WEBTICKET_ICS_TEXT = REAL_WEBTICKET_ICS_LINES.join('\r\n') + '\r\n';
+
+const REAL_WEBTICKET_FROM_HEADER = '"WebTicket.cz" <automat@webticket.cz>';
+const REAL_WEBTICKET_SUBJECT = 'WebTicket prodej #3064785 / kal:00795453 \u{1F3AB}';
+const WEBTICKET_TICKET_PDF_NAME = 'webticket_3064785.pdf';
+const WEBTICKET_ICS_ATTACHMENT_NAME = 'wt0.ics';
+const REAL_WEBTICKET_RECEIVED_DATE = new Date(Date.UTC(2026, 9, 28, 10, 11, 2));
+
+// webticketRealShapedMessage -- real MIME attachment order: PDF first, then
+// the .ics. `overrides` may replace `attachments` and/or `plainBody`.
+function webticketRealShapedMessage(overrides) {
+  const opts = overrides || {};
+  const attachments = opts.attachments || [
+    ticketportalCzFakeAttachment(WEBTICKET_TICKET_PDF_NAME, 'application/pdf'),
+    ticketportalCzFakeAttachment(WEBTICKET_ICS_ATTACHMENT_NAME, 'text/calendar', REAL_WEBTICKET_ICS_TEXT),
+  ];
+  const plainBody = Object.prototype.hasOwnProperty.call(opts, 'plainBody') ? opts.plainBody : REAL_WEBTICKET_PLAIN_BODY_TEXT;
+
+  return fakeMessage(REAL_WEBTICKET_FROM_HEADER, attachments, plainBody, REAL_WEBTICKET_RECEIVED_DATE, REAL_WEBTICKET_SUBJECT);
+}
+
+// EXPECTED_WEBTICKET_DESCRIPTION (quick-261028-h1n Task 2, D-08) -- the
+// description buildWebticketParsedTicket's body enrichment builds from the
+// real plain body: eventName, the FULL trimmed LOCATION, the seat line, and
+// the "Zakázka #.../kal:..." + "Cena: ..." order lines, each paragraph
+// joined by '\n\n'.
+const EXPECTED_WEBTICKET_DESCRIPTION =
+  'Biograf láska 2: Nový příběh\n\nDivadlo Kalich, Jungmannova 9, Praha 1 | www.divadlokalich.cz | tel: 722 922 070\n\nBalkón, řada 2, sedadlo 19 (5. kategorie) ... 849 Kč\n\nZakázka #3064785 / kal:00795453\nCena: 849 Kč';
+
+const EXPECTED_WEBTICKET_RESOURCE = {
+  summary: 'Biograf láska 2: Nový příběh',
+  location: 'Divadlo Kalich, Jungmannova 9, Praha 1',
+  start: { dateTime: '2026-12-28T19:00:00', timeZone: 'Europe/Prague' },
+  end: { dateTime: '2026-12-28T21:00:00', timeZone: 'Europe/Prague' },
+  description: EXPECTED_WEBTICKET_DESCRIPTION,
+  extendedProperties: { private: { ticketIdentifier: '3064785' } },
+  attachments: [
+    {
+      fileId: 'FILE_1',
+      fileUrl: 'https://drive.example/FILE_1',
+      title: 'Biograf láska 2- Nový příběh - 2026-12-28 - 3064785.pdf',
+      mimeType: 'application/pdf',
+    },
+  ],
+};
+
+// WEBTICKET_DERIVED_HTML_RENDERING_LINES (Task 2; DERIVED) -- the first 19
+// lines of ticketingHtmlToPlainText's own rendering of the real HTML part,
+// captured by the planner. The real HTML part itself is not committed; this
+// stands for the body source ticketingMessageBodyText would hand over if
+// Gmail ever returned a blank plain body for this sender.
+const WEBTICKET_DERIVED_HTML_RENDERING_LINES = [
+  'zakázka #3064785',
+  'kal:00795453',
+  'Děkujeme za Váš nákup, zakázka byla uhrazena.',
+  'Upozorňujeme, že dle obchodních podmínek není možné zakoupené vstupenky vrátit ani vyměnit.',
+  'Vstupenku ve formátu PDF si můžete uložit nebo vytisknout, je v příloze tohoto emailu.',
+  'Aktuální stav této zakázky naleznete na serveru WebTicket, stačí kliknout na následující odkaz:',
+  'Zobraz zakázku',
+  'Na stránce zakázky si také můžete přidat vstupenku do Peněženky Google / Apple.',
+  'Přidat do Peněženky Google',
+  'Přidat do Peněženky Apple',
+  'Zakázka #3064785 / kal:00795453',
+  'Po 28. 12. 2026 19:00 - Biograf láska 2: Nový příběh',
+  'Divadlo Kalich, Jungmannova 9, Praha 1 | www.divadlokalich.cz | tel: 722 922 070',
+  'Balkón, řada 2, sedadlo 19 (5. kategorie) ... 849 Kč',
+  '1 ks, 849 Kč',
+  'Vytvořeno: 28.10.2026',
+  'Stav: prodáno',
+  'Cena: 849 Kč',
+  'V případě nesrovnalostí neprodleně kontaktujte administrátora nebo technickou podporu serveru WebTicket.',
+];
+
+// WEBTICKET_DERIVED_ICS_LATER_DTEND_TEXT / _EMPTY_SUMMARY_TEXT (Task 2;
+// DERIVED from REAL_WEBTICKET_ICS_TEXT) -- the real .ics with exactly one
+// field changed each.
+const WEBTICKET_DERIVED_ICS_LATER_DTEND_TEXT = REAL_WEBTICKET_ICS_TEXT.replace('DTEND:20261228T180000Z', 'DTEND:20261228T203000Z');
+const WEBTICKET_DERIVED_ICS_EMPTY_SUMMARY_TEXT = REAL_WEBTICKET_ICS_TEXT.replace('SUMMARY:Biograf láska 2: Nový příběh', 'SUMMARY:');
+
+// WEBTICKET_DERIVED_TWO_SEAT_PLAIN_BODY_TEXT (Task 2; DERIVED, built by
+// mapping REAL_WEBTICKET_PLAIN_BODY_LINES) -- a second seat line added
+// right after the real one, and the ks-count/total-price lines updated to
+// match a 2-seat purchase.
+const WEBTICKET_DERIVED_TWO_SEAT_PLAIN_BODY_LINES = [];
+REAL_WEBTICKET_PLAIN_BODY_LINES.forEach(function (line) {
+  if (line === 'Balkón, řada 2, sedadlo 19 (5. kategorie) ... 849 Kč') {
+    WEBTICKET_DERIVED_TWO_SEAT_PLAIN_BODY_LINES.push(line, 'Balkón, řada 2, sedadlo 20 (5. kategorie) ... 849 Kč');
+  } else if (line === '_1 ks, 849 Kč_ ') {
+    WEBTICKET_DERIVED_TWO_SEAT_PLAIN_BODY_LINES.push('_2 ks, 1 698 Kč_ ');
+  } else if (line === 'Cena: 849 Kč') {
+    WEBTICKET_DERIVED_TWO_SEAT_PLAIN_BODY_LINES.push('Cena: 1 698 Kč');
+  } else {
+    WEBTICKET_DERIVED_TWO_SEAT_PLAIN_BODY_LINES.push(line);
+  }
+});
+const WEBTICKET_DERIVED_TWO_SEAT_PLAIN_BODY_TEXT = WEBTICKET_DERIVED_TWO_SEAT_PLAIN_BODY_LINES.join('\n');
+
+test('quick-261028-h1n: TICKETING_PORTALS_ACTION.run on the real-shaped WebTicket.cz message gives exactly ONE insert, the exact resource (incl. description), the renamed attached PDF and the ticketIdentifier=3064785 dedup query, with the .ics UID nowhere in the resource (D-01, D-03, D-04, D-05, D-06, D-07, D-08)', () => {
+  const message = webticketRealShapedMessage();
+  const thread = ticketportalCzOneMessageThread(message);
+
+  assert.equal(TICKETING_PORTALS_ACTION.appliesTo(thread), true);
+
+  const jobs = resolveTicketProcessingJobs([message], TICKETING_PORTALS_ACTION.config.ticketingPortals);
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'ics');
+  assert.strictEqual(jobs[0].message, message);
+  assert.equal(jobs[0].portal.identifyingEmail, 'automat@webticket.cz');
+
+  withTicketportalCzIcsRunGlobals(function (calls) {
+    const listCalls = [];
+    const previousList = global.Calendar.Events.list;
+    global.Calendar.Events.list = function (calendarId, params) {
+      listCalls.push({ calendarId: calendarId, params: params });
+      return previousList(calendarId, params);
+    };
+
+    TICKETING_PORTALS_ACTION.run(thread);
+
+    assert.equal(calls.inserted.length, 1);
+    const insertCall = calls.inserted[0];
+    assert.equal(insertCall.calendarId, 'DEFAULT_CAL');
+    assert.deepEqual(insertCall.resource, EXPECTED_WEBTICKET_RESOURCE);
+    assert.deepEqual(insertCall.optionalArgs, { supportsAttachments: true });
+    assert.equal(calls.created.length, 1);
+    assert.equal(calls.created[0].name, EXPECTED_WEBTICKET_RESOURCE.attachments[0].title);
+    assert.equal(calls.fetched.length, 0);
+
+    assert.equal(listCalls.length, 1);
+    assert.equal(listCalls[0].params.privateExtendedProperty, 'ticketIdentifier=3064785');
+
+    assert.equal(JSON.stringify(insertCall.resource).indexOf('6ae1ca363e827'), -1);
+  });
+});
+
+test('quick-261028-h1n: pin -- parseIcs(REAL_WEBTICKET_ICS_TEXT) returns exactly 1 event with the real quirks this whole section depends on (D-01)', () => {
+  const events = parseIcs(REAL_WEBTICKET_ICS_TEXT);
+  assert.equal(events.length, 1);
+  assert.strictEqual(events[0].uid, '6ae1ca363e827');
+  assert.strictEqual(events[0].summary, 'Biograf láska 2: Nový příběh');
+  assert.strictEqual(events[0].location, 'Divadlo Kalich, Jungmannova 9, Praha 1 | www.divadlokalich.cz | tel: 722 922 070');
+  assert.equal(events[0].start.getTime(), Date.UTC(2026, 11, 28, 18, 0, 0));
+  assert.equal(events[0].end.getTime(), Date.UTC(2026, 11, 28, 18, 0, 0));
+});
+
+test('quick-261028-h1n: buildWebticketParsedTicket (four arguments) returns the real eventName/location/wall-clock/ticketIdentifier, has no own end, and never uses the .ics UID (D-03, D-04, D-05)', () => {
+  const realEvent = parseIcs(REAL_WEBTICKET_ICS_TEXT)[0];
+  const parsed = buildWebticketParsedTicket(realEvent, 'webticket_3064785.pdf', 'Europe/Prague', intlFormatDateForTests);
+
+  assert.equal(parsed.eventName, 'Biograf láska 2: Nový příběh');
+  assert.equal(parsed.location, 'Divadlo Kalich, Jungmannova 9, Praha 1');
+  assert.equal(parsed.year, 2026);
+  assert.equal(parsed.month, 11);
+  assert.equal(parsed.day, 28);
+  assert.equal(parsed.hour, 19);
+  assert.equal(parsed.minute, 0);
+  assert.equal(parsed.ticketIdentifier, '3064785');
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, 'end'), false);
+  assert.notStrictEqual(parsed.ticketIdentifier, realEvent.uid);
+});
+
+test('quick-261028-h1n: extractWebticketOrderNumberFromPdfName reads the order number case-insensitively from the real filename, and returns null for every non-matching input (D-05)', () => {
+  assert.equal(extractWebticketOrderNumberFromPdfName('webticket_3064785.pdf'), '3064785');
+  assert.equal(extractWebticketOrderNumberFromPdfName('WEBTICKET_3064785.PDF'), '3064785');
+  assert.equal(extractWebticketOrderNumberFromPdfName('eTicket_13634244.pdf'), null);
+  assert.equal(extractWebticketOrderNumberFromPdfName('webticket.pdf'), null);
+  assert.equal(extractWebticketOrderNumberFromPdfName(null), null);
+  assert.equal(extractWebticketOrderNumberFromPdfName(undefined), null);
+  assert.equal(extractWebticketOrderNumberFromPdfName(''), null);
+});
+
+test('quick-261028-h1n: findWebticketTicketPdfAttachment finds the real ticket PDF (identity), ignores the .ics, returns null when no webticket_ PDF exists, and is registered in TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL (D-06)', () => {
+  const message = webticketRealShapedMessage();
+  assert.strictEqual(findWebticketTicketPdfAttachment(message), message.getAttachments()[0]);
+
+  const termsOnlyMessage = fakeMessage(REAL_WEBTICKET_FROM_HEADER, [ticketportalCzFakeAttachment('terms.pdf', 'application/pdf')], '', undefined, '');
+  assert.equal(findWebticketTicketPdfAttachment(termsOnlyMessage), null);
+
+  assert.strictEqual(TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL['automat@webticket.cz'], findWebticketTicketPdfAttachment);
+});
+
+test('quick-261028-h1n: TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL registers both ICS-sourced portals, its keys deepEqual TICKET_ICS_MODE_SENDERS, and automat@webticket.cz is absent from every other registry (D-02)', () => {
+  assert.strictEqual(TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL['automat@webticket.cz'], buildWebticketParsedTicket);
+  assert.strictEqual(TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL['vstupenky@ticketportal.cz'], buildTicketportalCzParsedTicket);
+  assert.deepEqual(Object.keys(TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL), TICKET_ICS_MODE_SENDERS);
+
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL, 'automat@webticket.cz'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL, 'automat@webticket.cz'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL, 'automat@webticket.cz'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL, 'automat@webticket.cz'), false);
+});
+
+test('quick-261028-h1n: TICKETING_PORTALS_ACTION.config.ticketingPortals[7] is the shipped WebTicket.cz entry, and resolveTicketingCalendarId on it returns the passed default (D-07)', () => {
+  const portals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
+  assert.deepEqual(portals[7], { identifyingEmail: 'automat@webticket.cz', calendarId: null, insertPdfIntoEvent: true });
+  assert.equal(resolveTicketingCalendarId(portals[7], 'GLOBAL_DEFAULT_CAL'), 'GLOBAL_DEFAULT_CAL');
+});
+
+// --- parseWebticketOrderText (Task 2, D-08) ----------------------------------
+
+test('quick-261028-h1n: parseWebticketOrderText extracts the order number, order reference, seat line and total price line identically from the real all-caps plain body, its CRLF variant, and the HTML rendering (D-08)', () => {
+  const expected = {
+    orderNumber: '3064785',
+    orderReference: 'kal:00795453',
+    seatLines: ['Balkón, řada 2, sedadlo 19 (5. kategorie) ... 849 Kč'],
+    totalPriceLine: 'Cena: 849 Kč',
+  };
+
+  assert.deepEqual(parseWebticketOrderText(REAL_WEBTICKET_PLAIN_BODY_TEXT), expected);
+  assert.deepEqual(parseWebticketOrderText(REAL_WEBTICKET_PLAIN_BODY_TEXT.replace(/\n/g, '\r\n')), expected);
+  assert.deepEqual(parseWebticketOrderText(WEBTICKET_DERIVED_HTML_RENDERING_LINES.join('\n')), expected);
+});
+
+test('quick-261028-h1n: parseWebticketOrderText on a two-seat derived body lists both seat lines in order and the updated total price line (D-08)', () => {
+  const parsed = parseWebticketOrderText(WEBTICKET_DERIVED_TWO_SEAT_PLAIN_BODY_TEXT);
+  assert.deepEqual(parsed.seatLines, [
+    'Balkón, řada 2, sedadlo 19 (5. kategorie) ... 849 Kč',
+    'Balkón, řada 2, sedadlo 20 (5. kategorie) ... 849 Kč',
+  ]);
+  assert.equal(parsed.totalPriceLine, 'Cena: 1 698 Kč');
+});
+
+test('quick-261028-h1n: parseWebticketOrderText never throws on null/undefined/empty/non-string input, and the order-number anchor requires the literal "#" (never matching a bare URL path segment) (D-08)', () => {
+  const empty = { orderNumber: null, orderReference: null, seatLines: [], totalPriceLine: null };
+  assert.deepEqual(parseWebticketOrderText(null), empty);
+  assert.deepEqual(parseWebticketOrderText(undefined), empty);
+  assert.deepEqual(parseWebticketOrderText(''), empty);
+  assert.deepEqual(parseWebticketOrderText(42), empty);
+
+  const urlOnlyText = 'Zobraz zakázku [https://www.webticket.cz/wt4/zakazka/3064785/A1B2C3D4/305024]';
+  assert.equal(parseWebticketOrderText(urlOnlyText).orderNumber, null);
+});
+
+// --- buildWebticketParsedTicket, five arguments (Task 2, D-08) --------------
+
+test('quick-261028-h1n: buildWebticketParsedTicket (five arguments) with the real .ics, PDF filename and plain body deepEquals the full expected ticket, with the identical description from the HTML-derived body too (D-03, D-04, D-05, D-08)', () => {
+  const realEvent = parseIcs(REAL_WEBTICKET_ICS_TEXT)[0];
+
+  const parsed = buildWebticketParsedTicket(realEvent, 'webticket_3064785.pdf', 'Europe/Prague', intlFormatDateForTests, REAL_WEBTICKET_PLAIN_BODY_TEXT);
+  assert.deepEqual(parsed, {
+    eventName: 'Biograf láska 2: Nový příběh',
+    location: 'Divadlo Kalich, Jungmannova 9, Praha 1',
+    year: 2026,
+    month: 11,
+    day: 28,
+    hour: 19,
+    minute: 0,
+    ticketIdentifier: '3064785',
+    description: EXPECTED_WEBTICKET_DESCRIPTION,
+  });
+
+  const parsedFromHtmlRendering = buildWebticketParsedTicket(
+    realEvent,
+    'webticket_3064785.pdf',
+    'Europe/Prague',
+    intlFormatDateForTests,
+    WEBTICKET_DERIVED_HTML_RENDERING_LINES.join('\n')
+  );
+  assert.equal(parsedFromHtmlRendering.description, EXPECTED_WEBTICKET_DESCRIPTION);
+});
+
+test('quick-261028-h1n: buildWebticketParsedTicket falls back to the body order number when no PDF name is given, and still builds the two-paragraph description when the body is also empty (D-05, D-08)', () => {
+  const realEvent = parseIcs(REAL_WEBTICKET_ICS_TEXT)[0];
+
+  const withBodyFallback = buildWebticketParsedTicket(realEvent, null, 'Europe/Prague', intlFormatDateForTests, REAL_WEBTICKET_PLAIN_BODY_TEXT);
+  assert.equal(withBodyFallback.ticketIdentifier, '3064785');
+  assert.equal(withBodyFallback.description, EXPECTED_WEBTICKET_DESCRIPTION);
+
+  const withNoBodyAtAll = buildWebticketParsedTicket(realEvent, null, 'Europe/Prague', intlFormatDateForTests, '');
+  assert.equal(withNoBodyAtAll.ticketIdentifier, null);
+  assert.equal(
+    withNoBodyAtAll.description,
+    'Biograf láska 2: Nový příběh\n\nDivadlo Kalich, Jungmannova 9, Praha 1 | www.divadlokalich.cz | tel: 722 922 070'
+  );
+});
+
+test('quick-261028-h1n: buildWebticketParsedTicket honors a later DTEND as a real end, and throws naming WebTicket.cz on an empty .ics SUMMARY (D-03)', () => {
+  const laterEndEvent = parseIcs(WEBTICKET_DERIVED_ICS_LATER_DTEND_TEXT)[0];
+  const parsedWithLaterEnd = buildWebticketParsedTicket(laterEndEvent, 'webticket_3064785.pdf', 'Europe/Prague', intlFormatDateForTests, REAL_WEBTICKET_PLAIN_BODY_TEXT);
+  assert.deepEqual(parsedWithLaterEnd.end, { year: 2026, month: 11, day: 28, hour: 21, minute: 30 });
+
+  const emptySummaryEvent = parseIcs(WEBTICKET_DERIVED_ICS_EMPTY_SUMMARY_TEXT)[0];
+  assert.throws(
+    function () {
+      buildWebticketParsedTicket(emptySummaryEvent, 'webticket_3064785.pdf', 'Europe/Prague', intlFormatDateForTests, REAL_WEBTICKET_PLAIN_BODY_TEXT);
+    },
+    /WebTicket\.cz/
+  );
+});
+
+test('quick-261028-h1n: Ticketportal.cz REGRESSION -- buildTicketportalCzParsedTicket still ignores a fifth bodyText argument and deepEquals its existing quick-261005-orv expected object, unchanged (D-02)', () => {
+  const realTicketportalEvent = parseIcs(REAL_TICKETPORTAL_CZ_ICS_TEXT)[0];
+  const parsed = buildTicketportalCzParsedTicket(realTicketportalEvent, 'eTicket_13634244.pdf', 'Europe/Prague', intlFormatDateForTests, 'any body text');
+
+  assert.deepEqual(parsed, {
+    eventName: 'HELENA Forever',
+    location: 'BOBYHALL, Sportovní 559/2A, Brno',
+    year: 2026,
+    month: 9,
+    day: 19,
+    hour: 19,
+    minute: 0,
+    end: { year: 2026, month: 9, day: 19, hour: 21, minute: 30 },
+    ticketIdentifier: '13634244',
+  });
+});
+
+// --- processTicketFromIcsAttachment, WebTicket.cz enrichment and hardening --
+// --- (Task 2) -----------------------------------------------------------------
+
+test('quick-261028-h1n: processTicketFromIcsAttachment with insertPdfIntoEvent false still tags ticketIdentifier and builds the description, but creates no attachment and no Drive copy (D-08)', () => {
+  withTicketportalCzIcsRunGlobals(function (calls) {
+    const message = webticketRealShapedMessage();
+    processTicketFromIcsAttachment(message, { identifyingEmail: 'automat@webticket.cz', calendarId: 'WT_CAL', insertPdfIntoEvent: false });
+
+    assert.equal(calls.inserted.length, 1);
+    const insertCall = calls.inserted[0];
+    assert.equal(insertCall.calendarId, 'WT_CAL');
+    assert.equal(Object.prototype.hasOwnProperty.call(insertCall.resource, 'attachments'), false);
+    assert.equal(calls.created.length, 0);
+    assert.equal(insertCall.resource.extendedProperties.private.ticketIdentifier, '3064785');
+    assert.equal(insertCall.resource.description, EXPECTED_WEBTICKET_DESCRIPTION);
+  });
+});
+
+test('quick-261028-h1n: a WebTicket.cz message with NO ticket PDF still gets exactly one event, deduped by the body order-number fallback (D-05, D-08)', () => {
+  withTicketportalCzIcsRunGlobals(function (calls) {
+    const noPdfMessage = webticketRealShapedMessage({
+      attachments: [ticketportalCzFakeAttachment(WEBTICKET_ICS_ATTACHMENT_NAME, 'text/calendar', REAL_WEBTICKET_ICS_TEXT)],
+    });
+    const thread = ticketportalCzOneMessageThread(noPdfMessage);
+
+    TICKETING_PORTALS_ACTION.run(thread);
+
+    assert.equal(calls.inserted.length, 1);
+    const insertCall = calls.inserted[0];
+    assert.equal(insertCall.resource.extendedProperties.private.ticketIdentifier, '3064785');
+    assert.equal(Object.prototype.hasOwnProperty.call(insertCall.resource, 'attachments'), false);
+    assert.equal(calls.created.length, 0);
+  });
+});
+
+test('quick-261028-h1n: a two-seat WebTicket.cz purchase still yields exactly ONE event, whose description lists both seat lines (D-08, one-event-per-purchase)', () => {
+  withTicketportalCzIcsRunGlobals(function (calls) {
+    const twoSeatMessage = webticketRealShapedMessage({ plainBody: WEBTICKET_DERIVED_TWO_SEAT_PLAIN_BODY_TEXT });
+    const thread = ticketportalCzOneMessageThread(twoSeatMessage);
+
+    TICKETING_PORTALS_ACTION.run(thread);
+
+    assert.equal(calls.inserted.length, 1);
+    const description = calls.inserted[0].resource.description;
+    assert.match(description, /Balkón, řada 2, sedadlo 19 \(5\. kategorie\) \.\.\. 849 Kč/);
+    assert.match(description, /Balkón, řada 2, sedadlo 20 \(5\. kategorie\) \.\.\. 849 Kč/);
+  });
+});
+
+test('quick-261028-h1n: processTicketFromIcsAttachment -- when the spy list returns an existing tagged event, there are 0 inserts and 0 Drive copies for WebTicket.cz too (D-07)', () => {
+  withTicketportalCzIcsRunGlobals(function (calls) {
+    global.Calendar.Events.list = function () {
+      return { items: [{ id: 'existing-event' }] };
+    };
+
+    const message = webticketRealShapedMessage();
+    processTicketFromIcsAttachment(message, { identifyingEmail: 'automat@webticket.cz', calendarId: null, insertPdfIntoEvent: true });
+
+    assert.equal(calls.inserted.length, 0);
+    assert.equal(calls.created.length, 0);
+  });
+});
+
+test('quick-261028-h1n: a WebTicket.cz message carrying only the ticket PDF and the real body (no .ics) yields zero jobs, and appliesTo is false (D-09)', () => {
+  const noIcsMessage = webticketRealShapedMessage({ attachments: [ticketportalCzFakeAttachment(WEBTICKET_TICKET_PDF_NAME, 'application/pdf')] });
+
+  const jobs = resolveTicketProcessingJobs([noIcsMessage], TICKETING_PORTALS_ACTION.config.ticketingPortals);
+  assert.equal(jobs.length, 0);
+
+  const thread = ticketportalCzOneMessageThread(noIcsMessage);
+  assert.equal(TICKETING_PORTALS_ACTION.appliesTo(thread), false);
 });

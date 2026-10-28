@@ -8,7 +8,7 @@ Five actions ship today:
 
 - **ICS-to-Calendar import** — any sender, generic `.ics` calendar attachments
 - **Booking.com reservation management** — booking.com
-- **Ticketing-portal import** — enigoo.cz, Kino Art (kinoart.cz), Ticketmaster CZ (ticketmaster.cz), Entradio (app.entradio.cz), Fever (feverup.com), Ticketportal.cz (ticketportal.cz), smsticket (smsticket.cz)
+- **Ticketing-portal import** — enigoo.cz, Kino Art (kinoart.cz), Ticketmaster CZ (ticketmaster.cz), Entradio (app.entradio.cz), Fever (feverup.com), Ticketportal.cz (ticketportal.cz), smsticket (smsticket.cz), WebTicket (webticket.cz)
 - **Transport ticket import** — RegioJet (regiojet.cz), IDOS.cz (idos.svt.cz)
 - **Meetings** — body-sourced meeting invites with no `.ics` attachment, matched by sender domain; Teamio (teamio.com) ships first
 
@@ -34,10 +34,11 @@ in addition to processed, so nothing is lost silently.
 - **Ticketing-portal import** — for a configured portal (identified by its
   confirmation email's sender address), extracts the event name, date/time,
   and venue either from the attached PDF ticket via Google Drive's
-  PDF-to-Docs OCR conversion (Apps Script has no native PDF text parser) or
+  PDF-to-Docs OCR conversion (Apps Script has no native PDF text parser),
   straight from the email body (its plain-text part, or for portals whose
-  plain-text part is empty a plain-text rendering of its HTML), depending
-  on where that portal actually puts the data. Either way it creates one
+  plain-text part is empty a plain-text rendering of its HTML), or from the
+  confirmation's own `.ics` attachment, depending on where that portal
+  actually puts the data. Either way it creates one
   calendar event per purchase regardless of how many tickets it contains,
   and can optionally attach the original ticket PDF to the event. See
   [Ticketing portals](#ticketing-portals).
@@ -241,6 +242,7 @@ only the extraction differs.
 | Fever (feverup.com) | body | the plain-text email body (event name from the subject line) |
 | Ticketportal.cz (ticketportal.cz) | ics | the confirmation's own `.ics` attachment |
 | smsticket (smsticket.cz) | body | the email's HTML body (its plain-text part is empty; event name from the subject line) |
+| WebTicket (webticket.cz) | ics | the confirmation's own `.ics` attachment (seat, price and order details from the email body) |
 
 A portal is assigned a mode implicitly, by which parser registry its sender
 address is registered in — there is no `mode` config field here (unlike the
@@ -345,6 +347,22 @@ own filename (the order number), deliberately **not** from the `.ics`'s own
 `UID` — that UID identifies the performance/showing, not the individual
 order, and two different real orders for the same show would otherwise be
 wrongly treated as duplicates of each other.
+
+**WebTicket.cz** (`automat@webticket.cz`) is worth calling out: its
+plain-text part writes the event name in capitals, while its `.ics` keeps
+the real casing, which is why it is an ics-mode portal. Its `.ics` gives an
+exact start time but an end equal to the start, so the 2-hour default
+applies. The event's location is the venue's address part, and the full
+venue line (website and phone) goes in the description, along with each
+seat and its price and the order reference ("Zakázka #..." plus the
+venue's own number). Dedup is keyed on the WebTicket order number from the
+ticket PDF's filename, falling back to the order number in the body. It is
+never the `.ics` UID, which WebTicket mints fresh for every email it
+sends. WebTicket sells on behalf of many venues, so the one sender address
+covers them all. The ticket PDF is attached by default (`insertPdfIntoEvent`
+shipped on), since it also supplies the dedup identifier. Before this
+version, WebTicket's `.ics` was picked up by the generic ICS import as a
+zero-length event. Configuring the portal hands it to this action instead.
 
 **No `excludeFrom` entry needed.** Unlike an `'ics'`-mode transport-tickets
 carrier (see [Transport tickets](#transport-tickets)), a ticketing-portals
