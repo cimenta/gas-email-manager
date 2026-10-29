@@ -8,7 +8,7 @@ Five actions ship today:
 
 - **ICS-to-Calendar import** — any sender, generic `.ics` calendar attachments
 - **Booking.com reservation management** — booking.com
-- **Ticketing-portal import** — enigoo.cz, Kino Art (kinoart.cz), Ticketmaster CZ (ticketmaster.cz), Entradio (app.entradio.cz), Fever (feverup.com), Ticketportal.cz (ticketportal.cz), smsticket (smsticket.cz), WebTicket (webticket.cz)
+- **Ticketing-portal import** — enigoo.cz, Kino Art (kinoart.cz), Ticketmaster CZ (ticketmaster.cz), Entradio (app.entradio.cz), Fever (feverup.com), Ticketportal.cz (ticketportal.cz), smsticket (smsticket.cz), WebTicket (webticket.cz), GoOut (goout.net)
 - **Transport ticket import** — RegioJet (regiojet.cz), IDOS.cz (idos.svt.cz)
 - **Meetings** — body-sourced meeting invites with no `.ics` attachment, matched by sender domain; Teamio (teamio.com) ships first
 
@@ -35,12 +35,14 @@ in addition to processed, so nothing is lost silently.
   confirmation email's sender address), extracts the event name, date/time,
   and venue either from the attached PDF ticket via Google Drive's
   PDF-to-Docs OCR conversion (Apps Script has no native PDF text parser),
-  straight from the email body (its plain-text part, or for portals whose
-  plain-text part is empty a plain-text rendering of its HTML), or from the
-  confirmation's own `.ics` attachment, depending on where that portal
-  actually puts the data. Either way it creates one
-  calendar event per purchase regardless of how many tickets it contains,
-  and can optionally attach the original ticket PDF to the event. See
+  straight from the email body (its plain-text part; for portals whose
+  plain-text part is empty, a plain-text rendering of its HTML; or the
+  machine-readable schema.org reservation markup some portals embed in
+  their HTML), or from the confirmation's own `.ics` attachment,
+  depending on where that portal actually puts the data. Either way it
+  creates one calendar event per purchase regardless of how many tickets
+  it contains, and can optionally attach the original ticket PDF to the
+  event. See
   [Ticketing portals](#ticketing-portals).
 - **Transport ticket import (train/bus)** — for a configured carrier
   (identified by its confirmation email's sender address), builds the
@@ -243,6 +245,7 @@ only the extraction differs.
 | Ticketportal.cz (ticketportal.cz) | ics | the confirmation's own `.ics` attachment |
 | smsticket (smsticket.cz) | body | the email's HTML body (its plain-text part is empty; event name from the subject line) |
 | WebTicket (webticket.cz) | ics | the confirmation's own `.ics` attachment (seat, price and order details from the email body) |
+| GoOut (goout.net) | body | the schema.org reservation markup embedded in the email's HTML (exact start time; end time, section and price from the visible HTML) |
 
 A portal is assigned a mode implicitly, by which parser registry its sender
 address is registered in — there is no `mode` config field here (unlike the
@@ -274,10 +277,13 @@ no native PDF text parser, this mode:
 Other portals put everything in the email body itself. This mode reads
 `message.getPlainBody()` and never touches Drive or OCR at all — no temp
 folder, no Doc conversion. When that comes back blank, the action renders
-the HTML body to plain text itself and parses that instead. If that
-portal's `insertPdfIntoEvent` is on and it has a ticket PDF worth keeping,
-the PDF is moved straight into your permanent Drive folder and attached;
-there is nothing to clean up otherwise, because nothing was ever uploaded.
+the HTML body to plain text itself and parses that instead. A portal
+whose HTML carries schema.org reservation markup (GoOut) is read from
+the raw HTML instead, because any plain-text rendering throws that
+markup away. If that portal's `insertPdfIntoEvent` is on and it has a
+ticket PDF worth keeping, the PDF is moved straight into your permanent
+Drive folder and attached; there is nothing to clean up otherwise,
+because nothing was ever uploaded.
 
 Each body-mode portal anchors on literal markers that actually appear in its
 own emails, never on line positions — email-to-plain-text rendering reflows
@@ -308,6 +314,28 @@ from the same address, so a content detector admits a message only when it
 carries both an event date and at least one entry code. The single PDF
 holding every ticket of the purchase can be attached when
 `insertPdfIntoEvent` is on (shipped off).
+
+**GoOut** (`info@mg.goout.net`) is worth calling out: its confirmation
+has no plain-text part at all. Instead of parsing rendered text, the
+action reads the machine-readable schema.org reservation markup GoOut
+embeds in the HTML for Gmail: one block per ticket, carrying the event
+name, an exact start time including its UTC offset, and the venue's
+name and street address. The buyer's own name sits in the same markup
+and is never used. One event covers the whole order. Its end time comes
+from the visible "17:00–18:05" line only when that line agrees with
+the markup's start, otherwise the 2-hour default applies. Its
+description lists each ticket's section, price and ticket number, plus
+the order number. Dedup is keyed on the order number. GoOut also sends
+promotional mail through the same pipeline, so a content detector
+admits only mail carrying reservation markup, and never a reservation
+marked as anything other than confirmed (a cancellation never creates
+an event). The ticket PDF is recognized by the date-and-time tail of
+its filename and is never confused with the separate `receipt.pdf`. It
+is attached when `insertPdfIntoEvent` is on (shipped off). The Apple
+Wallet links in the email are never followed. Because the markup is the
+same one Gmail reads, Google Calendar's own "Events from Gmail" feature
+may add its own copy of the event. That copy is Google's, not this
+action's.
 
 **Entradio** (`no-reply@app.entradio.cz`) is worth calling out: it is a
 white-label platform many venues send through, not a venue itself, so the one

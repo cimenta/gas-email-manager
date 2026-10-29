@@ -26,7 +26,11 @@
  * alongside Ticketportal.cz, routed through a per-sender `.ics`
  * parsed-ticket builder registry
  * (TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL) in the sibling
- * action file, rather than a hardcoded single-portal call.
+ * action file, rather than a hardcoded single-portal call. Since
+ * quick-261029-pmx, a body-sourced portal (GoOut) is parsed from the
+ * schema.org reservation MICRODATA in its RAW HTML rather than any text
+ * rendering, since every text rendering strips the attributes that
+ * microdata lives in.
  */
 const TICKETING_PORTALS_ACTION_CONFIG = {
   // Cross-cutting per-action enable/disable toggle, same convention as
@@ -57,7 +61,7 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // whether it then survives in the permanent folder + becomes a real
   // Calendar attachment, or is deleted).
   //
-  // The shipped default seeds EIGHT entries: enigoo.cz (the original portal
+  // The shipped default seeds NINE entries: enigoo.cz (the original portal
   // this feature was built from, PDF/OCR-sourced — see the sibling action
   // file's parseEnigooTicketText), Kino Art (kinoart.cz, a Czech cinema,
   // added quick-260731-kar, BODY-SOURCED — see the sibling action file's
@@ -73,17 +77,20 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // added quick-261005-orv, ICS-SOURCED — see the sibling action file's
   // processTicketFromIcsAttachment), smsticket.cz (info@smsticket.cz,
   // added quick-261026-ma6, also BODY-SOURCED — see the sibling action
-  // file's parseSmsticketTicketText), and WebTicket.cz
+  // file's parseSmsticketTicketText), WebTicket.cz
   // (automat@webticket.cz, added quick-261028-h1n, ICS-SOURCED like
   // Ticketportal.cz — see the sibling action file's
-  // buildWebticketParsedTicket). The first five entries and the seventh
-  // ship with calendarId left null and insertPdfIntoEvent left false — the
-  // owner fills in the real calendar ID and decides the attachment toggle
-  // live, per entry, via rebuildScriptProperties() + Script Properties,
-  // matching the now-established settings workflow (never committed to git
-  // — same placeholder-calendar-ID convention as CONFIG.calendarId
-  // itself). The SIXTH AND EIGHTH entries (Ticketportal.cz and
-  // WebTicket.cz) ship with insertPdfIntoEvent TRUE — an owner decision,
+  // buildWebticketParsedTicket), and GoOut (info@mg.goout.net, added
+  // quick-261029-pmx, BODY-SOURCED from the schema.org EventReservation
+  // microdata in its raw HTML — see the sibling action file's
+  // parseGooutTicketHtml). The first five entries, the seventh AND THE
+  // NINTH ship with calendarId left null and insertPdfIntoEvent left
+  // false — the owner fills in the real calendar ID and decides the
+  // attachment toggle live, per entry, via rebuildScriptProperties() +
+  // Script Properties, matching the now-established settings workflow
+  // (never committed to git — same placeholder-calendar-ID convention as
+  // CONFIG.calendarId itself). The SIXTH AND EIGHTH entries (Ticketportal.cz
+  // and WebTicket.cz) ship with insertPdfIntoEvent TRUE — an owner decision,
   // not a placeholder: both portals' ticket PDFs also supply the dedup
   // ticketIdentifier (see TICKETPORTAL.CZ and WEBTICKET.CZ below), so
   // there is no reason to ship either off.
@@ -196,6 +203,31 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // isTicketingPortalSender exclusion every other TICKETING_PORTALS sender
   // already gets.
   //
+  // GOOUT (info@mg.goout.net, quick-261029-pmx): BODY-SOURCED, the NINTH
+  // portal. Its real confirmation is HTML-only (no text/plain part at
+  // all), so it is read as RAW HTML through TICKET_BODY_RAW_HTML_SENDERS
+  // in the sibling action file, never a text rendering — its event data
+  // lives entirely in schema.org EventReservation microdata attributes,
+  // which every plain-text rendering strips (D-01). A scope-aware
+  // microdata reader (ticketingReadMicrodataItems) avoids the "three
+  // itemprop=name values per block" trap (the buyer's own name sits in
+  // the same markup and is never used as the event name). The start time
+  // is exact and offset-qualified, carried verbatim into the Calendar
+  // API alongside the resolved timeZone. Dedup is keyed on the order's
+  // own reservationNumber (identical across every per-ticket block),
+  // never a per-seat ticketNumber; ONE event covers the whole order. The
+  // detector (gooutHtmlHasConfirmedReservation) is REQUIRED — GoOut is a
+  // bulk ESP (Mailgun) that markets through this same pipeline, and a
+  // cancelled reservation must never create an event. A PDF finder IS
+  // registered (findGooutTicketPdfAttachment), hard-excluding the
+  // separate receipt.pdf; insertPdfIntoEvent ships FALSE below, since the
+  // ticket PDF's filename carries no order number (no dedup reason to
+  // ship it on) — the owner decides live. The .pkpass Apple Wallet links
+  // in the body are bearer links and are never followed or fetched; no
+  // new OAuth scope is needed. Google's own "Events from Gmail" feature
+  // may add its OWN copy of the event from this same markup — that copy
+  // is Google's, not this script's, and carries no ticketIdentifier tag.
+  //
   // Script Property override: 07-action-ticketing-portals-TICKETING_PORTALS
   // (json — array of {identifyingEmail, calendarId, insertPdfIntoEvent}
   // objects).
@@ -205,7 +237,7 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // src/05-action-cfg-ics-import.js for the exact same JSON-vs-JS-object-
   // literal pitfall a real owner mistake already hit once for that other
   // JSON-typed setting):
-  // [{"identifyingEmail":"no-reply@enigoo.cz","calendarId":"abc123@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":"def456@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"noreply@ticketmaster.cz","calendarId":"ghi789@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"no-reply@app.entradio.cz","calendarId":"jkl012@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"hello@feverup.com","calendarId":"mno345@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"vstupenky@ticketportal.cz","calendarId":"pqr678@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"info@smsticket.cz","calendarId":"stu901@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"automat@webticket.cz","calendarId":"vwx234@group.calendar.google.com","insertPdfIntoEvent":true}]
+  // [{"identifyingEmail":"no-reply@enigoo.cz","calendarId":"abc123@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":"def456@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"noreply@ticketmaster.cz","calendarId":"ghi789@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"no-reply@app.entradio.cz","calendarId":"jkl012@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"hello@feverup.com","calendarId":"mno345@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"vstupenky@ticketportal.cz","calendarId":"pqr678@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"info@smsticket.cz","calendarId":"stu901@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"automat@webticket.cz","calendarId":"vwx234@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"info@mg.goout.net","calendarId":"yza567@group.calendar.google.com","insertPdfIntoEvent":false}]
   get ticketingPortals() {
     return getJsonSetting(
       '07-action-ticketing-portals-TICKETING_PORTALS',
@@ -218,6 +250,7 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
         { identifyingEmail: 'vstupenky@ticketportal.cz', calendarId: null, insertPdfIntoEvent: true },
         { identifyingEmail: 'info@smsticket.cz', calendarId: null, insertPdfIntoEvent: false },
         { identifyingEmail: 'automat@webticket.cz', calendarId: null, insertPdfIntoEvent: true },
+        { identifyingEmail: 'info@mg.goout.net', calendarId: null, insertPdfIntoEvent: false },
       ],
       isValidTicketingPortalsShape
     );

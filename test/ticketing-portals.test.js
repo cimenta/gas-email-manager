@@ -72,6 +72,17 @@ const {
   findWebticketTicketPdfAttachment,
   TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL,
   parseWebticketOrderText,
+  // quick-261029-pmx: the NINTH portal, GoOut, BODY-SOURCED from
+  // schema.org EventReservation microdata in its RAW HTML.
+  parseGooutTicketHtml,
+  gooutHtmlHasConfirmedReservation,
+  ticketingReadMicrodataItems,
+  ticketingDecodeHtmlEntities,
+  ticketingStripHtmlScriptStyleAndComments,
+  TICKET_BODY_RAW_HTML_SENDERS,
+  ticketingBodyInputForSender,
+  ticketingMessageRawHtml,
+  findGooutTicketPdfAttachment,
 } = require('../src/07-action-ticketing-portals.js');
 
 // Separately required so tests derive the real event objects from the real
@@ -1480,11 +1491,11 @@ test('TICKETING_PORTALS_ACTION_CONFIG: the shipped default seeds a THIRD entry f
   assert.equal(resolveTicketingCalendarId(thirdPortal, 'DEFAULT_CAL'), 'DEFAULT_CAL');
 });
 
-test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are still the unchanged enigoo.cz and Kino Art entries, array length is 8 (updated quick-261028-h1n)', () => {
+test('TICKETING_PORTALS_ACTION_CONFIG: regression guard -- entries 0 and 1 are still the unchanged enigoo.cz and Kino Art entries, array length is 9 (updated quick-261029-pmx)', () => {
   const { TICKETING_PORTALS_ACTION_CONFIG } = require('../src/07-action-cfg-ticketing-portals.js');
   const portals = TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals;
 
-  assert.equal(portals.length, 8);
+  assert.equal(portals.length, 9);
   assert.deepEqual(portals[0], { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[1], { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false });
 });
@@ -1854,10 +1865,10 @@ test('TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL: noreply@ticketmaster.c
   assert.strictEqual(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL['noreply@ticketmaster.cz'], ticketmasterCzTextHasOrderDetails);
 });
 
-test('TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL: has NO entry for Kino Art or Entradio -- the fix is scoped to Ticketmaster CZ (and, since quick-260921-gj0, Fever) only, the Kino Art/Entradio variants are unverified, and, since quick-261026-ma6, smsticket.cz', () => {
+test('TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL: has NO entry for Kino Art or Entradio -- the fix is scoped to Ticketmaster CZ (and, since quick-260921-gj0, Fever) only, the Kino Art/Entradio variants are unverified, and, since quick-261026-ma6, smsticket.cz, and, since quick-261029-pmx, GoOut', () => {
   assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL, 'rezervace@kinoart.cz'), false);
   assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL, 'no-reply@app.entradio.cz'), false);
-  assert.deepEqual(Object.keys(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL), ['noreply@ticketmaster.cz', 'hello@feverup.com', 'info@smsticket.cz']);
+  assert.deepEqual(Object.keys(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL), ['noreply@ticketmaster.cz', 'hello@feverup.com', 'info@smsticket.cz', 'info@mg.goout.net']);
 });
 
 test('FAIL-OPEN on a missing detector: a Kino Art message with an EMPTY body still yields exactly one "body"-mode job -- unchanged from before the fix', () => {
@@ -4273,9 +4284,9 @@ test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: the shipped default fift
   assert.equal(resolveTicketingCalendarId(portals[4], 'GLOBAL_DEFAULT_CAL'), 'GLOBAL_DEFAULT_CAL');
 });
 
-test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: regression guard -- entries 0-3 (enigoo.cz, Kino Art, Ticketmaster CZ, Entradio) are unchanged and the array length is 8 (updated quick-261028-h1n)', () => {
+test('TICKETING_PORTALS_ACTION_CONFIG.ticketingPortals: regression guard -- entries 0-3 (enigoo.cz, Kino Art, Ticketmaster CZ, Entradio) are unchanged and the array length is 9 (updated quick-261029-pmx)', () => {
   const portals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
-  assert.equal(portals.length, 8);
+  assert.equal(portals.length, 9);
   assert.deepEqual(portals[0], { identifyingEmail: 'no-reply@enigoo.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[1], { identifyingEmail: 'rezervace@kinoart.cz', calendarId: null, insertPdfIntoEvent: false });
   assert.deepEqual(portals[2], { identifyingEmail: 'noreply@ticketmaster.cz', calendarId: null, insertPdfIntoEvent: false });
@@ -6161,4 +6172,1305 @@ test('quick-261028-h1n: a WebTicket.cz message carrying only the ticket PDF and 
 
   const thread = ticketportalCzOneMessageThread(noIcsMessage);
   assert.equal(TICKETING_PORTALS_ACTION.appliesTo(thread), false);
+});
+
+// =============================================================================
+// quick-261029-pmx: GoOut, the NINTH portal, BODY-SOURCED from schema.org
+// EventReservation microdata in an HTML-only confirmation
+// =============================================================================
+//
+// MIME FACTS (from the real sample .eml, decoded by the planner):
+//   - multipart/mixed: ONE text/html part (37490 decoded chars, quoted-
+//     printable) and NO text/plain part at all (the Fever situation --
+//     unlike smsticket.cz's own empty-but-PRESENT text/plain part).
+//   - Five image/png parts named "ticket_<13 digits>.png", each with
+//     Content-Disposition: attachment (NOT inline) and a Content-ID
+//     referenced by cid: in the HTML as the per-ticket QR code --
+//     GmailMessage.getAttachments() returns them, since the disposition
+//     is "attachment".
+//   - One application/pdf: the real ticket PDF, filename
+//     "Vanocni koncert (19.12.2026 17:00 lbynb).pdf" -- a plain ASCII
+//     filename (diacritic-stripped event name, parenthesized date/time
+//     and a random lowercase token), carrying NO order number at all.
+//   - One application/pdf named "receipt.pdf" -- a purchase receipt, NOT
+//     a ticket.
+//
+// WHY THE RAW HTML (D-01): the event data lives entirely in schema.org
+// EventReservation microdata ATTRIBUTES (itemprop/content/href). Gmail's
+// own getPlainBody() of this HTML-only message, AND this file's own
+// ticketingHtmlToPlainText, both discard every tag attribute -- neither
+// preserves the microdata. So this portal's body input is
+// message.getBody() itself, via TICKET_BODY_RAW_HTML_SENDERS /
+// ticketingBodyInputForSender, never a plain-text rendering.
+//
+// THE THREE-`name`-ITEMPROP TRAP (D-02): each of the five
+// EventReservation blocks carries THREE itemprop="name" properties --
+// the buyer (Person, FIRST), the event (Event), and the venue (Place) --
+// in that DOM order. A flat /itemprop="name" content="([^"]*)"/ regex
+// therefore returns the BUYER'S OWN NAME as the event name. Extraction
+// must be scope-aware (ticketingReadMicrodataItems); the test below pins
+// that the naive regex really would grab the wrong value.
+//
+// FIXTURE PROVENANCE (D-13): this is a real-structure EXCERPT of the
+// decoded HTML body, generated mechanically by the planner from the real
+// sample. Source lines 1-42, 81-281 and 362-511 are kept; the dropped
+// regions are complete, balanced rows (the logo/nav/hero rows and the
+// promo/social-icon rows). Substitutions, applied uniformly:
+//   - the five real QR ticket numbers (each one IS the QR payload printed
+//     on its own ticket -- a LIVE entry credential for a general-
+//     admission event) become 1111111111111 through 5555555555555, in
+//     every one of their 4 places each;
+//   - the .pkpass order hash (a BEARER link's path segment) becomes 32
+//     zeros, and the five per-ticket suffixes become aaaaaaa through
+//     eeeeeee;
+//   - the buyer's real name becomes the fictional "Jan Novák" (5 places)
+//     -- a DELIBERATE DEVIATION from the brief's suggestion to keep the
+//     real name, following this suite's own Ticketmaster CZ redaction
+//     precedent (buyer name/phone redacted, see that section's own
+//     "fixture integrity" note) and the 2026-08-03 history squash
+//     recorded in COMMIT-MESSAGES.md for exactly this class of PII; the
+//     fictional name still differs from the event/venue names, so the
+//     D-02 name-trap test below stays meaningful.
+// Every U+00A0 no-break space is written as the literal 6-character
+// escape \u00A0 (8 places), which this template literal turns back into
+// a real U+00A0 at evaluation time -- never a raw no-break space typed
+// directly. No PNG or PDF bytes are committed anywhere in this repo.
+
+// quick-261029-pmx: the NINTH portal, GoOut
+const GOOUT_FIXTURE_HTML = `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>Tvé vstupenky: Vánoční koncert (Objednávka č. 45153208)</title>
+    <style type="text/css">
+        @font-face {
+            font-family: 'Dela Gothic One';
+            src: url('https://static.goout.net/fonts/DelaGothicOneRegular.ttf') format('truetype');
+            font-weight: 400;
+        }
+        body {
+            background-color: #EAE8EE;
+        }
+        * {
+            font-family: 'Public Sans', Arial, sans-serif;
+            color: #11002D;
+            -webkit-text-size-adjust:100%;
+            -ms-text-size-adjust:100%;
+        }
+    </style>
+</head>
+
+
+
+<body style="background-color: #EAE8EE;">
+<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #EAE8EE;">
+<tr>
+<td align="center">
+    <div style="display: none;">
+        <img src="https://goout.net/services/saleform/email/v1/seen?item=ticket&amp;id=45153208" width="1" height="1" alt=""/>
+    </div>
+    <table cellpadding="0" cellspacing="0" border="0">
+        <tr>
+            <td style="display:none !important; visibility:hidden; opacity:0; color:transparent; height:0; width:0; mso-hide:all; line-height:0px; font-size:0px">
+                GoOut | Tvé vstupenky: Vánoční koncert (Objednávka č. 45153208) |
+            </td>
+        </tr>
+    </table>
+    <table style="margin:0 auto; padding:0; max-width: 600px; width: 600px; line-height: 100% !important; border: none;" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+            <td style="background-color: #ffffff;">
+                <div style="text-align:center;">
+
+    <table cellpadding="0" cellspacing="0" style="margin: 0 auto 0 auto; width: 100%;">
+
+                <tr>
+                    <td style="padding: 32px 24px; text-align: center;">
+                        <div style="font-family: 'Dela Gothic One', Arial, sans-serif; font-size: 19px; color: #11002D; line-height: 26px; margin-bottom: 8px; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;">
+                            Vánoční koncert
+                        </div>
+                            <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; color: #413357; line-height: 26px;">
+                                Sobota\u00A019.\u00A012.\u00A017:00–18:05<br/>
+                                Červený kostel                            </div>
+                    </td>
+                </tr>
+
+                <tr>
+                    <td style="padding: 0 24px;">
+                        <table cellpadding="0" cellspacing="0" style="margin: 0 auto 0 auto; width: 552px; background-color: #f8f7f9; border-radius: 24px;">
+                            <tr>
+                                <td style="width: 552px;">
+                                    <table cellpadding="0" cellspacing="0" style="margin: 0 auto 0 auto; width: 552px;">
+
+                                        <tr data-id="394100965" data-index="1" data-sorted="5" data-total="5">
+                                            <td style="padding: 40px 24px; text-align: center;">
+                                                <span style="line-height: 40px; border-radius: 50%; font-size: 15px; margin: 0 auto;
+                                                             background-color: #11002D; width: 40px; height: 40px; display: block;
+                                                             color: #fff; font-family: 'Public Sans', Arial, sans-serif; font-weight: 600;">1</span>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; font-weight: 400; line-height: 26px; color: #413357; margin: 15px 0 0 0;">
+                                                            1111111111111
+                                                </div>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; font-weight: 400; line-height: 26px; color: #413357;">
+                                                    
+                                                </div>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; color: #413357; line-height: 26px;">
+                                                            Sekce C2
+                                                        
+                                                            <br>
+490\u00A0Kč                                                </div>
+                                                    <img src="cid:1111111111111"
+                                                         style="display: block; margin: 20px auto; max-width: 290px; width: auto; background-color: #fff;"/>
+                                                        <a href="https://goout.net/services/ticketmaker/passbook/00000000000000000000000000000000/aaaaaaa.pkpass"
+                                                            style="display: block; font-family: 'Dela Gothic One', Arial, sans-serif;
+                                                                    color: #11002D; font-size: 14px; margin: 15px auto; text-decoration: underline;
+                                                                    text-align: center; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;">Přidat vstupenku do Apple Wallet</a>
+                                                <br style="display: none;" data-id="1">
+                                            </td>
+                                        </tr>
+
+                                        <tr data-id="394100966" data-index="2" data-sorted="5" data-total="5">
+                                            <td style="padding: 40px 24px; text-align: center;">
+                                                <span style="line-height: 40px; border-radius: 50%; font-size: 15px; margin: 0 auto;
+                                                             background-color: #11002D; width: 40px; height: 40px; display: block;
+                                                             color: #fff; font-family: 'Public Sans', Arial, sans-serif; font-weight: 600;">2</span>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; font-weight: 400; line-height: 26px; color: #413357; margin: 15px 0 0 0;">
+                                                            2222222222222
+                                                </div>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; font-weight: 400; line-height: 26px; color: #413357;">
+                                                    
+                                                </div>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; color: #413357; line-height: 26px;">
+                                                            Sekce C2
+                                                        
+                                                            <br>
+490\u00A0Kč                                                </div>
+                                                    <img src="cid:2222222222222"
+                                                         style="display: block; margin: 20px auto; max-width: 290px; width: auto; background-color: #fff;"/>
+                                                        <a href="https://goout.net/services/ticketmaker/passbook/00000000000000000000000000000000/bbbbbbb.pkpass"
+                                                            style="display: block; font-family: 'Dela Gothic One', Arial, sans-serif;
+                                                                    color: #11002D; font-size: 14px; margin: 15px auto; text-decoration: underline;
+                                                                    text-align: center; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;">Přidat vstupenku do Apple Wallet</a>
+                                                <br style="display: none;" data-id="2">
+                                            </td>
+                                        </tr>
+
+                                        <tr data-id="394100967" data-index="3" data-sorted="5" data-total="5">
+                                            <td style="padding: 40px 24px; text-align: center;">
+                                                <span style="line-height: 40px; border-radius: 50%; font-size: 15px; margin: 0 auto;
+                                                             background-color: #11002D; width: 40px; height: 40px; display: block;
+                                                             color: #fff; font-family: 'Public Sans', Arial, sans-serif; font-weight: 600;">3</span>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; font-weight: 400; line-height: 26px; color: #413357; margin: 15px 0 0 0;">
+                                                            3333333333333
+                                                </div>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; font-weight: 400; line-height: 26px; color: #413357;">
+                                                    
+                                                </div>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; color: #413357; line-height: 26px;">
+                                                            Sekce C2
+                                                        
+                                                            <br>
+490\u00A0Kč                                                </div>
+                                                    <img src="cid:3333333333333"
+                                                         style="display: block; margin: 20px auto; max-width: 290px; width: auto; background-color: #fff;"/>
+                                                        <a href="https://goout.net/services/ticketmaker/passbook/00000000000000000000000000000000/ccccccc.pkpass"
+                                                            style="display: block; font-family: 'Dela Gothic One', Arial, sans-serif;
+                                                                    color: #11002D; font-size: 14px; margin: 15px auto; text-decoration: underline;
+                                                                    text-align: center; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;">Přidat vstupenku do Apple Wallet</a>
+                                                <br style="display: none;" data-id="3">
+                                            </td>
+                                        </tr>
+
+                                        <tr data-id="394100968" data-index="4" data-sorted="5" data-total="5">
+                                            <td style="padding: 40px 24px; text-align: center;">
+                                                <span style="line-height: 40px; border-radius: 50%; font-size: 15px; margin: 0 auto;
+                                                             background-color: #11002D; width: 40px; height: 40px; display: block;
+                                                             color: #fff; font-family: 'Public Sans', Arial, sans-serif; font-weight: 600;">4</span>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; font-weight: 400; line-height: 26px; color: #413357; margin: 15px 0 0 0;">
+                                                            4444444444444
+                                                </div>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; font-weight: 400; line-height: 26px; color: #413357;">
+                                                    
+                                                </div>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; color: #413357; line-height: 26px;">
+                                                            Sekce C2
+                                                        
+                                                            <br>
+490\u00A0Kč                                                </div>
+                                                    <img src="cid:4444444444444"
+                                                         style="display: block; margin: 20px auto; max-width: 290px; width: auto; background-color: #fff;"/>
+                                                        <a href="https://goout.net/services/ticketmaker/passbook/00000000000000000000000000000000/ddddddd.pkpass"
+                                                            style="display: block; font-family: 'Dela Gothic One', Arial, sans-serif;
+                                                                    color: #11002D; font-size: 14px; margin: 15px auto; text-decoration: underline;
+                                                                    text-align: center; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;">Přidat vstupenku do Apple Wallet</a>
+                                                <br style="display: none;" data-id="4">
+                                            </td>
+                                        </tr>
+
+                                        <tr data-id="394100969" data-index="5" data-sorted="5" data-total="5">
+                                            <td style="padding: 40px 24px; text-align: center;">
+                                                <span style="line-height: 40px; border-radius: 50%; font-size: 15px; margin: 0 auto;
+                                                             background-color: #11002D; width: 40px; height: 40px; display: block;
+                                                             color: #fff; font-family: 'Public Sans', Arial, sans-serif; font-weight: 600;">5</span>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; font-weight: 400; line-height: 26px; color: #413357; margin: 15px 0 0 0;">
+                                                            5555555555555
+                                                </div>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; font-weight: 400; line-height: 26px; color: #413357;">
+                                                    
+                                                </div>
+                                                <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; color: #413357; line-height: 26px;">
+                                                            Sekce C2
+                                                        
+                                                            <br>
+490\u00A0Kč                                                </div>
+                                                    <img src="cid:5555555555555"
+                                                         style="display: block; margin: 20px auto; max-width: 290px; width: auto; background-color: #fff;"/>
+                                                        <a href="https://goout.net/services/ticketmaker/passbook/00000000000000000000000000000000/eeeeeee.pkpass"
+                                                            style="display: block; font-family: 'Dela Gothic One', Arial, sans-serif;
+                                                                    color: #11002D; font-size: 14px; margin: 15px auto; text-decoration: underline;
+                                                                    text-align: center; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;">Přidat vstupenku do Apple Wallet</a>
+                                                <br style="display: none;" data-id="5">
+                                            </td>
+                                        </tr>
+
+                                    </table>
+                                </td>
+                            </tr>
+                        </table>
+                    </td>
+                </tr>
+    </table>
+
+    <div style="text-align: center; padding: 32px 24px 48px;">
+                <a href='https://goout.net/settings/tickets' style="-webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+        white-space: nowrap; display: block; background: #06D373; color: #ffffff;
+        margin: 0 auto; text-decoration: none; height: 48px; width: 100%; max-width: 552px;
+        line-height: 48px; font-family: 'Public Sans', Arial, sans-serif; font-size: 16px;
+        font-weight: 800; text-align: center; border-radius: 49px;">
+                        Zobrazit mé vstupenky a rezervace
+                </a>
+
+
+    </div>
+</div>
+
+            </td>
+        </tr>
+            <tr>
+                <td style="background-color: #ffffff;">
+                            <table cellpadding="0" cellspacing="0" border="0" style="width:100%; padding: 24px;">
+            <tr>
+                <td style="width: 50%; vertical-align: middle; padding: 8px 12px 8px 0;">
+                    <div style="font-family: 'Dela Gothic One', Arial, sans-serif; font-size: 19px; color: #11002D; line-height: 26px; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;">
+                        Červený kostel
+                    </div>
+                        <div style="font-family: 'Public Sans', Arial, sans-serif; font-size: 16px; color: #06D373; line-height: 26px; padding-top: 8px;">
+                            Komenského náměstí 2,<br/>Brno
+                        </div>
+                </td>
+                <td style="width: 50%; line-height: 0; padding: 8px 0 8px 12px;">
+                    <a style="line-height: 0; display: block;"
+                            href="https://www.google.com/maps/search/?api=1&amp;query=49.1978,16.6033">
+                        <img src="https://gcf.goout.net/php-maps-proxy?size=400x500&amp;center=49.1978,16.6033&amp;zoom=13"
+                             style="width:100%;display:block;border-radius: 24px;" alt="Map" title="Map"/>
+                    </a>
+                </td>
+            </tr>
+        </table>
+
+                </td>
+            </tr>
+    </table>
+        <table style="margin:0 auto; padding:0; max-width: 600px; width: 600px;" cellpadding="0" cellspacing="0" border="0">
+            <tr>
+                <td style="padding: 16px 20px; text-align: center;">
+                        <div style="text-align: center; color: #6B6B6B; margin-bottom: 20px; font-family: 'Public Sans', Arial, sans-serif; font-size: 14px; line-height: 1.5;">
+        Tento e-mail je potvrzením objednávky č. 45153208.
+        Zakoupením vstupenky zákazník souhlasí s <a href="https://terms.goout.net/?utm_source=transactional&utm_medium=email&utm_campaign=terms" style="color: #999; text-decoration: underline;">Podmínkami nákupu vstupenek</a>,
+<a href="https://terms.goout.net/article/455-zasady-pouzivani-cookies?utm_source=transactional&utm_medium=email&utm_campaign=terms" style="color: #999; text-decoration: underline;">Zásadami používání cookies</a><span style="color: #999;"> a </span>
+<a href="https://terms.goout.net/article/454-zasady-soukromi?utm_source=transactional&utm_medium=email&utm_campaign=terms" style="color: #999; text-decoration: underline;">Zásadami soukromí</a>.
+    </div>
+
+            <div itemscope itemtype="http://schema.org/EventReservation">
+                <meta itemprop="reservationNumber" content="45153208"/>
+                <link itemprop="reservationStatus" href="http://schema.org/Confirmed"/>
+                <div itemprop="underName" itemscope itemtype="http://schema.org/Person">
+                    <meta itemprop="name" content="Jan Novák"/>
+                </div>
+                <div itemprop="reservationFor" itemscope itemtype="http://schema.org/Event">
+                    <meta itemprop="name" content="Vánoční koncert"/>
+                        <meta itemprop="startDate" content="2026-12-19T17:00:00+01:00"/>
+                    <div itemprop="location" itemscope itemtype="http://schema.org/Place">
+                        <meta itemprop="name" content="Červený kostel"/>
+                        <div itemprop="address" itemscope itemtype="http://schema.org/PostalAddress">
+                            <meta itemprop="streetAddress" content="Komenského náměstí 2"/>
+                            <meta itemprop="addressLocality" content="Brno"/>
+                            <meta itemprop="addressRegion" content="CZE">
+                            <meta itemprop="postalCode" content="CZE">
+                            <meta itemprop="addressCountry" content="CZE">
+                        </div>
+                    </div>
+                </div>
+                    <meta itemprop="venueSeat" content=""/>
+                    <meta itemprop="venueRow" content=""/>
+                    <meta itemprop="venueSection" content=""/>
+                <meta itemprop="ticketToken" content="qrCode:1111111111111"/>
+                <meta itemprop="ticketNumber" content="1111111111111"/>
+            </div>
+            <div itemscope itemtype="http://schema.org/EventReservation">
+                <meta itemprop="reservationNumber" content="45153208"/>
+                <link itemprop="reservationStatus" href="http://schema.org/Confirmed"/>
+                <div itemprop="underName" itemscope itemtype="http://schema.org/Person">
+                    <meta itemprop="name" content="Jan Novák"/>
+                </div>
+                <div itemprop="reservationFor" itemscope itemtype="http://schema.org/Event">
+                    <meta itemprop="name" content="Vánoční koncert"/>
+                        <meta itemprop="startDate" content="2026-12-19T17:00:00+01:00"/>
+                    <div itemprop="location" itemscope itemtype="http://schema.org/Place">
+                        <meta itemprop="name" content="Červený kostel"/>
+                        <div itemprop="address" itemscope itemtype="http://schema.org/PostalAddress">
+                            <meta itemprop="streetAddress" content="Komenského náměstí 2"/>
+                            <meta itemprop="addressLocality" content="Brno"/>
+                            <meta itemprop="addressRegion" content="CZE">
+                            <meta itemprop="postalCode" content="CZE">
+                            <meta itemprop="addressCountry" content="CZE">
+                        </div>
+                    </div>
+                </div>
+                    <meta itemprop="venueSeat" content=""/>
+                    <meta itemprop="venueRow" content=""/>
+                    <meta itemprop="venueSection" content=""/>
+                <meta itemprop="ticketToken" content="qrCode:2222222222222"/>
+                <meta itemprop="ticketNumber" content="2222222222222"/>
+            </div>
+            <div itemscope itemtype="http://schema.org/EventReservation">
+                <meta itemprop="reservationNumber" content="45153208"/>
+                <link itemprop="reservationStatus" href="http://schema.org/Confirmed"/>
+                <div itemprop="underName" itemscope itemtype="http://schema.org/Person">
+                    <meta itemprop="name" content="Jan Novák"/>
+                </div>
+                <div itemprop="reservationFor" itemscope itemtype="http://schema.org/Event">
+                    <meta itemprop="name" content="Vánoční koncert"/>
+                        <meta itemprop="startDate" content="2026-12-19T17:00:00+01:00"/>
+                    <div itemprop="location" itemscope itemtype="http://schema.org/Place">
+                        <meta itemprop="name" content="Červený kostel"/>
+                        <div itemprop="address" itemscope itemtype="http://schema.org/PostalAddress">
+                            <meta itemprop="streetAddress" content="Komenského náměstí 2"/>
+                            <meta itemprop="addressLocality" content="Brno"/>
+                            <meta itemprop="addressRegion" content="CZE">
+                            <meta itemprop="postalCode" content="CZE">
+                            <meta itemprop="addressCountry" content="CZE">
+                        </div>
+                    </div>
+                </div>
+                    <meta itemprop="venueSeat" content=""/>
+                    <meta itemprop="venueRow" content=""/>
+                    <meta itemprop="venueSection" content=""/>
+                <meta itemprop="ticketToken" content="qrCode:3333333333333"/>
+                <meta itemprop="ticketNumber" content="3333333333333"/>
+            </div>
+            <div itemscope itemtype="http://schema.org/EventReservation">
+                <meta itemprop="reservationNumber" content="45153208"/>
+                <link itemprop="reservationStatus" href="http://schema.org/Confirmed"/>
+                <div itemprop="underName" itemscope itemtype="http://schema.org/Person">
+                    <meta itemprop="name" content="Jan Novák"/>
+                </div>
+                <div itemprop="reservationFor" itemscope itemtype="http://schema.org/Event">
+                    <meta itemprop="name" content="Vánoční koncert"/>
+                        <meta itemprop="startDate" content="2026-12-19T17:00:00+01:00"/>
+                    <div itemprop="location" itemscope itemtype="http://schema.org/Place">
+                        <meta itemprop="name" content="Červený kostel"/>
+                        <div itemprop="address" itemscope itemtype="http://schema.org/PostalAddress">
+                            <meta itemprop="streetAddress" content="Komenského náměstí 2"/>
+                            <meta itemprop="addressLocality" content="Brno"/>
+                            <meta itemprop="addressRegion" content="CZE">
+                            <meta itemprop="postalCode" content="CZE">
+                            <meta itemprop="addressCountry" content="CZE">
+                        </div>
+                    </div>
+                </div>
+                    <meta itemprop="venueSeat" content=""/>
+                    <meta itemprop="venueRow" content=""/>
+                    <meta itemprop="venueSection" content=""/>
+                <meta itemprop="ticketToken" content="qrCode:4444444444444"/>
+                <meta itemprop="ticketNumber" content="4444444444444"/>
+            </div>
+            <div itemscope itemtype="http://schema.org/EventReservation">
+                <meta itemprop="reservationNumber" content="45153208"/>
+                <link itemprop="reservationStatus" href="http://schema.org/Confirmed"/>
+                <div itemprop="underName" itemscope itemtype="http://schema.org/Person">
+                    <meta itemprop="name" content="Jan Novák"/>
+                </div>
+                <div itemprop="reservationFor" itemscope itemtype="http://schema.org/Event">
+                    <meta itemprop="name" content="Vánoční koncert"/>
+                        <meta itemprop="startDate" content="2026-12-19T17:00:00+01:00"/>
+                    <div itemprop="location" itemscope itemtype="http://schema.org/Place">
+                        <meta itemprop="name" content="Červený kostel"/>
+                        <div itemprop="address" itemscope itemtype="http://schema.org/PostalAddress">
+                            <meta itemprop="streetAddress" content="Komenského náměstí 2"/>
+                            <meta itemprop="addressLocality" content="Brno"/>
+                            <meta itemprop="addressRegion" content="CZE">
+                            <meta itemprop="postalCode" content="CZE">
+                            <meta itemprop="addressCountry" content="CZE">
+                        </div>
+                    </div>
+                </div>
+                    <meta itemprop="venueSeat" content=""/>
+                    <meta itemprop="venueRow" content=""/>
+                    <meta itemprop="venueSection" content=""/>
+                <meta itemprop="ticketToken" content="qrCode:5555555555555"/>
+                <meta itemprop="ticketNumber" content="5555555555555"/>
+            </div>
+
+                </td>
+            </tr>
+        </table>
+</td>
+</tr>
+</table>
+</body>
+</html>`;
+
+const GOOUT_FIXTURE_SHA256 = '6f01e8f56277bac3ecbc09055fa0d561d2c71ad6498be3a1ad3da69854f189d7';
+
+// GOOUT_EXPECTED_HELPER_LINES -- ticketingHtmlToPlainText(GOOUT_FIXTURE_HTML).split('\n'),
+// prototype-verified by the planner. Entry 2 (the visible date/time line)
+// carries the U+2013 en dash (\u2013), which ticketingHtmlToPlainText never
+// touches (it is not one of the nbsp/lt/gt/quot/apos/amp entities, nor a
+// numeric character reference in this fixture).
+const GOOUT_EXPECTED_HELPER_LINES = [
+  'GoOut | Tvé vstupenky: Vánoční koncert (Objednávka č. 45153208) |',
+  'Vánoční koncert',
+  'Sobota 19. 12. 17:00\u201318:05',
+  'Červený kostel',
+  '1',
+  '1111111111111',
+  'Sekce C2',
+  '490 Kč',
+  'Přidat vstupenku do Apple Wallet',
+  '2',
+  '2222222222222',
+  'Sekce C2',
+  '490 Kč',
+  'Přidat vstupenku do Apple Wallet',
+  '3',
+  '3333333333333',
+  'Sekce C2',
+  '490 Kč',
+  'Přidat vstupenku do Apple Wallet',
+  '4',
+  '4444444444444',
+  'Sekce C2',
+  '490 Kč',
+  'Přidat vstupenku do Apple Wallet',
+  '5',
+  '5555555555555',
+  'Sekce C2',
+  '490 Kč',
+  'Přidat vstupenku do Apple Wallet',
+  'Zobrazit mé vstupenky a rezervace',
+  'Červený kostel',
+  'Komenského náměstí 2,',
+  'Brno',
+  'Tento e-mail je potvrzením objednávky č. 45153208.',
+  'Zakoupením vstupenky zákazník souhlasí s Podmínkami nákupu vstupenek,',
+  'Zásadami používání cookies a',
+  'Zásadami soukromí.',
+];
+
+const GOOUT_FIXTURE_FROM = 'GoOut <info@mg.goout.net>';
+const GOOUT_FIXTURE_SUBJECT = 'Tvé vstupenky: Vánoční koncert (Objednávka č. 45153208)';
+const GOOUT_FIXTURE_RECEIVED_DATE = new Date(Date.UTC(2026, 9, 29, 17, 12, 2));
+const GOOUT_FIXTURE_TICKET_NUMBERS = ['1111111111111', '2222222222222', '3333333333333', '4444444444444', '5555555555555'];
+const GOOUT_FIXTURE_TICKET_PDF_NAME = 'Vanocni koncert (19.12.2026 17:00 lbynb).pdf';
+const GOOUT_FIXTURE_RECEIPT_PDF_NAME = 'receipt.pdf';
+
+/**
+ * gooutRealAttachments -- a fresh array, in the real MIME order: the five
+ * ticket_<number>.png QR codes, the real ticket PDF (copyBlob returns a
+ * fake application/pdf blob), then receipt.pdf, whose copyBlob THROWS if
+ * ever reached (D-11: receipt.pdf must never be copied).
+ */
+function gooutRealAttachments() {
+  const pngs = GOOUT_FIXTURE_TICKET_NUMBERS.map(function (n) {
+    return fakeAttachment('ticket_' + n + '.png', 'image/png');
+  });
+  const ticketPdf = Object.assign(fakeAttachment(GOOUT_FIXTURE_TICKET_PDF_NAME, 'application/pdf'), {
+    copyBlob: function () {
+      return entradioFakeBlob('application/pdf');
+    },
+  });
+  const receiptPdf = Object.assign(fakeAttachment(GOOUT_FIXTURE_RECEIPT_PDF_NAME, 'application/pdf'), {
+    copyBlob: function () {
+      throw new Error('receipt.pdf must never be copied (D-11)');
+    },
+  });
+  return pngs.concat([ticketPdf, receiptPdf]);
+}
+
+/**
+ * gooutRealShapedMessage -- the real-shaped GoOut confirmation, modeled on
+ * smsticketRealShapedMessage. getPlainBody() THROWS unless
+ * overrides.plainBody is explicitly supplied -- passing a test proves
+ * processTicketFromMessageBody never calls it for this raw-HTML sender
+ * (D-01).
+ */
+function gooutRealShapedMessage(overrides) {
+  const opts = overrides || {};
+
+  return {
+    getFrom: function () {
+      return GOOUT_FIXTURE_FROM;
+    },
+    getBody: function () {
+      return Object.prototype.hasOwnProperty.call(opts, 'htmlBody') ? opts.htmlBody : GOOUT_FIXTURE_HTML;
+    },
+    getPlainBody: function () {
+      if (Object.prototype.hasOwnProperty.call(opts, 'plainBody')) {
+        return opts.plainBody;
+      }
+      throw new Error('getPlainBody must not be called for a raw-HTML sender (D-01)');
+    },
+    getSubject: function () {
+      return Object.prototype.hasOwnProperty.call(opts, 'subject') ? opts.subject : GOOUT_FIXTURE_SUBJECT;
+    },
+    getDate: function () {
+      return GOOUT_FIXTURE_RECEIVED_DATE;
+    },
+    getAttachments: function () {
+      return Object.prototype.hasOwnProperty.call(opts, 'attachments') ? opts.attachments : gooutRealAttachments();
+    },
+  };
+}
+
+const EXPECTED_GOOUT_FIRST_RESERVATION_ITEM = {
+  '@type': 'EventReservation',
+  reservationNumber: '45153208',
+  reservationStatus: 'http://schema.org/Confirmed',
+  underName: { '@type': 'Person', name: 'Jan Novák' },
+  reservationFor: {
+    '@type': 'Event',
+    name: 'Vánoční koncert',
+    startDate: '2026-12-19T17:00:00+01:00',
+    location: {
+      '@type': 'Place',
+      name: 'Červený kostel',
+      address: {
+        '@type': 'PostalAddress',
+        streetAddress: 'Komenského náměstí 2',
+        addressLocality: 'Brno',
+        addressRegion: 'CZE',
+        postalCode: 'CZE',
+        addressCountry: 'CZE',
+      },
+    },
+  },
+  venueSeat: '',
+  venueRow: '',
+  venueSection: '',
+  ticketToken: 'qrCode:1111111111111',
+  ticketNumber: '1111111111111',
+};
+
+// EXPECTED_GOOUT_DESCRIPTION (D-08, D-09, Task 2) -- five paragraphs joined
+// by '\n\n': eventName, location, the visible date/time LINE (not just the
+// matched substring), the five ticket lines (each 'Sekce C2 | 490 Kč |
+// <number>') joined by '\n', and the order-number paragraph.
+const EXPECTED_GOOUT_DESCRIPTION = [
+  'Vánoční koncert',
+  'Červený kostel, Komenského náměstí 2, Brno',
+  'Sobota 19. 12. 17:00–18:05',
+  ['Sekce C2 | 490 Kč | 1111111111111', 'Sekce C2 | 490 Kč | 2222222222222', 'Sekce C2 | 490 Kč | 3333333333333', 'Sekce C2 | 490 Kč | 4444444444444', 'Sekce C2 | 490 Kč | 5555555555555'].join(
+    '\n'
+  ),
+  'Objednávka č. 45153208',
+].join('\n\n');
+
+// EXPECTED_GOOUT_PARSED_TICKET (Task 2) -- the Task 1 fields plus the
+// cross-validated end (D-08) and the full description (D-09), asserted in
+// ONE deepEqual.
+const EXPECTED_GOOUT_PARSED_TICKET = {
+  eventName: 'Vánoční koncert',
+  location: 'Červený kostel, Komenského náměstí 2, Brno',
+  year: 2026,
+  month: 11,
+  day: 19,
+  hour: 17,
+  minute: 0,
+  ticketIdentifier: '45153208',
+  utcOffset: '+01:00',
+  end: { year: 2026, month: 11, day: 19, hour: 18, minute: 5 },
+  description: EXPECTED_GOOUT_DESCRIPTION,
+};
+
+// EXPECTED_GOOUT_RESOURCE (Task 2) -- EXPECTED_GOOUT_TASK1_RESOURCE with the
+// real cross-validated end (18:05, not the 120-minute default) and the
+// full description added.
+const EXPECTED_GOOUT_RESOURCE = {
+  summary: 'Vánoční koncert',
+  location: 'Červený kostel, Komenského náměstí 2, Brno',
+  start: { dateTime: '2026-12-19T17:00:00+01:00', timeZone: 'Europe/Prague' },
+  end: { dateTime: '2026-12-19T18:05:00+01:00', timeZone: 'Europe/Prague' },
+  description: EXPECTED_GOOUT_DESCRIPTION,
+  extendedProperties: { private: { ticketIdentifier: '45153208' } },
+};
+
+// --- DERIVED variants (Task 2, D-08/D-09/D-04/D-06/D-07) --------------------
+// Each is built from GOOUT_FIXTURE_HTML by a single split/join, per the
+// plan's <sample_data> table. "DERIVED from GOOUT_FIXTURE_HTML" labels each.
+
+// DERIVED from GOOUT_FIXTURE_HTML: split '17:00–18:05', join '17:00–01:30' (rollover past midnight)
+const GOOUT_DERIVED_ROLLOVER_HTML = GOOUT_FIXTURE_HTML.split('17:00–18:05').join('17:00–01:30');
+
+// DERIVED from GOOUT_FIXTURE_HTML: split '17:00–18:05', join '17:00–17:00' (zero-length span)
+const GOOUT_DERIVED_ZERO_LENGTH_HTML = GOOUT_FIXTURE_HTML.split('17:00–18:05').join('17:00–17:00');
+
+// DERIVED from GOOUT_FIXTURE_HTML: split '17:00–18:05', join '18:00–19:30' (visible start disagrees with the microdata start)
+const GOOUT_DERIVED_MISMATCHED_VISIBLE_TIME_HTML = GOOUT_FIXTURE_HTML.split('17:00–18:05').join('18:00–19:30');
+
+// DERIVED from GOOUT_FIXTURE_HTML: split '17:00–18:05', join '17:00' (no end time at all on the visible line)
+const GOOUT_DERIVED_NO_END_TIME_HTML = GOOUT_FIXTURE_HTML.split('17:00–18:05').join('17:00');
+
+// DERIVED from GOOUT_FIXTURE_HTML: split '490 Kč', join '' (no price text survives at all)
+const GOOUT_DERIVED_NO_PRICE_HTML = GOOUT_FIXTURE_HTML.split('490 Kč').join('');
+
+// DERIVED from GOOUT_FIXTURE_HTML: split 'Sekce C2', join 'Řada 5, místo 12<br>Sekce C2' (a seated layout)
+const GOOUT_DERIVED_SEATED_HTML = GOOUT_FIXTURE_HTML.split('Sekce C2').join('Řada 5, místo 12<br>Sekce C2');
+
+// DERIVED from GOOUT_FIXTURE_HTML: split 'content="Vánoční koncert"', join 'content="Vánoční koncert &amp; hosté"' (an HTML entity in the event name)
+const GOOUT_DERIVED_ENTITY_NAME_HTML = GOOUT_FIXTURE_HTML.split('content="Vánoční koncert"').join('content="Vánoční koncert &amp; hosté"');
+
+// DERIVED from GOOUT_FIXTURE_HTML: slice out every itemscope block entirely (no EventReservation microdata survives)
+const GOOUT_DERIVED_NO_RESERVATION_HTML =
+  GOOUT_FIXTURE_HTML.slice(0, GOOUT_FIXTURE_HTML.indexOf('<div itemscope')) + GOOUT_FIXTURE_HTML.slice(GOOUT_FIXTURE_HTML.lastIndexOf('</div>') + 6);
+
+// DERIVED from GOOUT_FIXTURE_HTML: split 'http://schema.org/Confirmed', join 'http://schema.org/Cancelled' (every reservation cancelled)
+const GOOUT_DERIVED_ALL_CANCELLED_HTML = GOOUT_FIXTURE_HTML.split('http://schema.org/Confirmed').join('http://schema.org/Cancelled');
+
+// DERIVED from GOOUT_FIXTURE_HTML: replace only the LAST 'http://schema.org/Confirmed' with 'http://schema.org/Cancelled' (one of five cancelled)
+const GOOUT_DERIVED_ONE_CANCELLED_HTML = (function () {
+  const marker = 'http://schema.org/Confirmed';
+  const lastIndex = GOOUT_FIXTURE_HTML.lastIndexOf(marker);
+  return GOOUT_FIXTURE_HTML.slice(0, lastIndex) + 'http://schema.org/Cancelled' + GOOUT_FIXTURE_HTML.slice(lastIndex + marker.length);
+})();
+
+// DERIVED from GOOUT_FIXTURE_HTML: split the reservationStatus <link> (5 occurrences), join '' (no status at all)
+const GOOUT_DERIVED_NO_STATUS_HTML = GOOUT_FIXTURE_HTML.split('<link itemprop="reservationStatus" href="http://schema.org/Confirmed"/>').join('');
+
+// DERIVED from GOOUT_FIXTURE_HTML: split 'http://schema.org/Confirmed', join 'http://schema.org/ReservationConfirmed' (the tolerated alternate spelling)
+const GOOUT_DERIVED_RESERVATION_CONFIRMED_HTML = GOOUT_FIXTURE_HTML.split('http://schema.org/Confirmed').join('http://schema.org/ReservationConfirmed');
+
+// DERIVED from GOOUT_FIXTURE_HTML: replace only the LAST 'content="45153208"' with 'content="45153209"' (a second, inconsistent order number)
+const GOOUT_DERIVED_SECOND_ORDER_HTML = (function () {
+  const marker = 'content="45153208"';
+  const lastIndex = GOOUT_FIXTURE_HTML.lastIndexOf(marker);
+  return GOOUT_FIXTURE_HTML.slice(0, lastIndex) + 'content="45153209"' + GOOUT_FIXTURE_HTML.slice(lastIndex + marker.length);
+})();
+
+// DERIVED from GOOUT_FIXTURE_HTML: split 'content="Vánoční koncert"', join 'content=""' (empty event name)
+const GOOUT_DERIVED_EMPTY_EVENT_NAME_HTML = GOOUT_FIXTURE_HTML.split('content="Vánoční koncert"').join('content=""');
+
+// DERIVED from GOOUT_FIXTURE_HTML: split '2026-12-19T17:00:00+01:00', join '19.12.2026 17:00' (an unrecognized startDate shape)
+const GOOUT_DERIVED_BAD_START_HTML = GOOUT_FIXTURE_HTML.split('2026-12-19T17:00:00+01:00').join('19.12.2026 17:00');
+
+// DERIVED from GOOUT_FIXTURE_HTML: split '2026-12-19T17:00:00+01:00', join '2026-13-19T17:00:00+01:00' (month out of range)
+const GOOUT_DERIVED_MONTH_13_HTML = GOOUT_FIXTURE_HTML.split('2026-12-19T17:00:00+01:00').join('2026-13-19T17:00:00+01:00');
+
+// DERIVED from GOOUT_FIXTURE_HTML: split 'itemprop="reservationNumber" content="45153208"', join 'itemprop="reservationNumber" content=""' (no order number)
+const GOOUT_DERIVED_NO_ORDER_NUMBER_HTML = GOOUT_FIXTURE_HTML.split('itemprop="reservationNumber" content="45153208"').join(
+  'itemprop="reservationNumber" content=""'
+);
+
+// --- THE TRACER: appliesTo + resolveTicketProcessingJobs + run, end to end -
+
+test('quick-261029-pmx: TICKETING_PORTALS_ACTION.appliesTo is true for the real-shaped GoOut confirmation, read from the raw HTML (D-01, D-02, D-10)', () => {
+  const thread = smsticketOneMessageThread(gooutRealShapedMessage());
+  assert.equal(TICKETING_PORTALS_ACTION.appliesTo(thread), true);
+});
+
+test('quick-261029-pmx: resolveTicketProcessingJobs gives exactly ONE job for the real-shaped GoOut message: mode "body", the message by identity, portal info@mg.goout.net (D-01)', () => {
+  const message = gooutRealShapedMessage();
+  const jobs = resolveTicketProcessingJobs([message], TICKETING_PORTALS_ACTION.config.ticketingPortals);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].mode, 'body');
+  assert.strictEqual(jobs[0].message, message);
+  assert.equal(jobs[0].portal.identifyingEmail, 'info@mg.goout.net');
+});
+
+test('quick-261029-pmx TRACER: TICKETING_PORTALS_ACTION.run on the real-shaped GoOut thread produces exactly ONE insert whose resource deepEquals EXPECTED_GOOUT_RESOURCE (real end time, full description), with no attachments, zero Drive copies, zero fetches, and getPlainBody never called (D-01, D-02, D-04, D-05, D-06, D-07, D-08, D-09)', () => {
+  withTicketBodyRunGlobals({}, function (calls) {
+    const recordedListParams = [];
+    const realList = global.Calendar.Events.list;
+    global.Calendar.Events.list = function (calendarId, params) {
+      recordedListParams.push(params);
+      return realList(calendarId, params);
+    };
+
+    const thread = smsticketOneMessageThread(gooutRealShapedMessage());
+    TICKETING_PORTALS_ACTION.run(thread);
+
+    assert.equal(calls.inserted.length, 1);
+    const insertCall = calls.inserted[0];
+    assert.equal(insertCall.calendarId, 'DEFAULT_CAL');
+    assert.deepEqual(insertCall.resource, EXPECTED_GOOUT_RESOURCE);
+    assert.equal(Object.prototype.hasOwnProperty.call(insertCall.resource, 'attachments'), false);
+    assert.deepEqual(insertCall.optionalArgs, {});
+
+    assert.equal(calls.created.length, 0);
+    assert.equal(calls.fetched.length, 0);
+
+    assert.ok(
+      recordedListParams.some(function (p) {
+        return p && p.privateExtendedProperty === 'ticketIdentifier=45153208';
+      }),
+      'expected a Calendar.Events.list call with privateExtendedProperty ticketIdentifier=45153208'
+    );
+  });
+});
+
+// --- FIXTURE INTEGRITY ------------------------------------------------------
+
+test('quick-261029-pmx: GOOUT_FIXTURE_HTML sha256 matches the pinned value (D-13 transcription guard)', () => {
+  const crypto = require('node:crypto');
+  const hash = crypto.createHash('sha256').update(GOOUT_FIXTURE_HTML, 'utf8').digest('hex');
+  assert.equal(hash, GOOUT_FIXTURE_SHA256);
+});
+
+test('quick-261029-pmx: GOOUT_FIXTURE_HTML never contains the buyer\'s real given name, and does contain the fictional "Jan Novák" (D-13). The real surname itself is never typed into this file at all -- not even inside a negative check -- since Task 2\'s credential gate is a literal grep that cannot distinguish a check for absence from a leak.', () => {
+  assert.equal(GOOUT_FIXTURE_HTML.indexOf('Radek'), -1);
+  assert.ok(GOOUT_FIXTURE_HTML.indexOf('Jan Novák') !== -1);
+});
+
+test('quick-261029-pmx: the naive /itemprop="name" content="([^"]*)"/ regex really DOES grab the buyer\'s name first -- proving the D-02 three-name trap is real, not hypothetical', () => {
+  const naiveMatch = /itemprop="name" content="([^"]*)"/.exec(GOOUT_FIXTURE_HTML);
+  assert.ok(naiveMatch);
+  assert.equal(naiveMatch[1], 'Jan Novák');
+});
+
+test('quick-261029-pmx: ticketingHtmlToPlainText(GOOUT_FIXTURE_HTML) deepEquals GOOUT_EXPECTED_HELPER_LINES', () => {
+  assert.deepEqual(ticketingHtmlToPlainText(GOOUT_FIXTURE_HTML).split('\n'), GOOUT_EXPECTED_HELPER_LINES);
+});
+
+// --- THE SCHEMA.ORG MICRODATA READER, on the real fixture (D-02) -----------
+
+test('quick-261029-pmx: ticketingReadMicrodataItems(GOOUT_FIXTURE_HTML, "EventReservation") returns 5 items; item 0 deepEquals EXPECTED_GOOUT_FIRST_RESERVATION_ITEM; the ticketNumber list deepEquals the fixture numbers (D-02)', () => {
+  const items = ticketingReadMicrodataItems(GOOUT_FIXTURE_HTML, 'EventReservation');
+
+  assert.equal(items.length, 5);
+  assert.deepEqual(items[0], EXPECTED_GOOUT_FIRST_RESERVATION_ITEM);
+  assert.deepEqual(
+    items.map(function (i) {
+      return i.ticketNumber;
+    }),
+    GOOUT_FIXTURE_TICKET_NUMBERS
+  );
+});
+
+// --- THE SCHEMA.ORG MICRODATA READER, contract (inline snippets) (D-02) ----
+
+test('quick-261029-pmx: ticketingReadMicrodataItems never throws on null/undefined/empty input, or on a document with no matching type (D-02)', () => {
+  assert.deepEqual(ticketingReadMicrodataItems(null, 'EventReservation'), []);
+  assert.deepEqual(ticketingReadMicrodataItems(undefined, 'EventReservation'), []);
+  assert.deepEqual(ticketingReadMicrodataItems('', 'EventReservation'), []);
+  assert.deepEqual(ticketingReadMicrodataItems('<div itemscope itemtype="http://schema.org/Event"></div>', 'EventReservation'), []);
+});
+
+test('quick-261029-pmx: ticketingReadMicrodataItems handles single quotes, the https scheme, attribute order and an unclosed meta tag (D-02)', () => {
+  const html = "<div itemscope itemtype='https://schema.org/EventReservation'><meta content='A' itemprop='reservationNumber'></div>";
+  assert.deepEqual(ticketingReadMicrodataItems(html, 'EventReservation'), [{ '@type': 'EventReservation', reservationNumber: 'A' }]);
+});
+
+test('quick-261029-pmx: ticketingReadMicrodataItems -- FIRST itemprop occurrence wins on a tag with a duplicate (D-02)', () => {
+  const html =
+    '<div itemscope itemtype="http://schema.org/EventReservation">' +
+    '<meta itemprop="reservationNumber" content="1"/>' +
+    '<meta itemprop="reservationNumber" content="2"/>' +
+    '</div>';
+  const items = ticketingReadMicrodataItems(html, 'EventReservation');
+  assert.equal(items[0].reservationNumber, '1');
+});
+
+test('quick-261029-pmx: ticketingReadMicrodataItems -- an itemprop="__proto__" adds no own __proto__ key, and the item\'s prototype is untouched (T-261029-08, D-02)', () => {
+  const html = '<div itemscope itemtype="http://schema.org/EventReservation"><meta itemprop="__proto__" content="x"/></div>';
+  const items = ticketingReadMicrodataItems(html, 'EventReservation');
+  assert.equal(Object.prototype.hasOwnProperty.call(items[0], '__proto__'), false);
+  assert.equal(Object.getPrototypeOf(items[0]), Object.prototype);
+});
+
+test('quick-261029-pmx: ticketingReadMicrodataItems -- an EventReservation inside an HTML comment or inside <script> gives [] (D-02)', () => {
+  const insideComment = '<!-- <div itemscope itemtype="http://schema.org/EventReservation"></div> -->';
+  const insideScript = '<script><div itemscope itemtype="http://schema.org/EventReservation"></div></script>';
+  assert.deepEqual(ticketingReadMicrodataItems(insideComment, 'EventReservation'), []);
+  assert.deepEqual(ticketingReadMicrodataItems(insideScript, 'EventReservation'), []);
+});
+
+test('quick-261029-pmx: ticketingReadMicrodataItems decodes entities in attribute values via ticketingDecodeHtmlEntities (D-02, D-03)', () => {
+  const html = '<div itemscope itemtype="http://schema.org/EventReservation"><meta itemprop="x" content="Rock &amp; Roll &#x159;"/></div>';
+  const items = ticketingReadMicrodataItems(html, 'EventReservation');
+  assert.equal(items[0].x, 'Rock & Roll ř');
+});
+
+test('quick-261029-pmx: ticketingReadMicrodataItems -- a multi-token itemtype is collected if ANY token matches, and @type is the FIRST token\'s last segment (D-02)', () => {
+  const html = '<div itemscope itemtype="http://schema.org/Thing http://schema.org/EventReservation"></div>';
+  const items = ticketingReadMicrodataItems(html, 'EventReservation');
+  assert.equal(items.length, 1);
+  assert.equal(items[0]['@type'], 'Thing');
+});
+
+test('quick-261029-pmx: ticketingReadMicrodataItems -- an EventReservation with no itemprop nested inside an Order itemscope is collected as top-level, and the Order itself is not (D-02)', () => {
+  const html =
+    '<div itemscope itemtype="http://schema.org/Order">' + '<div itemscope itemtype="http://schema.org/EventReservation"></div>' + '</div>';
+  const items = ticketingReadMicrodataItems(html, 'EventReservation');
+  assert.equal(items.length, 1);
+  assert.equal(items[0]['@type'], 'EventReservation');
+});
+
+test('quick-261029-pmx: ticketingReadMicrodataItems reads a value from the "datetime" attribute when "content" is absent (D-02)', () => {
+  const html =
+    '<div itemscope itemtype="http://schema.org/EventReservation">' +
+    '<time itemprop="startDate" datetime="2026-12-19T17:00:00+01:00">19. 12.</time>' +
+    '</div>';
+  const items = ticketingReadMicrodataItems(html, 'EventReservation');
+  assert.equal(items[0].startDate, '2026-12-19T17:00:00+01:00');
+});
+
+test('quick-261029-pmx: ticketingReadMicrodataItems -- a text-content-only itemprop value (no content/datetime/href/src attribute) gives "" (D-02)', () => {
+  const html = '<div itemscope itemtype="http://schema.org/EventReservation"><span itemprop="name">Text</span></div>';
+  const items = ticketingReadMicrodataItems(html, 'EventReservation');
+  assert.equal(items[0].name, '');
+});
+
+test('quick-261029-pmx: ticketingReadMicrodataItems -- a stray closing tag and an unclosed <p> inside a scope leave the FOLLOWING sibling props in the right scope (D-02)', () => {
+  const html =
+    '<div itemscope itemtype="http://schema.org/EventReservation">' +
+    '<p>' +
+    '<meta itemprop="x" content="1">' +
+    '</span>' +
+    '<meta itemprop="y" content="2">' +
+    '</div>';
+  const items = ticketingReadMicrodataItems(html, 'EventReservation');
+  assert.equal(items[0].x, '1');
+  assert.equal(items[0].y, '2');
+});
+
+// --- D-03 HELPERS, extracted byte-identically from ticketingHtmlToPlainText
+
+test('quick-261029-pmx: ticketingDecodeHtmlEntities decodes a double-encoded ampersand and a hex numeric reference, amp always last (D-03)', () => {
+  assert.equal(ticketingDecodeHtmlEntities('&amp;lt;'), '&lt;');
+  assert.equal(ticketingDecodeHtmlEntities('&#x159;'), 'ř');
+});
+
+test('quick-261029-pmx: ticketingStripHtmlScriptStyleAndComments removes style/script content and comments, keeping ordinary surrounding text (D-03)', () => {
+  const stripped = ticketingStripHtmlScriptStyleAndComments('<style>.x{}</style>A<!-- c -->B<script>1</script>');
+  assert.ok(stripped.indexOf('A') !== -1);
+  assert.ok(stripped.indexOf('B') !== -1);
+  assert.equal(stripped.indexOf('.x'), -1);
+  assert.equal(stripped.indexOf(' c '), -1);
+  assert.equal(stripped.indexOf('1'), -1);
+});
+
+// --- THE PARSER, on the real fixture (Task 1 fields only, D-04/D-06/D-07) --
+
+test('quick-261029-pmx: parseGooutTicketHtml(GOOUT_FIXTURE_HTML) gives the core microdata-sourced fields, asserted individually -- eventName is NOT the buyer\'s name, location does not contain "CZE" (D-04, D-07; updated quick-261029-pmx Task 2, which adds end/description, see the full-parse EXPECTED_GOOUT_PARSED_TICKET test below)', () => {
+  const parsed = parseGooutTicketHtml(GOOUT_FIXTURE_HTML);
+
+  assert.equal(parsed.eventName, 'Vánoční koncert');
+  assert.notEqual(parsed.eventName, 'Jan Novák');
+  assert.equal(parsed.location, 'Červený kostel, Komenského náměstí 2, Brno');
+  assert.equal(parsed.location.indexOf('CZE'), -1);
+  assert.equal(parsed.year, 2026);
+  assert.equal(parsed.month, 11);
+  assert.equal(parsed.day, 19);
+  assert.equal(parsed.hour, 17);
+  assert.equal(parsed.minute, 0);
+  assert.equal(parsed.ticketIdentifier, '45153208');
+  assert.equal(parsed.utcOffset, '+01:00');
+});
+
+test('quick-261029-pmx: parseGooutTicketHtml ignores its referenceDate and subject arguments (BODY-PARSER CONTRACT) (D-04)', () => {
+  const withoutExtras = parseGooutTicketHtml(GOOUT_FIXTURE_HTML);
+  const withExtras = parseGooutTicketHtml(GOOUT_FIXTURE_HTML, new Date(0), 'unrelated subject');
+  assert.deepEqual(withExtras, withoutExtras);
+});
+
+// --- THE BUILDER'S UTC-OFFSET SUPPORT (D-05) --------------------------------
+
+test('quick-261029-pmx: buildTicketCalendarEventResource appends a valid utcOffset verbatim to both dateTimes; an invalid or absent one adds no suffix (D-05)', () => {
+  const minimalTicket = { eventName: 'X', location: '', year: 2026, month: 11, day: 19, hour: 17, minute: 0 };
+
+  const withOffset = buildTicketCalendarEventResource(Object.assign({}, minimalTicket, { utcOffset: '+01:00' }), 'Europe/Prague', []);
+  assert.equal(withOffset.resource.start.dateTime, '2026-12-19T17:00:00+01:00');
+  assert.equal(withOffset.resource.end.dateTime, '2026-12-19T19:00:00+01:00');
+
+  const withZ = buildTicketCalendarEventResource(Object.assign({}, minimalTicket, { utcOffset: 'Z' }), 'Europe/Prague', []);
+  assert.equal(withZ.resource.start.dateTime, '2026-12-19T17:00:00Z');
+
+  ['+1:00', 'Europe/Prague', 5].forEach(function (badOffset) {
+    const withBad = buildTicketCalendarEventResource(Object.assign({}, minimalTicket, { utcOffset: badOffset }), 'Europe/Prague', []);
+    assert.equal(withBad.resource.start.dateTime, '2026-12-19T17:00:00');
+  });
+
+  const withNone = buildTicketCalendarEventResource(minimalTicket, 'Europe/Prague', []);
+  assert.equal(withNone.resource.start.dateTime, '2026-12-19T17:00:00');
+});
+
+// --- THE RAW-HTML BODY SOURCE (D-01) ----------------------------------------
+
+test('quick-261029-pmx: TICKET_BODY_RAW_HTML_SENDERS deepEquals ["info@mg.goout.net"], and every entry also has a TICKET_BODY_PARSERS entry (D-01)', () => {
+  assert.deepEqual(TICKET_BODY_RAW_HTML_SENDERS, ['info@mg.goout.net']);
+  TICKET_BODY_RAW_HTML_SENDERS.forEach(function (sender) {
+    assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL, sender), true);
+  });
+});
+
+test('quick-261029-pmx: ticketingBodyInputForSender returns the raw HTML for info@mg.goout.net without ever calling getPlainBody, and the UNCHANGED ticketingMessageBodyText result for an ordinary body-sourced sender (D-01)', () => {
+  const gooutMessage = gooutRealShapedMessage();
+  assert.equal(ticketingBodyInputForSender(gooutMessage, 'info@mg.goout.net'), GOOUT_FIXTURE_HTML);
+
+  const smsticketMessage = smsticketRealShapedMessage();
+  assert.equal(ticketingBodyInputForSender(smsticketMessage, 'info@smsticket.cz'), ticketingMessageBodyText(smsticketMessage));
+});
+
+test('quick-261029-pmx: ticketingMessageRawHtml returns "" for a message with no getBody method at all (D-01)', () => {
+  assert.equal(
+    ticketingMessageRawHtml({
+      getPlainBody: function () {
+        return 'irrelevant';
+      },
+    }),
+    ''
+  );
+});
+
+// --- THE DETECTOR (D-10) ----------------------------------------------------
+
+test('quick-261029-pmx: gooutHtmlHasConfirmedReservation(GOOUT_FIXTURE_HTML) is strictly true (D-10)', () => {
+  assert.strictEqual(gooutHtmlHasConfirmedReservation(GOOUT_FIXTURE_HTML), true);
+});
+
+// --- REGISTRY WIRING AND ABSENCE (D-01, D-10) -------------------------------
+
+test('quick-261029-pmx: info@mg.goout.net is wired to parseGooutTicketHtml and gooutHtmlHasConfirmedReservation, and is absent from the text-parser, ICS-mode and attachment-fetcher registries (D-01, D-10)', () => {
+  assert.strictEqual(TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL['info@mg.goout.net'], parseGooutTicketHtml);
+  assert.strictEqual(TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL['info@mg.goout.net'], gooutHtmlHasConfirmedReservation);
+
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL, 'info@mg.goout.net'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL, 'info@mg.goout.net'), false);
+  assert.equal(TICKET_ICS_MODE_SENDERS.indexOf('info@mg.goout.net'), -1);
+});
+
+// --- CONFIG (D-12) -----------------------------------------------------------
+
+test('quick-261029-pmx: TICKETING_PORTALS_ACTION.config.ticketingPortals[8] deepEquals the shipped GoOut entry, and resolveTicketingCalendarId falls back to the passed default for it (D-12)', () => {
+  const ninthPortal = TICKETING_PORTALS_ACTION.config.ticketingPortals[8];
+  assert.deepEqual(ninthPortal, { identifyingEmail: 'info@mg.goout.net', calendarId: null, insertPdfIntoEvent: false });
+  assert.equal(resolveTicketingCalendarId(ninthPortal, 'DEFAULT_CAL'), 'DEFAULT_CAL');
+});
+
+
+// --- FULL PARSE (Task 2, D-08/D-09 combined) --------------------------------
+
+test('quick-261029-pmx: parseGooutTicketHtml(GOOUT_FIXTURE_HTML) deepEquals EXPECTED_GOOUT_PARSED_TICKET in ONE assertion (D-08, D-09)', () => {
+  assert.deepEqual(parseGooutTicketHtml(GOOUT_FIXTURE_HTML), EXPECTED_GOOUT_PARSED_TICKET);
+});
+
+// --- END-TIME VARIANTS (D-08) -----------------------------------------------
+
+test('quick-261029-pmx: parseGooutTicketHtml rolls the end time past midnight to the next day when the visible end precedes the start (D-08)', () => {
+  const parsed = parseGooutTicketHtml(GOOUT_DERIVED_ROLLOVER_HTML);
+  assert.deepEqual(parsed.end, { year: 2026, month: 11, day: 20, hour: 1, minute: 30 });
+  assert.ok(parsed.description.indexOf('Sobota 19. 12. 17:00\u201301:30') !== -1);
+});
+
+test('quick-261029-pmx: parseGooutTicketHtml sets NO own end for a zero-length visible span, keeping the dateTimeText paragraph (D-08)', () => {
+  const parsed = parseGooutTicketHtml(GOOUT_DERIVED_ZERO_LENGTH_HTML);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, 'end'), false);
+  assert.ok(parsed.description.indexOf('Sobota 19. 12. 17:00\u201317:00') !== -1);
+});
+
+test('quick-261029-pmx: parseGooutTicketHtml ignores a visible line whose START disagrees with the microdata start, synthesizing dateTimeText instead (D-08)', () => {
+  const parsed = parseGooutTicketHtml(GOOUT_DERIVED_MISMATCHED_VISIBLE_TIME_HTML);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, 'end'), false);
+  assert.ok(parsed.description.indexOf('19. 12. 2026 17:00') !== -1);
+});
+
+test('quick-261029-pmx: parseGooutTicketHtml sets NO own end when the visible line carries no end time at all (D-08)', () => {
+  const parsed = parseGooutTicketHtml(GOOUT_DERIVED_NO_END_TIME_HTML);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, 'end'), false);
+  assert.ok(parsed.description.indexOf('Sobota 19. 12. 17:00') !== -1);
+});
+
+// --- TICKET-LINE VARIANTS (D-09) --------------------------------------------
+
+test('quick-261029-pmx: parseGooutTicketHtml degrades to five bare ticket numbers when no price text survives at all (D-09)', () => {
+  const parsed = parseGooutTicketHtml(GOOUT_DERIVED_NO_PRICE_HTML);
+  const ticketParagraph = parsed.description.split('\n\n')[3];
+  assert.equal(ticketParagraph, GOOUT_FIXTURE_TICKET_NUMBERS.join('\n'));
+});
+
+test('quick-261029-pmx: parseGooutTicketHtml includes the seat/row line for a seated layout (D-09)', () => {
+  const parsed = parseGooutTicketHtml(GOOUT_DERIVED_SEATED_HTML);
+  const ticketParagraph = parsed.description.split('\n\n')[3];
+  assert.equal(
+    ticketParagraph,
+    [
+      'Řada 5, místo 12 | Sekce C2 | 490 Kč | 1111111111111',
+      'Řada 5, místo 12 | Sekce C2 | 490 Kč | 2222222222222',
+      'Řada 5, místo 12 | Sekce C2 | 490 Kč | 3333333333333',
+      'Řada 5, místo 12 | Sekce C2 | 490 Kč | 4444444444444',
+      'Řada 5, místo 12 | Sekce C2 | 490 Kč | 5555555555555',
+    ].join('\n')
+  );
+});
+
+// --- ENTITY DECODING IN THE EVENT NAME ---------------------------------------
+
+test('quick-261029-pmx: parseGooutTicketHtml decodes an HTML entity in the event name (D-04)', () => {
+  const parsed = parseGooutTicketHtml(GOOUT_DERIVED_ENTITY_NAME_HTML);
+  assert.equal(parsed.eventName, 'Vánoční koncert & hosté');
+});
+
+// --- THROWS (D-04, D-06), each ending in the diagnostic suffix --------------
+
+test('quick-261029-pmx: parseGooutTicketHtml throws naming no EventReservation microdata when every itemscope block is removed (D-04)', () => {
+  assert.throws(
+    function () {
+      parseGooutTicketHtml(GOOUT_DERIVED_NO_RESERVATION_HTML);
+    },
+    function (err) {
+      return (
+        err.message.indexOf('Unrecognized GoOut ticket HTML: no schema.org EventReservation microdata found') === 0 &&
+        err.message.indexOf('. Full raw HTML body:\n' + GOOUT_DERIVED_NO_RESERVATION_HTML) !== -1
+      );
+    }
+  );
+});
+
+test('quick-261029-pmx: parseGooutTicketHtml throws naming no event name when reservationFor.name is empty (D-04)', () => {
+  assert.throws(
+    function () {
+      parseGooutTicketHtml(GOOUT_DERIVED_EMPTY_EVENT_NAME_HTML);
+    },
+    function (err) {
+      return (
+        err.message.indexOf('Unrecognized GoOut ticket HTML: the EventReservation microdata carries no event name (reservationFor.name)') === 0 &&
+        err.message.indexOf('. Full raw HTML body:\n' + GOOUT_DERIVED_EMPTY_EVENT_NAME_HTML) !== -1
+      );
+    }
+  );
+});
+
+test('quick-261029-pmx: parseGooutTicketHtml throws naming an unrecognized startDate shape (D-04)', () => {
+  assert.throws(
+    function () {
+      parseGooutTicketHtml(GOOUT_DERIVED_BAD_START_HTML);
+    },
+    function (err) {
+      return (
+        err.message.indexOf('Unrecognized GoOut ticket HTML: unrecognized reservationFor.startDate') === 0 &&
+        err.message.indexOf('. Full raw HTML body:\n' + GOOUT_DERIVED_BAD_START_HTML) !== -1
+      );
+    }
+  );
+});
+
+test('quick-261029-pmx: parseGooutTicketHtml throws "Month out of range (13) in GoOut reservationFor.startDate" for an out-of-range month (D-04)', () => {
+  assert.throws(
+    function () {
+      parseGooutTicketHtml(GOOUT_DERIVED_MONTH_13_HTML);
+    },
+    function (err) {
+      return (
+        err.message.indexOf('Month out of range (13) in GoOut reservationFor.startDate') === 0 &&
+        err.message.indexOf('. Full raw HTML body:\n' + GOOUT_DERIVED_MONTH_13_HTML) !== -1
+      );
+    }
+  );
+});
+
+test('quick-261029-pmx: parseGooutTicketHtml throws naming more than one distinct reservation when the fifth block\'s order number disagrees (D-06)', () => {
+  assert.throws(
+    function () {
+      parseGooutTicketHtml(GOOUT_DERIVED_SECOND_ORDER_HTML);
+    },
+    function (err) {
+      return (
+        err.message.indexOf(
+          'Unrecognized GoOut ticket HTML: the email carries more than one distinct reservation (reservation number, event name or start differ between EventReservation blocks); one event per purchase cannot be built safely'
+        ) === 0 && err.message.indexOf('. Full raw HTML body:\n' + GOOUT_DERIVED_SECOND_ORDER_HTML) !== -1
+      );
+    }
+  );
+});
+
+// --- OPTIONAL ORDER NUMBER (D-07) -------------------------------------------
+
+test('quick-261029-pmx: parseGooutTicketHtml gives ticketIdentifier null and no "Objednávka č." paragraph when the order number is empty (D-07)', () => {
+  const parsed = parseGooutTicketHtml(GOOUT_DERIVED_NO_ORDER_NUMBER_HTML);
+  assert.equal(parsed.ticketIdentifier, null);
+  assert.equal(parsed.description.indexOf('Objednávka č.'), -1);
+});
+
+// --- DETECTOR (D-10) ---------------------------------------------------------
+
+test('quick-261029-pmx: gooutHtmlHasConfirmedReservation is false for no-reservation and fully/partially cancelled markup (D-10)', () => {
+  assert.equal(gooutHtmlHasConfirmedReservation(GOOUT_DERIVED_NO_RESERVATION_HTML), false);
+  assert.equal(gooutHtmlHasConfirmedReservation(GOOUT_DERIVED_ALL_CANCELLED_HTML), false);
+  assert.equal(gooutHtmlHasConfirmedReservation(GOOUT_DERIVED_ONE_CANCELLED_HTML), false);
+});
+
+test('quick-261029-pmx: gooutHtmlHasConfirmedReservation is true for an absent status and the tolerated "ReservationConfirmed" spelling (D-10)', () => {
+  assert.equal(gooutHtmlHasConfirmedReservation(GOOUT_DERIVED_NO_STATUS_HTML), true);
+  assert.equal(gooutHtmlHasConfirmedReservation(GOOUT_DERIVED_RESERVATION_CONFIRMED_HTML), true);
+});
+
+test('quick-261029-pmx: gooutHtmlHasConfirmedReservation is false for a marketing schema.org/Event listing (no EventReservation), and never throws on null/undefined/"" (D-10)', () => {
+  const marketingHtml =
+    '<div itemscope itemtype="http://schema.org/Event"><meta itemprop="name" content="X"/><meta itemprop="startDate" content="2026-12-19T17:00:00+01:00"/></div>';
+  assert.equal(gooutHtmlHasConfirmedReservation(marketingHtml), false);
+  assert.equal(gooutHtmlHasConfirmedReservation(null), false);
+  assert.equal(gooutHtmlHasConfirmedReservation(undefined), false);
+  assert.equal(gooutHtmlHasConfirmedReservation(''), false);
+});
+
+// --- ADMISSION INTEGRATION ---------------------------------------------------
+
+test('quick-261029-pmx: a GoOut thread with ALL_CANCELLED or NO_RESERVATION markup gives appliesTo false and zero resolveTicketProcessingJobs (D-10)', () => {
+  [GOOUT_DERIVED_ALL_CANCELLED_HTML, GOOUT_DERIVED_NO_RESERVATION_HTML].forEach(function (htmlBody) {
+    const message = gooutRealShapedMessage({ htmlBody: htmlBody });
+    const thread = smsticketOneMessageThread(message);
+
+    assert.equal(TICKETING_PORTALS_ACTION.appliesTo(thread), false);
+    assert.deepEqual(resolveTicketProcessingJobs([message], TICKETING_PORTALS_ACTION.config.ticketingPortals), []);
+  });
+});
+
+// --- PDF FINDER (D-11) -------------------------------------------------------
+
+test('quick-261029-pmx: findGooutTicketPdfAttachment returns the real ticket PDF by identity from gooutRealAttachments() (D-11)', () => {
+  const attachments = gooutRealAttachments();
+  const found = findGooutTicketPdfAttachment({
+    getAttachments: function () {
+      return attachments;
+    },
+  });
+  assert.strictEqual(found, attachments[5]);
+  assert.equal(found.getName(), GOOUT_FIXTURE_TICKET_PDF_NAME);
+});
+
+test('quick-261029-pmx: findGooutTicketPdfAttachment still returns the ticket when the receipt is placed BEFORE it (D-11)', () => {
+  const receipt = Object.assign(fakeAttachment(GOOUT_FIXTURE_RECEIPT_PDF_NAME, 'application/pdf'), {
+    copyBlob: function () {
+      throw new Error('receipt.pdf must never be copied (D-11)');
+    },
+  });
+  const ticket = fakeAttachment(GOOUT_FIXTURE_TICKET_PDF_NAME, 'application/pdf');
+  const found = findGooutTicketPdfAttachment({
+    getAttachments: function () {
+      return [receipt, ticket];
+    },
+  });
+  assert.strictEqual(found, ticket);
+});
+
+test('quick-261029-pmx: findGooutTicketPdfAttachment returns null for receipt-only attachments, a non-matching single PDF, a date-tailed receipt name, and PNG-only attachments (D-11)', () => {
+  const receiptOnly = findGooutTicketPdfAttachment({
+    getAttachments: function () {
+      return [fakeAttachment(GOOUT_FIXTURE_RECEIPT_PDF_NAME, 'application/pdf')];
+    },
+  });
+  assert.equal(receiptOnly, null);
+
+  const nonMatchingSingle = findGooutTicketPdfAttachment({
+    getAttachments: function () {
+      return [fakeAttachment('Vanocni koncert.pdf', 'application/pdf')];
+    },
+  });
+  assert.equal(nonMatchingSingle, null);
+
+  const dateTailedReceipt = findGooutTicketPdfAttachment({
+    getAttachments: function () {
+      return [fakeAttachment('receipt (19.12.2026 17:00 abcde).pdf', 'application/pdf')];
+    },
+  });
+  assert.equal(dateTailedReceipt, null);
+
+  const pngOnly = findGooutTicketPdfAttachment({
+    getAttachments: function () {
+      return [fakeAttachment('ticket_1111111111111.png', 'image/png')];
+    },
+  });
+  assert.equal(pngOnly, null);
+});
+
+test('quick-261029-pmx: TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL["info@mg.goout.net"] === findGooutTicketPdfAttachment (D-11)', () => {
+  assert.strictEqual(TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL['info@mg.goout.net'], findGooutTicketPdfAttachment);
+});
+
+// --- ATTACHMENT PATH (D-11) --------------------------------------------------
+
+test('quick-261029-pmx: processTicketFromMessageBody with insertPdfIntoEvent true attaches the renamed real ticket PDF, never the receipt, and the receipt\'s throwing copyBlob is never reached (D-11)', () => {
+  withTicketBodyRunGlobals({}, function (calls) {
+    processTicketFromMessageBody(gooutRealShapedMessage(), { identifyingEmail: 'info@mg.goout.net', calendarId: 'GO_CAL', insertPdfIntoEvent: true });
+
+    assert.equal(calls.inserted.length, 1);
+    const insertCall = calls.inserted[0];
+    assert.equal(insertCall.calendarId, 'GO_CAL');
+    assert.deepEqual(insertCall.resource.attachments, [
+      {
+        fileId: 'FILE_1',
+        fileUrl: 'https://drive.example/FILE_1',
+        title: 'Vánoční koncert - 2026-12-19 - 45153208.pdf',
+        mimeType: 'application/pdf',
+      },
+    ]);
+    assert.deepEqual(insertCall.optionalArgs, { supportsAttachments: true });
+    assert.equal(calls.created.length, 1);
+    assert.equal(calls.created[0].name, 'Vánoční koncert - 2026-12-19 - 45153208.pdf');
+  });
+});
+
+test('quick-261029-pmx: with ONLY the receipt attached, insertPdfIntoEvent true still creates the event with no own attachments key and zero Drive copies (D-11)', () => {
+  withTicketBodyRunGlobals({}, function (calls) {
+    const receiptOnlyMessage = gooutRealShapedMessage({
+      attachments: [
+        Object.assign(fakeAttachment(GOOUT_FIXTURE_RECEIPT_PDF_NAME, 'application/pdf'), {
+          copyBlob: function () {
+            throw new Error('receipt.pdf must never be copied (D-11)');
+          },
+        }),
+      ],
+    });
+
+    processTicketFromMessageBody(receiptOnlyMessage, { identifyingEmail: 'info@mg.goout.net', calendarId: 'GO_CAL', insertPdfIntoEvent: true });
+
+    assert.equal(calls.inserted.length, 1);
+    assert.equal(Object.prototype.hasOwnProperty.call(calls.inserted[0].resource, 'attachments'), false);
+    assert.equal(calls.created.length, 0);
+  });
+});
+
+// --- DEDUP --------------------------------------------------------------------
+
+test('quick-261029-pmx: with an existing tagged event, TICKETING_PORTALS_ACTION.run on the real-shaped GoOut thread gives 0 inserts and 0 Drive copies (D-07)', () => {
+  withTicketBodyRunGlobals({}, function (calls) {
+    global.Calendar.Events.list = function () {
+      return { items: [{ id: 'existing-event' }] };
+    };
+
+    const thread = smsticketOneMessageThread(gooutRealShapedMessage());
+    TICKETING_PORTALS_ACTION.run(thread);
+
+    assert.equal(calls.inserted.length, 0);
+    assert.equal(calls.created.length, 0);
+  });
+});
+
+// --- ABSENCE PROOFS (D-18, D-01) ---------------------------------------------
+
+test('quick-261029-pmx: info@mg.goout.net has no attachment fetcher, and TICKET_ICS_MODE_SENDERS is unchanged (D-18, D-01)', () => {
+  assert.equal(Object.prototype.hasOwnProperty.call(TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL, 'info@mg.goout.net'), false);
+  assert.deepEqual(Object.keys(TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL), ['no-reply@app.entradio.cz']);
+  assert.deepEqual(TICKET_ICS_MODE_SENDERS, ['vstupenky@ticketportal.cz', 'automat@webticket.cz']);
 });

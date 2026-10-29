@@ -21,7 +21,16 @@
  *     ticketingHtmlToPlainText's own rendering of the HTML body, via the
  *     shared ticketingMessageBodyText helper (see this file's "SHARED
  *     BODY-TEXT SOURCE" section) — every portal whose plain body is
- *     non-blank is unaffected.
+ *     non-blank is unaffected. Since quick-261029-pmx, a THIRD extraction
+ *     TECHNIQUE exists within this same mode: for GoOut
+ *     (info@mg.goout.net), the body input is the RAW HTML
+ *     (TICKET_BODY_RAW_HTML_SENDERS / ticketingBodyInputForSender), and
+ *     the parser reads structured schema.org EventReservation MICRODATA
+ *     through the scope-aware ticketingReadMicrodataItems — structured
+ *     data, not literal-marker text and not `.ics`. This is a
+ *     TECHNIQUE, not a fourth processing mode: admission, dedup, the PDF
+ *     attachment and event creation are all shared, unchanged. See this
+ *     file's "SCHEMA.ORG MICRODATA READER" section.
  *   - ICS-sourced (Ticketportal.cz, quick-261005-orv; WebTicket.cz,
  *     quick-261028-h1n): the event data comes from the confirmation
  *     email's OWN `.ics` attachment, parsed by the EXISTING parseIcs
@@ -51,7 +60,9 @@
  * from its ticket PDF's own filename, falling back to the body's own
  * "Zakázka #" number, never the per-email `.ics` UID (WebTicket mints a
  * fresh UID for every sent email, so a re-send would otherwise duplicate
- * the event).
+ * the event). GoOut's (quick-261029-pmx) identifier is the order's own
+ * `reservationNumber`, identical across its per-ticket microdata blocks,
+ * never a per-seat `ticketNumber` (which differs per block).
  *
  * ALL PORTAL-SPECIFIC PARSING LOGIC LIVES IN THIS ONE FILE: every parser is
  * a clearly-separated, well-named function/section within THIS file (e.g.
@@ -121,7 +132,12 @@
  * `CalendarApp.getCalendarById(calendarId).getTimeZone()` (the portal's own
  * configured calendar's timezone), never a hardcoded assumption. Formatted
  * via formatWallClockComponentsIso (deliberately no trailing `Z`/offset,
- * paired with an explicit Calendar API `timeZone` field).
+ * paired with an explicit Calendar API `timeZone` field). EXCEPTION
+ * (quick-261029-pmx, D-05): GoOut's microdata start is itself
+ * offset-qualified, so its parser sets `parsedTicket.utcOffset`, which
+ * buildTicketCalendarEventResource appends verbatim to BOTH the start and
+ * end `dateTime` strings — a no-op for every other portal, which never
+ * sets this field.
  *
  * OAUTH SCOPES (see src/appsscript.json):
  *   - `https://www.googleapis.com/auth/drive` (the BROADER scope, not the
@@ -2782,6 +2798,468 @@ function buildWebticketParsedTicket(icsEvent, ticketPdfName, timeZone, formatDat
   return parsedTicket;
 }
 
+// =============================================================================
+// GOOUT (info@mg.goout.net) — the NINTH supported portal, BODY-SOURCED from
+// schema.org microdata (quick-261029-pmx)
+// =============================================================================
+//
+// STRUCTURAL FACTS (from the real sample .eml, decoded by the planner):
+//   - The confirmation has NO text/plain part at all (the Fever situation).
+//     The raw HTML body is the ONLY input, read via TICKET_BODY_RAW_HTML_SENDERS
+//     / ticketingBodyInputForSender above (D-01).
+//   - The event data lives entirely in FIVE `<div itemscope
+//     itemtype=".../EventReservation">` blocks (one per ticket), each with
+//     THREE `itemprop="name"` properties (buyer, event, venue, in that
+//     order) — read via the generic ticketingReadMicrodataItems (D-02).
+//   - The start (`reservationFor.startDate`) is OFFSET-QUALIFIED
+//     (`2026-12-19T17:00:00+01:00`) and there is NO `endDate` anywhere.
+//   - `address.postalCode`, `address.addressRegion` and
+//     `address.addressCountry` are all filled with the literal `CZE`
+//     (deliberately ignored, D-04).
+//   - `venueSeat`, `venueRow` and `venueSection` are all EMPTY — general
+//     admission; the real section/price exist only in the VISIBLE HTML
+//     (D-09).
+//   - Each per-ticket `ticketNumber` IS the QR payload printed on the
+//     per-ticket PNG — a LIVE entry credential (D-13).
+//   - Attachments: five `image/png` QR codes (attachment disposition), the
+//     real ticket PDF (filename carries NO order number, only a
+//     date/time/random-token tail), and a SEPARATE `receipt.pdf` (D-11).
+//   - The `.pkpass` Apple Wallet links are BEARER links, never followed
+//     (D-18).
+//   - The visible `Sobota 19. 12. 17:00–18:05` line uses U+00A0 no-break
+//     spaces and a U+2013 en dash — ticketingHtmlToPlainText folds the
+//     NBSPs to plain spaces (D-08).
+//   - GoOut is sent via Mailgun and markets through this same pipeline (a
+//     promo block rides along with every real confirmation) — the same
+//     incident class as Ticketmaster CZ/Fever/smsticket.cz (D-10).
+//   - GoOut is a PLATFORM selling for many venues (this sample: Červený
+//     kostel, Brno) — the one sender covers every venue on it, the same
+//     Entradio-style platform shape.
+
+/**
+ * gooutCleanValue (D-04, quick-261029-pmx) — pure; whitespace-collapses
+ * (`\s` includes U+00A0) and trims a string value, or returns `''` for a
+ * non-string. Used throughout this section to normalize raw microdata
+ * values before comparing or joining them.
+ */
+function gooutCleanValue(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * gooutNestedItem (D-04, quick-261029-pmx) — pure; returns `value`
+ * unchanged when it is a non-null object, else `{}` — a defensive
+ * default so a missing nested microdata item (reservationFor, location,
+ * address, underName) never throws when ITS OWN properties are read.
+ */
+function gooutNestedItem(value) {
+  return value && typeof value === 'object' ? value : {};
+}
+
+/**
+ * gooutLocationFromPlace (D-04, quick-261029-pmx) — pure; builds the
+ * Calendar-event `location` string from a schema.org Place item: the
+ * DISTINCT non-empty cleaned `[place.name, address.streetAddress,
+ * address.addressLocality]`, joined with `', '`, or `''` when none are
+ * present. `postalCode`, `addressRegion` and `addressCountry` are
+ * deliberately IGNORED — the real sample fills all three with the literal
+ * `'CZE'`. A missing location is not an error (the same WebTicket-style
+ * absent-LOCATION rule).
+ */
+function gooutLocationFromPlace(place) {
+  const placeItem = gooutNestedItem(place);
+  const address = gooutNestedItem(placeItem.address);
+
+  const candidates = [gooutCleanValue(placeItem.name), gooutCleanValue(address.streetAddress), gooutCleanValue(address.addressLocality)];
+
+  const seen = {};
+  const parts = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    if (candidate && !seen[candidate]) {
+      seen[candidate] = true;
+      parts.push(candidate);
+    }
+  }
+
+  return parts.join(', ');
+}
+
+// GOOUT_START_DATE_PATTERN (D-04, quick-261029-pmx) — only the
+// offset-qualified shape OBSERVED in the real sample
+// ("2026-12-19T17:00:00+01:00") is observed live; a trailing 'Z', missing
+// seconds/fractional seconds, and a missing offset entirely are TOLERANCE
+// (never seen live, but accepted defensively — ISO 8601 allows all of
+// them).
+const GOOUT_START_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})?$/;
+
+// GOOUT_CONFIRMED_STATUS_PATTERN (D-10, quick-261029-pmx) — the OBSERVED
+// status is the literal 'http://schema.org/Confirmed' (a `<link href>`);
+// a bare 'Confirmed' or a 'ReservationConfirmed' suffix are TOLERANCE
+// (both spellings exist in schema.org reservation vocabularies), anchored
+// so a 'NotConfirmed'/'Cancelled'-shaped value never matches.
+const GOOUT_CONFIRMED_STATUS_PATTERN = /(?:^|\/)(?:Reservation)?Confirmed$/;
+
+// GOOUT_VISIBLE_DATE_TIME_PATTERN (D-08, quick-261029-pmx) — the OBSERVED
+// shape is "D. M. HH:MM–HH:MM" with no-break spaces around the dots
+// (folded to plain spaces by ticketingHtmlToPlainText, which this pattern
+// is applied AFTER) and a U+2013 EN DASH between the two times. An
+// optional four-digit year between the date and the start time, and a
+// plain hyphen or em dash time separator, are TOLERANCE — never observed
+// live, but harmless to accept. Non-global; a single `.exec()` always
+// returns the FIRST match.
+const GOOUT_VISIBLE_DATE_TIME_PATTERN = /(\d{1,2})\.\s*(\d{1,2})\.\s*(?:\d{4}\s+)?(\d{1,2}):(\d{2})(?:\s*[-–—]\s*(\d{1,2}):(\d{2}))?/;
+
+// GOOUT_TICKET_DETAIL_WINDOW_LINES (D-09, quick-261029-pmx) — the maximum
+// number of surviving lines scanned AFTER each ticket number's own line
+// for a bare Kč price line; 3 is wide enough to span the empty seat/row
+// line and the "Sekce C2" line in the real fixture, while staying well
+// short of the next ticket's own price line.
+const GOOUT_TICKET_DETAIL_WINDOW_LINES = 3;
+
+/**
+ * gooutVisibleDateTime (D-08, quick-261029-pmx) — pure; cross-validates
+ * the microdata start against the VISIBLE text's own date/time line —
+ * the only place GoOut's confirmation states an end time at all (there is
+ * no `endDate` anywhere in the microdata). `lines` is
+ * `ticketingHtmlToPlainText(rawHtml).split('\n')`; `start` is the
+ * microdata-derived `{ year, month (ZERO-indexed), day, hour, minute }`.
+ *
+ * Returns `{ dateTimeText, end }`: the FIRST line whose
+ * GOOUT_VISIBLE_DATE_TIME_PATTERN match has day/month(1-indexed)/hour/
+ * minute ALL equal to `start`'s own digits wins, and `dateTimeText` is
+ * that WHOLE LINE (not just the matched substring). When that line's own
+ * end-time group is also present, `delta` is the end minus the start in
+ * minutes: `delta < 0` rolls past midnight (+1440), `delta === 0` yields
+ * NO `end` (a zero-length span is never copied — the WebTicket lesson),
+ * `delta > 0` yields `end = addMinutesToWallClockComponents(start,
+ * delta)`.
+ *
+ * When NO line validates, `dateTimeText` is synthesized as
+ * `'<day>. <month>. <year> <HH>:<MM>'`, and `end` stays `undefined` (the
+ * shared 120-minute DEFAULT_EVENT_DURATION_MINUTES fallback then applies
+ * in buildTicketCalendarEventResource).
+ */
+function gooutVisibleDateTime(lines, start) {
+  const list = lines || [];
+  const startMonthOneIndexed = start.month + 1;
+
+  for (let i = 0; i < list.length; i++) {
+    const match = GOOUT_VISIBLE_DATE_TIME_PATTERN.exec(list[i]);
+    if (!match) {
+      continue;
+    }
+
+    const matchedDay = Number(match[1]);
+    const matchedMonth = Number(match[2]);
+    const matchedHour = Number(match[3]);
+    const matchedMinute = Number(match[4]);
+
+    if (matchedDay !== start.day || matchedMonth !== startMonthOneIndexed || matchedHour !== start.hour || matchedMinute !== start.minute) {
+      continue;
+    }
+
+    const result = { dateTimeText: list[i] };
+
+    if (match[5] !== undefined && match[6] !== undefined) {
+      const endHour = Number(match[5]);
+      const endMinute = Number(match[6]);
+      let delta = endHour * 60 + endMinute - (start.hour * 60 + start.minute);
+      if (delta < 0) {
+        delta += 1440;
+      }
+      if (delta > 0) {
+        result.end = addMinutesToWallClockComponents(
+          { year: start.year, month: start.month, day: start.day, hour: start.hour, minute: start.minute },
+          delta
+        );
+      }
+    }
+
+    return result;
+  }
+
+  return {
+    dateTimeText:
+      start.day +
+      '. ' +
+      startMonthOneIndexed +
+      '. ' +
+      start.year +
+      ' ' +
+      zeroPadTicketComponent(start.hour, 2) +
+      ':' +
+      zeroPadTicketComponent(start.minute, 2),
+  };
+}
+
+/**
+ * gooutTicketLines (D-09, quick-261029-pmx) — pure; builds the
+ * description's per-ticket detail lines. `lines` is the same
+ * ticketingHtmlToPlainText-rendered array gooutVisibleDateTime reads;
+ * `ticketNumbers` are the DISTINCT cleaned `ticketNumber` values, in item
+ * order (venueSection is empty in the microdata — the section and price
+ * exist only in the VISIBLE HTML, reusing this file's shared
+ * SMSTICKET_PRICE_LINE_PATTERN by name).
+ *
+ * For each ticket number, finds its own EXACT line in `lines` and scans
+ * the next GOOUT_TICKET_DETAIL_WINDOW_LINES lines for the first line
+ * matching SMSTICKET_PRICE_LINE_PATTERN. When found, the returned line is
+ * every line strictly between the ticket-number line and the price line,
+ * plus the price and the ticket number itself, all joined by `' | '`
+ * (giving `'Sekce C2 | 490 Kč | 1111111111111'` for the real fixture, or
+ * `'Řada 5, místo 12 | Sekce C2 | 490 Kč | …'` for a seated layout).
+ * Otherwise the BARE ticket number is used (graceful degradation). The
+ * 3-line window can never reach the next ticket's own price line.
+ */
+function gooutTicketLines(lines, ticketNumbers) {
+  const list = lines || [];
+
+  return (ticketNumbers || []).map(function (ticketNumber) {
+    const lineIndex = list.indexOf(ticketNumber);
+    if (lineIndex === -1) {
+      return ticketNumber;
+    }
+
+    for (let offset = 1; offset <= GOOUT_TICKET_DETAIL_WINDOW_LINES; offset++) {
+      const priceLineIndex = lineIndex + offset;
+      if (priceLineIndex >= list.length) {
+        break;
+      }
+      if (SMSTICKET_PRICE_LINE_PATTERN.test(list[priceLineIndex])) {
+        const between = list.slice(lineIndex + 1, priceLineIndex);
+        return between.concat([list[priceLineIndex], ticketNumber]).join(' | ');
+      }
+    }
+
+    return ticketNumber;
+  });
+}
+
+/**
+ * parseGooutTicketHtml (D-04, D-06, D-07, D-10; D-08/D-09 enrichment added
+ * quick-261029-pmx Task 2) — the info@mg.goout.net ticket-BODY parser.
+ * `html` is the message's RAW HTML body (TICKET_BODY_RAW_HTML_SENDERS /
+ * ticketingBodyInputForSender, D-01) — GoOut's event data lives entirely
+ * in schema.org EventReservation microdata ATTRIBUTES, which every
+ * plain-text rendering strips. `referenceDate` and `subject` exist only
+ * for the shared BODY-PARSER CONTRACT and are IGNORED: the year comes
+ * from the microdata's own offset-qualified startDate, so there is no
+ * year inference and no month-name table, unlike Fever.
+ *
+ * CORE STEPS (from the microdata):
+ *   1. `items = ticketingReadMicrodataItems(rawHtml, 'EventReservation')`.
+ *      Throws when empty.
+ *   2. CONSISTENCY (D-06): every item must agree with item 0 on the
+ *      cleaned reservationNumber, reservationFor.name and
+ *      reservationFor.startDate — otherwise throws naming "more than one
+ *      distinct reservation"; blocks are NEVER merged and a disagreement
+ *      is never silently dropped.
+ *   3. `event = gooutNestedItem(items[0].reservationFor)`; `eventName =
+ *      gooutCleanValue(event.name)` is REQUIRED.
+ *   4. The start is matched against GOOUT_START_DATE_PATTERN on
+ *      `gooutCleanValue(event.startDate)`; month/day/hour/minute are each
+ *      range-validated. `month` in the RETURN shape is ZERO-indexed, and
+ *      seconds are dropped. `utcOffset` (D-05) is set as an OWN property
+ *      ONLY when the matched offset group is present.
+ *   5. `location` = gooutLocationFromPlace(event.location) (D-04).
+ *   6. `ticketIdentifier` (D-07) = `gooutCleanValue(items[0].reservationNumber)
+ *      || null` — the ORDER number, identical across every per-ticket
+ *      block, NEVER a per-seat ticketNumber (which differs per block),
+ *      the PDF filename (carries no order number) or ticketToken (a
+ *      credential).
+ *
+ * VISIBLE-TEXT ENRICHMENT LAYER (D-08, D-09, quick-261029-pmx Task 2) —
+ * read ONLY for the end time, the date/time line and each ticket's
+ * section/price, NEVER for any core field above:
+ *   7. `lines = ticketingHtmlToPlainText(rawHtml).split('\n')`.
+ *   8. `gooutVisibleDateTime(lines, <the Task 1 start components>)` gives
+ *      `{ dateTimeText, end }`, cross-validated against the microdata
+ *      start so a mismatched or absent visible line can never produce a
+ *      wrong end time (D-08).
+ *   9. The DISTINCT cleaned `ticketNumber` values, in item order, are
+ *      passed to gooutTicketLines(lines, ...) for the per-ticket
+ *      section/price detail lines (D-09).
+ *  10. `description` (D-09) joins, with `'\n\n'`: eventName; location,
+ *      only if non-empty; dateTimeText (ALWAYS present, synthesized when
+ *      no visible line validates); the ticket lines joined by `'\n'`,
+ *      only if any; `'Objednávka č. ' + ticketIdentifier`, only if
+ *      truthy.
+ *
+ * Every thrown message starts with 'Unrecognized GoOut ticket HTML: '
+ * (or is the D-06 consistency message, or a '<Field> out of range'
+ * message) and ALWAYS ends with '. Full raw HTML body:\n' + rawHtml —
+ * this file's DIAGNOSTIC-ON-FAILURE convention, with the raw HTML because
+ * that is this parser's own input.
+ *
+ * Return shape: `{ eventName, location, year, month, day, hour, minute,
+ * ticketIdentifier, description }`, plus `utcOffset` and/or `end` only
+ * when present.
+ */
+function parseGooutTicketHtml(html, referenceDate, subject) {
+  const rawHtml = String(html || '');
+  const diagnosticSuffix = '. Full raw HTML body:\n' + rawHtml;
+
+  const items = ticketingReadMicrodataItems(rawHtml, 'EventReservation');
+  if (items.length === 0) {
+    throw new Error('Unrecognized GoOut ticket HTML: no schema.org EventReservation microdata found' + diagnosticSuffix);
+  }
+
+  const firstReservationNumber = gooutCleanValue(items[0].reservationNumber);
+  const firstEvent = gooutNestedItem(items[0].reservationFor);
+  const firstEventName = gooutCleanValue(firstEvent.name);
+  const firstStartDate = gooutCleanValue(firstEvent.startDate);
+
+  for (let i = 1; i < items.length; i++) {
+    const event = gooutNestedItem(items[i].reservationFor);
+    if (
+      gooutCleanValue(items[i].reservationNumber) !== firstReservationNumber ||
+      gooutCleanValue(event.name) !== firstEventName ||
+      gooutCleanValue(event.startDate) !== firstStartDate
+    ) {
+      throw new Error(
+        'Unrecognized GoOut ticket HTML: the email carries more than one distinct reservation (reservation number, event name or start differ between EventReservation blocks); one event per purchase cannot be built safely' +
+          diagnosticSuffix
+      );
+    }
+  }
+
+  const eventName = firstEventName;
+  if (!eventName) {
+    throw new Error(
+      'Unrecognized GoOut ticket HTML: the EventReservation microdata carries no event name (reservationFor.name)' + diagnosticSuffix
+    );
+  }
+
+  const startMatch = GOOUT_START_DATE_PATTERN.exec(firstStartDate);
+  if (!startMatch) {
+    throw new Error('Unrecognized GoOut ticket HTML: unrecognized reservationFor.startDate "' + firstStartDate + '"' + diagnosticSuffix);
+  }
+
+  const year = Number(startMatch[1]);
+  const month = Number(startMatch[2]);
+  const day = Number(startMatch[3]);
+  const hour = Number(startMatch[4]);
+  const minute = Number(startMatch[5]);
+  const utcOffset = startMatch[6];
+
+  if (month < 1 || month > 12) {
+    throw new Error('Month out of range (' + month + ') in GoOut reservationFor.startDate' + diagnosticSuffix);
+  }
+  if (day < 1 || day > 31) {
+    throw new Error('Day out of range (' + day + ') in GoOut reservationFor.startDate' + diagnosticSuffix);
+  }
+  if (hour < 0 || hour > 23) {
+    throw new Error('Hour out of range (' + hour + ') in GoOut reservationFor.startDate' + diagnosticSuffix);
+  }
+  if (minute < 0 || minute > 59) {
+    throw new Error('Minute out of range (' + minute + ') in GoOut reservationFor.startDate' + diagnosticSuffix);
+  }
+
+  const location = gooutLocationFromPlace(firstEvent.location);
+  const ticketIdentifier = firstReservationNumber || null;
+  const zeroIndexedMonth = month - 1;
+
+  // VISIBLE-TEXT ENRICHMENT LAYER (D-08, D-09) -- read only for the end
+  // time, the date/time line and each ticket's section/price, never for
+  // any core field above.
+  const lines = ticketingHtmlToPlainText(rawHtml).split('\n');
+  const visible = gooutVisibleDateTime(lines, { year: year, month: zeroIndexedMonth, day: day, hour: hour, minute: minute });
+
+  const ticketNumbers = [];
+  const seenTicketNumbers = {};
+  for (let i = 0; i < items.length; i++) {
+    const cleanedTicketNumber = gooutCleanValue(items[i].ticketNumber);
+    if (cleanedTicketNumber && !seenTicketNumbers[cleanedTicketNumber]) {
+      seenTicketNumbers[cleanedTicketNumber] = true;
+      ticketNumbers.push(cleanedTicketNumber);
+    }
+  }
+  const ticketLines = gooutTicketLines(lines, ticketNumbers);
+
+  const descriptionParagraphs = [eventName];
+  if (location) {
+    descriptionParagraphs.push(location);
+  }
+  descriptionParagraphs.push(visible.dateTimeText);
+  if (ticketLines.length > 0) {
+    descriptionParagraphs.push(ticketLines.join('\n'));
+  }
+  if (ticketIdentifier) {
+    descriptionParagraphs.push('Objednávka č. ' + ticketIdentifier);
+  }
+
+  const parsedTicket = {
+    eventName: eventName,
+    location: location,
+    year: year,
+    month: zeroIndexedMonth,
+    day: day,
+    hour: hour,
+    minute: minute,
+    ticketIdentifier: ticketIdentifier,
+    description: descriptionParagraphs.join('\n\n'),
+  };
+
+  if (utcOffset) {
+    parsedTicket.utcOffset = utcOffset;
+  }
+  if (visible.end) {
+    parsedTicket.end = visible.end;
+  }
+
+  return parsedTicket;
+}
+
+/**
+ * gooutHtmlHasConfirmedReservation (D-10, quick-261029-pmx) — the
+ * REQUIRED content detector for info@mg.goout.net: GoOut is a bulk ESP
+ * (Mailgun), and the real confirmation itself carries GoOut's own promo
+ * block, so GoOut markets through this same pipeline (the same incident
+ * class as Ticketmaster CZ/Fever/smsticket.cz). Returns a LITERAL
+ * boolean, never throws: `true` when
+ * `ticketingReadMicrodataItems(html, 'EventReservation')` is non-empty
+ * AND every item's `reservationStatus` is absent, `''`, or matches
+ * GOOUT_CONFIRMED_STATUS_PATTERN.
+ *
+ * Marketing event listings carry schema.org `Event`, not
+ * `EventReservation`, and are rejected by the exact type match. A
+ * cancellation carrying an EventReservation with an explicit
+ * non-confirmed status must NEVER create an event, so it is rejected
+ * here.
+ *
+ * Completeness (a broken name or start) is deliberately NOT checked here:
+ * a reservation-marked mail with missing/inconsistent fields is ADMITTED
+ * and fails LOUDLY in parseGooutTicketHtml instead, carrying the raw HTML
+ * in the failure email — rejecting it here would skip it silently,
+ * against this file's core "no silent failures" value. An ABSENT status
+ * is also admitted, for the same reason: it is likelier a template
+ * variant of a confirmation than a cancellation.
+ *
+ * SCOPE LIMITATION: cancellation handling (deleting an already-created
+ * event) and a changed-date notice for an already-processed order (dedup
+ * silently skips it, keeping the event's old time) both need real data to
+ * design.
+ */
+function gooutHtmlHasConfirmedReservation(html) {
+  const items = ticketingReadMicrodataItems(String(html || ''), 'EventReservation');
+  if (items.length === 0) {
+    return false;
+  }
+
+  for (let i = 0; i < items.length; i++) {
+    const status = items[i].reservationStatus;
+    if (status && !GOOUT_CONFIRMED_STATUS_PATTERN.test(status)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 /**
  * TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL — the local (single-file)
  * registry mapping a BODY-SOURCED ticketing portal's `identifyingEmail`
@@ -2809,6 +3287,10 @@ const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
   'hello@feverup.com': parseFeverTicketText,
   // The seventh portal, smsticket.cz (quick-261026-ma6).
   'info@smsticket.cz': parseSmsticketTicketText,
+  // The ninth portal, GoOut (quick-261029-pmx) -- BODY-SOURCED, but read
+  // from the RAW HTML via TICKET_BODY_RAW_HTML_SENDERS (D-01), never a
+  // plain-text rendering.
+  'info@mg.goout.net': parseGooutTicketHtml,
 };
 
 /**
@@ -2829,7 +3311,10 @@ const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
 // body's own rendering, see ticketingMessageBodyText), so no OCR is needed.
 // Also NO 'automat@webticket.cz' key (quick-261028-h1n, D-01) -- same reason
 // as Ticketportal.cz: WebTicket.cz's event data comes from its own .ics
-// attachment, never Drive/OCR.
+// attachment, never Drive/OCR. Also NO 'info@mg.goout.net' key
+// (quick-261029-pmx) -- no OCR is needed; the HTML's own schema.org
+// microdata carries everything (TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL
+// above).
 const TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL = {
   'no-reply@enigoo.cz': parseEnigooTicketText,
 };
@@ -2846,6 +3331,10 @@ const TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL = {
  * (findTicketIcsAttachments) is what admits the `mode: 'ics'` job (see
  * resolveTicketProcessingJobs / TICKETING_PORTALS_ACTION.appliesTo/run).
  */
+// DELIBERATE ABSENCE: there is NO 'info@mg.goout.net' entry here
+// (quick-261029-pmx) -- the real confirmation carries no .ics attachment
+// at all; its event data comes entirely from the raw HTML's own
+// schema.org microdata (TICKET_BODY_RAW_HTML_SENDERS above).
 const TICKET_ICS_MODE_SENDERS = ['vstupenky@ticketportal.cz', 'automat@webticket.cz'];
 
 /**
@@ -3339,6 +3828,64 @@ function findWebticketTicketPdfAttachment(message) {
   return null;
 }
 
+// GOOUT_RECEIPT_PDF_NAME_MARKER (D-11, quick-261029-pmx) -- the observed
+// receipt filename is the literal 'receipt.pdf'; matched
+// case-insensitively as a SUBSTRING so a differently-cased or
+// differently-suffixed receipt name is still excluded.
+const GOOUT_RECEIPT_PDF_NAME_MARKER = 'receipt';
+
+// GOOUT_TICKET_PDF_NAME_PATTERN (D-11, quick-261029-pmx) -- the real
+// ticket filename's STABLE tail is "(D.M.YYYY H:MM <token>).pdf" -- the
+// event's own date and time, which parseGooutTicketHtml already knows,
+// followed by a random lowercase token tolerated as any non-parenthesis
+// run. The random token itself is NEVER keyed on.
+const GOOUT_TICKET_PDF_NAME_PATTERN = /\(\s*\d{1,2}\.\s*\d{1,2}\.\s*\d{4}\s+\d{1,2}:\d{2}\b[^()]*\)\s*\.pdf$/i;
+
+/**
+ * findGooutTicketPdfAttachment (D-11, quick-261029-pmx) — GoOut's own
+ * ticket-PDF finder for the OPTIONAL `insertPdfIntoEvent` attachment
+ * path. The real confirmation carries the ticket PDF (filename template
+ * "<event> (<date> <time> <token>).pdf", carrying NO order number at
+ * all) AND a SEPARATE `receipt.pdf`.
+ *
+ * HARD RECEIPT EXCLUSION: any PDF attachment whose lowercased name
+ * contains GOOUT_RECEIPT_PDF_NAME_MARKER is skipped outright, regardless
+ * of its position among the attachments.
+ *
+ * Among the remaining PDFs, returns the FIRST whose name matches
+ * GOOUT_TICKET_PDF_NAME_PATTERN (the template's own date/time tail), or
+ * `null`. DELIBERATELY NO "only remaining PDF" FALLBACK: the attach path
+ * renames the matched file to `"<event> - <date> - <order>.pdf"`, so a
+ * wrong file would masquerade as the real ticket — a missing attachment
+ * (the event is still created; the existing "no matching ticket PDF" log
+ * line fires) is the cheaper failure. The positive match keys on the
+ * event's own date and time, the template's STABLE part, never on the
+ * random token, so any miss degrades gracefully.
+ *
+ * The five per-ticket QR PNGs are not PDFs and are never attached by
+ * this finder — the ticket PDF alone carries every ticket. The filename
+ * is plain ASCII, so there is no RFC 2047 caveat (unlike smsticket.cz's
+ * own finder's LIVE CAVEAT).
+ *
+ * SCOPE LIMITATION: a differently-named attachment would need handling
+ * THEN, with real data. Pure, no GAS globals.
+ */
+function findGooutTicketPdfAttachment(message) {
+  const pdfAttachments = findTicketPdfAttachments(message);
+
+  for (let i = 0; i < pdfAttachments.length; i++) {
+    const name = pdfAttachments[i].getName() || '';
+    if (name.toLowerCase().indexOf(GOOUT_RECEIPT_PDF_NAME_MARKER) !== -1) {
+      continue;
+    }
+    if (GOOUT_TICKET_PDF_NAME_PATTERN.test(name)) {
+      return pdfAttachments[i];
+    }
+  }
+
+  return null;
+}
+
 /**
  * TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL — the local
  * (single-file) registry mapping a BODY-SOURCED ticketing portal's
@@ -3369,6 +3916,9 @@ const TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL = {
   'vstupenky@ticketportal.cz': findTicketportalCzTicketPdfAttachment,
   'info@smsticket.cz': findSmsticketTicketPdfAttachment,
   'automat@webticket.cz': findWebticketTicketPdfAttachment,
+  // The ninth portal, GoOut (quick-261029-pmx, D-11) -- a hard receipt
+  // exclusion, never an "only remaining PDF" fallback.
+  'info@mg.goout.net': findGooutTicketPdfAttachment,
 };
 
 /**
@@ -3402,7 +3952,11 @@ const TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL = {
 // travels WITH the message (findWebticketTicketPdfAttachment above); the
 // order-status/wallet links in its body are bearer links and are NEVER
 // followed, so this portal makes no outbound HTTP call and needs no new
-// OAuth scope either.
+// OAuth scope either. Also NO 'info@mg.goout.net' key (quick-261029-pmx,
+// D-18) -- its ticket PDF travels WITH the message
+// (findGooutTicketPdfAttachment above); the .pkpass Apple Wallet links in
+// its body are bearer links and are NEVER followed or fetched; no new
+// OAuth scope is needed.
 const TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL = {
   'no-reply@app.entradio.cz': fetchEntradioAttachments,
 };
@@ -3436,6 +3990,9 @@ const TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL = {
   // address (its own real confirmation's footer advertises them) -- applied
   // here from day one too (D-09, quick-261026-ma6).
   'info@smsticket.cz': smsticketTextHasPurchaseDetails,
+  // info@mg.goout.net (quick-261029-pmx, D-10) -- REQUIRED: GoOut is a
+  // bulk ESP (Mailgun) and markets through this same pipeline.
+  'info@mg.goout.net': gooutHtmlHasConfirmedReservation,
 };
 // DELIBERATE ABSENCE: there is NO 'automat@webticket.cz' key here
 // (D-09, quick-261028-h1n). This registry gates BODY-mode admission only;
@@ -3461,67 +4018,108 @@ const TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL = {
 // live) sees BYTE-IDENTICAL input to before this change.
 
 /**
- * ticketingHtmlToPlainText (D-02) — pure; deterministically renders an HTML
- * email body down to plain text, for the body-sourced parsing pipeline's
- * fallback when a portal's own message.getPlainBody() comes back blank.
- * Never throws; `null`/`undefined`/`''` all return `''`. Algorithm, in
- * order (every pattern below is non-greedy, bounded by a literal closing
- * tag, or built from a negated character class — never a nested quantifier,
- * per this file's threat model, T-261026-03):
+ * ticketingStripHtmlScriptStyleAndComments (D-03, quick-261029-pmx) — pure;
+ * extracted BYTE-IDENTICALLY from ticketingHtmlToPlainText's own style,
+ * script and comment-removal steps, so the schema.org microdata reader
+ * (ticketingReadMicrodataItems, see this file's "SCHEMA.ORG MICRODATA
+ * READER" section) can reuse the exact same stripping without
+ * duplicating it. Replaces each `<style>...</style>` and
+ * `<script>...</script>` element with a newline (case-insensitive,
+ * non-greedy), then removes every HTML comment entirely. Never throws;
+ * `null`/`undefined`/`''` all return `''`.
+ */
+function ticketingStripHtmlScriptStyleAndComments(html) {
+  let text = String(html || '');
+
+  text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '\n');
+  text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '\n');
+  text = text.replace(/<!--[\s\S]*?-->/g, '');
+
+  return text;
+}
+
+/**
+ * ticketingDecodeHtmlEntities (D-03, quick-261029-pmx) — pure; extracted
+ * BYTE-IDENTICALLY from ticketingHtmlToPlainText's own entity-decoding
+ * steps, so the schema.org microdata reader decodes attribute values with
+ * the exact same rules. Decodes numeric character references —
+ * hexadecimal (`&#xHHHH;`) THEN decimal (`&#DDDD;`) — via
+ * `String.fromCodePoint`, leaving any reference above `0x10FFFF`
+ * untouched rather than throwing, then the named entities `nbsp` (to
+ * U+00A0), `lt`, `gt`, `quot` and `apos`, THEN `amp` LAST — so an
+ * already-decoded `&lt;` et al. is never double-decoded (e.g. the
+ * literal source text `&amp;lt;` decodes to the literal text `&lt;`,
+ * not `<`). Never throws; `null`/`undefined`/`''` all return `''`.
+ */
+function ticketingDecodeHtmlEntities(text) {
+  let decoded = String(text || '');
+
+  decoded = decoded.replace(/&#x([0-9a-f]+);/gi, function (match, hex) {
+    const codePoint = parseInt(hex, 16);
+    return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : match;
+  });
+  decoded = decoded.replace(/&#(\d+);/g, function (match, dec) {
+    const codePoint = parseInt(dec, 10);
+    return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : match;
+  });
+
+  decoded = decoded.replace(/&nbsp;/gi, ' ');
+  decoded = decoded.replace(/&lt;/gi, '<');
+  decoded = decoded.replace(/&gt;/gi, '>');
+  decoded = decoded.replace(/&quot;/gi, '"');
+  decoded = decoded.replace(/&apos;/gi, "'");
+  decoded = decoded.replace(/&amp;/gi, '&');
+
+  return decoded;
+}
+
+/**
+ * ticketingHtmlToPlainText (D-02; its style/script/comment-removal and
+ * entity-decoding steps extracted into ticketingStripHtmlScriptStyleAndComments
+ * and ticketingDecodeHtmlEntities, quick-261029-pmx, D-03) — pure;
+ * deterministically renders an HTML email body down to plain text, for
+ * the body-sourced parsing pipeline's fallback when a portal's own
+ * message.getPlainBody() comes back blank. Never throws;
+ * `null`/`undefined`/`''` all return `''`. Algorithm, in order (every
+ * pattern below is non-greedy, bounded by a literal closing tag, or
+ * built from a negated character class — never a nested quantifier, per
+ * this file's threat model, T-261026-03):
  *   1. String-coerce `html`, with `null`/`undefined` becoming `''`.
  *   2. Replace the whole `<head>...</head>` element with a newline
- *      (case-insensitive, non-greedy).
- *   3. Replace each `<style>...</style>` and `<script>...</script>` element
- *      with a newline.
- *   4. Remove every HTML comment.
- *   5. Remove every `<img>` tag ENTIRELY — alt text is never rendered.
- *   6. Replace every `<br>` tag (any form) with a newline.
- *   7. Replace every opening/closing tag of p, div, tr, td, th, li, ul, ol,
- *      table, tbody, thead, tfoot and h1-h6 with a newline.
- *   8. Remove every remaining tag.
- *   9. Decode numeric character references — hexadecimal (`&#xHHHH;`) THEN
- *      decimal (`&#DDDD;`) — via `String.fromCodePoint`, leaving any
- *      reference above `0x10FFFF` untouched rather than throwing.
- *   10. Decode the named entities `nbsp` (to U+00A0), `lt`, `gt`, `quot` and
- *      `apos`, THEN `amp` LAST — so an already-decoded `&lt;` et al. is
- *      never double-decoded (e.g. the literal source text `&amp;lt;`
- *      decodes to the literal text `&lt;`, not `<`).
- *   11. Split on CR, LF or CRLF; collapse each run of spaces, tabs and
- *      U+00A0 to ONE space; trim; drop lines left empty by that collapse;
- *      join the survivors with a single newline.
+ *      (case-insensitive, non-greedy) — this step stays INLINE here (the
+ *      microdata reader deliberately does NOT strip `<head>`, since it
+ *      never holds an itemscope).
+ *   3. ticketingStripHtmlScriptStyleAndComments: replace each
+ *      `<style>...</style>` and `<script>...</script>` element with a
+ *      newline, then remove every HTML comment.
+ *   4. Remove every `<img>` tag ENTIRELY — alt text is never rendered.
+ *   5. Replace every `<br>` tag (any form) with a newline.
+ *   6. Replace every opening/closing tag of p, div, tr, td, th, li, ul,
+ *      ol, table, tbody, thead, tfoot and h1-h6 with a newline.
+ *   7. Remove every remaining tag.
+ *   8. ticketingDecodeHtmlEntities: decode numeric character references
+ *      (hex then decimal) via `String.fromCodePoint`, then the named
+ *      entities nbsp/lt/gt/quot/apos, THEN amp LAST.
+ *   9. Split on CR, LF or CRLF; collapse each run of spaces, tabs and
+ *      U+00A0 to ONE space; trim; drop lines left empty by that
+ *      collapse; join the survivors with a single newline.
  */
 function ticketingHtmlToPlainText(html) {
   let text = String(html || '');
 
   text = text.replace(/<head\b[^>]*>[\s\S]*?<\/head>/gi, '\n');
-  text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '\n');
-  text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '\n');
-  text = text.replace(/<!--[\s\S]*?-->/g, '');
+  text = ticketingStripHtmlScriptStyleAndComments(text);
   text = text.replace(/<img\b[^>]*>/gi, '');
   text = text.replace(/<br\s*\/?>/gi, '\n');
   text = text.replace(/<\/?(?:p|div|tr|td|th|li|ul|ol|table|tbody|thead|tfoot|h[1-6])\b[^>]*>/gi, '\n');
   text = text.replace(/<[^>]+>/g, '');
 
-  text = text.replace(/&#x([0-9a-f]+);/gi, function (match, hex) {
-    const codePoint = parseInt(hex, 16);
-    return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : match;
-  });
-  text = text.replace(/&#(\d+);/g, function (match, dec) {
-    const codePoint = parseInt(dec, 10);
-    return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : match;
-  });
-
-  text = text.replace(/&nbsp;/gi, ' ');
-  text = text.replace(/&lt;/gi, '<');
-  text = text.replace(/&gt;/gi, '>');
-  text = text.replace(/&quot;/gi, '"');
-  text = text.replace(/&apos;/gi, "'");
-  text = text.replace(/&amp;/gi, '&');
+  text = ticketingDecodeHtmlEntities(text);
 
   const lines = text
     .split(/\r\n|\r|\n/)
     .map(function (line) {
-      return line.replace(/[ \t ]+/g, ' ').trim();
+      return line.replace(/[ \t\u00A0]+/g, ' ').trim();
     })
     .filter(function (line) {
       return line !== '';
@@ -3555,13 +4153,330 @@ function ticketingMessageBodyText(message) {
 }
 
 /**
+ * TICKET_BODY_RAW_HTML_SENDERS (D-01, quick-261029-pmx) — the list of
+ * BODY-SOURCED portals whose confirmation must be read from the RAW HTML
+ * body (`message.getBody()`) rather than any plain-text rendering. Built
+ * for GoOut (info@mg.goout.net): its event data lives entirely in
+ * schema.org EventReservation microdata (itemprop/content/href
+ * attributes), and EVERY plain-text rendering throws those attributes
+ * away — both Gmail's own getPlainBody() of an HTML-only message (the
+ * Fever situation: no text/plain part at all) and this file's own
+ * ticketingHtmlToPlainText (D-02, quick-261026-ma6), which renders tag
+ * TEXT content, never attribute values.
+ *
+ * This is a per-sender TECHNIQUE, not a fourth processing mode (see
+ * ticketingBodyInputForSender below): admission, dedup, the PDF finder,
+ * the attachment fetcher and event creation are all identical to
+ * ordinary body mode. A mode would duplicate processTicketFromMessageBody
+ * for no reason — only the parser's INPUT differs.
+ *
+ * Every non-listed sender's input stays BYTE-IDENTICAL to before this
+ * list existed (ticketingMessageBodyText is untouched).
+ *
+ * INVARIANT (tested): every entry here also has a
+ * TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL entry.
+ */
+const TICKET_BODY_RAW_HTML_SENDERS = ['info@mg.goout.net'];
+
+/**
+ * ticketingMessageRawHtml (D-01, quick-261029-pmx) — pure-over-its-argument
+ * (calls only methods ON `message`, no GAS global). Returns
+ * `String(message.getBody() || '')` when `typeof message.getBody ===
+ * 'function'`, else `''`. NEVER calls `message.getPlainBody()` — unlike
+ * ticketingMessageBodyText, this is the raw-HTML counterpart for a sender
+ * whose event data lives only in tag ATTRIBUTES, which every plain-text
+ * rendering discards.
+ */
+function ticketingMessageRawHtml(message) {
+  if (typeof message.getBody === 'function') {
+    return String(message.getBody() || '');
+  }
+  return '';
+}
+
+/**
+ * ticketingBodyInputForSender (D-01, quick-261029-pmx) — the single
+ * switch point deciding WHICH body-text source a body-sourced portal's
+ * parser and content detector read: `ticketingMessageRawHtml(message)`
+ * for a sender in TICKET_BODY_RAW_HTML_SENDERS (GoOut), else
+ * `ticketingMessageBodyText(message)` UNCHANGED for every other
+ * body-sourced sender. `senderKey` is the already-lowercased
+ * identifyingEmail (ticketingExtractEmailAddress's own output). Pure,
+ * given a pure `message`.
+ */
+function ticketingBodyInputForSender(message, senderKey) {
+  if (TICKET_BODY_RAW_HTML_SENDERS.indexOf(senderKey) !== -1) {
+    return ticketingMessageRawHtml(message);
+  }
+  return ticketingMessageBodyText(message);
+}
+
+// =============================================================================
+// SCHEMA.ORG MICRODATA READER (quick-261029-pmx)
+// =============================================================================
+//
+// Built for GoOut (info@mg.goout.net, D-02): a THIRD extraction TECHNIQUE
+// for this file, distinct from free-text literal-marker parsing (every
+// other body parser below) and `.ics` parsing (parseIcs, reused via this
+// file's end-of-file Node/GAS bridge). GoOut's confirmation carries FIVE
+// `<div itemscope itemtype=".../EventReservation">` blocks, each with
+// THREE `itemprop="name"` properties (the buyer, the event and the venue,
+// in that order) — a flat `itemprop="name"` regex would grab the buyer's
+// own name as the event name, which is exactly the trap this scope-aware
+// reader avoids.
+//
+// WHY NOT a flat itemprop="name" regex: every block holds three `name`
+// properties, buyer first.
+// WHY NOT slicing per block and taking "the first name after
+// reservationFor": that is only correct on the real sample because the
+// Event's own name happens to precede its location div — microdata
+// guarantees no property order.
+// WHY NOT XmlService: this HTML is not well-formed XML (a void `<br>`;
+// unclosed `<meta ...>` tags on addressRegion/postalCode/addressCountry
+// in the real sample).
+// WHY NOT a DOM library: Apps Script has no runtime npm dependencies.
+//
+// DOCUMENTED LIMITATION: an unescaped `>` inside a quoted attribute value
+// ends that tag early; a properly escaped `&gt;` is fine.
+
+// TICKETING_MICRODATA_TAG_PATTERN (D-02, quick-261029-pmx) — matches ANY
+// HTML tag (opening or closing): group 1 the optional leading '/' for a
+// closing tag, group 2 the tag name, group 3 the remaining (possibly
+// empty) attribute text. Linear: a negated class `[^>]*` bounded by a
+// literal `>` — never a nested quantifier (T-261029-03). `g`-flagged;
+// every caller resets `lastIndex` to 0 first.
+const TICKETING_MICRODATA_TAG_PATTERN = /<(\/?)([A-Za-z][A-Za-z0-9-]*)([^>]*)>/g;
+
+// TICKETING_HTML_ATTRIBUTE_PATTERN (D-02, quick-261029-pmx) — matches one
+// HTML attribute: a name (any run of characters excluding whitespace,
+// quotes, angle brackets, `/` and `=`), optionally followed by `=` and a
+// double-quoted, single-quoted or bare (unquoted) value. Each alternative
+// is disjoint and bounded by its own closing delimiter or a negated
+// class — never a nested quantifier (T-261029-03). `g`-flagged; every
+// caller resets `lastIndex` to 0 first.
+const TICKETING_HTML_ATTRIBUTE_PATTERN = /([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+
+// TICKETING_HTML_VOID_ELEMENTS (D-02, quick-261029-pmx) — HTML5 void
+// element names (lowercase), each of which can never have a matching
+// closing tag and so never gets pushed onto the reader's own element
+// stack.
+const TICKETING_HTML_VOID_ELEMENTS = [
+  'area',
+  'base',
+  'br',
+  'col',
+  'embed',
+  'hr',
+  'img',
+  'input',
+  'link',
+  'meta',
+  'param',
+  'source',
+  'track',
+  'wbr',
+];
+
+// TICKETING_MICRODATA_PROPERTY_NAME_PATTERN (D-02, quick-261029-pmx) — an
+// itemprop token must be a plain identifier (a letter, then letters/
+// digits only) to be assigned onto a scope object — this is what rejects
+// `__proto__` and its kin (T-261029-08).
+const TICKETING_MICRODATA_PROPERTY_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9]*$/;
+
+/**
+ * ticketingParseHtmlAttributes (D-02, quick-261029-pmx) — pure; parses an
+ * HTML tag's raw attribute text (everything between the tag name and the
+ * closing `>`, INCLUDING a trailing self-closing `/` if present — callers
+ * decide what that trailing slash means) into an `Object.create(null)`
+ * map of LOWERCASED attribute names to their (still entity-ENCODED)
+ * string values. A value-less (boolean) attribute maps to `''`. The FIRST
+ * occurrence of a given name wins — a later duplicate on the same tag is
+ * ignored. Resets TICKETING_HTML_ATTRIBUTE_PATTERN's `lastIndex` to 0
+ * first. Never throws.
+ */
+function ticketingParseHtmlAttributes(attributeText) {
+  const attributes = Object.create(null);
+  const text = String(attributeText || '');
+
+  TICKETING_HTML_ATTRIBUTE_PATTERN.lastIndex = 0;
+  let match = TICKETING_HTML_ATTRIBUTE_PATTERN.exec(text);
+  while (match !== null) {
+    const name = match[1].toLowerCase();
+    if (!Object.prototype.hasOwnProperty.call(attributes, name)) {
+      const value = match[2] !== undefined ? match[2] : match[3] !== undefined ? match[3] : match[4] !== undefined ? match[4] : '';
+      attributes[name] = value;
+    }
+    match = TICKETING_HTML_ATTRIBUTE_PATTERN.exec(text);
+  }
+
+  return attributes;
+}
+
+/**
+ * ticketingAssignMicrodataProperty (D-02, quick-261029-pmx) — pure; step 7
+ * of ticketingReadMicrodataItems's algorithm (see its own JSDoc below).
+ * Splits `itempropAttr` on whitespace and, for each token matching
+ * TICKETING_MICRODATA_PROPERTY_NAME_PATTERN that is NOT already an OWN
+ * property of `scope` (FIRST WINS), sets `scope[token] = value`. A token
+ * failing the pattern — including `__proto__`, which starts with `_` — is
+ * silently skipped (T-261029-08).
+ */
+function ticketingAssignMicrodataProperty(scope, itempropAttr, value) {
+  const tokens = String(itempropAttr || '').split(/\s+/);
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token && TICKETING_MICRODATA_PROPERTY_NAME_PATTERN.test(token) && !Object.prototype.hasOwnProperty.call(scope, token)) {
+      scope[token] = value;
+    }
+  }
+}
+
+/**
+ * ticketingReadMicrodataItems (D-02, quick-261029-pmx) — a GENERIC,
+ * scope-aware schema.org MICRODATA reader, regex/string-based like every
+ * other parser in this file (see this section's banner for the why-not
+ * list: a flat regex, block-slicing, XmlService, a DOM library).
+ *
+ * ALGORITHM:
+ *   1. String-coerce `html`, then run it through
+ *      ticketingStripHtmlScriptStyleAndComments (D-03) — `<head>` is NOT
+ *      stripped, since it never holds an itemscope.
+ *   2. Scan tags via TICKETING_MICRODATA_TAG_PATTERN (`lastIndex` reset to
+ *      0 first); `<!DOCTYPE>` and comments never match (comments are
+ *      already gone by step 1).
+ *   3. Parse each tag's attribute text via ticketingParseHtmlAttributes.
+ *   4. Maintain an element stack of `{ tagName, item }`. A tag is VOID
+ *      when its lowercased name is in TICKETING_HTML_VOID_ELEMENTS, or
+ *      its attribute text ends in `/` (self-closing). A closing tag pops
+ *      back to and including the NEAREST stack entry with the same
+ *      tagName, or is ignored if none matches. The current SCOPE is the
+ *      `item` of the topmost stack entry that has one, or `null`.
+ *   5. An opening tag WITH an `itemscope` attribute creates
+ *      `{ '@type': <the last '/'-segment of the FIRST whitespace-
+ *      separated itemtype token, or ''> }`.
+ *      - If it ALSO has an `itemprop` attribute and a current scope
+ *        exists, the new item is assigned INTO that scope (step 7)
+ *        instead of becoming a top-level result.
+ *      - If it has NO `itemprop` and ANY of its itemtype tokens' last
+ *        segment equals `itemTypeName`, it is collected as a TOP-LEVEL
+ *        RESULT (regardless of its own DOM nesting depth).
+ *      - It is pushed onto the stack (as a scope for its own
+ *        descendants) unless it is void.
+ *   6. An opening tag WITHOUT `itemscope`, but WITH `itemprop` and a
+ *      current scope, takes its value from the FIRST present of
+ *      `content`, `datetime`, `href`, `src`, decoded via
+ *      ticketingDecodeHtmlEntities (D-03) — `''` when none is present (a
+ *      text-CONTENT value is UNSUPPORTED, since it is unobserved). It is
+ *      assigned (step 7) and pushed unless void.
+ *   7. ASSIGN (ticketingAssignMicrodataProperty): split `itemprop` on
+ *      whitespace; set each token matching
+ *      TICKETING_MICRODATA_PROPERTY_NAME_PATTERN that is not already an
+ *      OWN property of the scope object (FIRST WINS).
+ *
+ * RETURN VALUE: an array of plain objects (nested items are plain objects
+ * too) in DOCUMENT ORDER. NEVER throws; `null`/`undefined`/`''` all give
+ * `[]`.
+ */
+function ticketingReadMicrodataItems(html, itemTypeName) {
+  const text = ticketingStripHtmlScriptStyleAndComments(String(html || ''));
+  const results = [];
+  const stack = [];
+
+  TICKETING_MICRODATA_TAG_PATTERN.lastIndex = 0;
+  let match = TICKETING_MICRODATA_TAG_PATTERN.exec(text);
+
+  while (match !== null) {
+    const isClosing = match[1] === '/';
+    const tagName = match[2].toLowerCase();
+    const attributeText = match[3] || '';
+
+    if (isClosing) {
+      let popIndex = -1;
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (stack[i].tagName === tagName) {
+          popIndex = i;
+          break;
+        }
+      }
+      if (popIndex !== -1) {
+        stack.length = popIndex;
+      }
+      match = TICKETING_MICRODATA_TAG_PATTERN.exec(text);
+      continue;
+    }
+
+    const attributes = ticketingParseHtmlAttributes(attributeText);
+    const isVoid = TICKETING_HTML_VOID_ELEMENTS.indexOf(tagName) !== -1 || /\/\s*$/.test(attributeText);
+
+    let currentScope = null;
+    for (let i = stack.length - 1; i >= 0; i--) {
+      if (stack[i].item) {
+        currentScope = stack[i].item;
+        break;
+      }
+    }
+
+    const hasItemscope = Object.prototype.hasOwnProperty.call(attributes, 'itemscope');
+    const itempropValue = Object.prototype.hasOwnProperty.call(attributes, 'itemprop') ? attributes['itemprop'] : null;
+
+    if (hasItemscope) {
+      const itemtypeAttr = attributes['itemtype'] || '';
+      const itemtypeTokens = itemtypeAttr.split(/\s+/).filter(function (token) {
+        return token;
+      });
+      const firstTokenSegments = (itemtypeTokens[0] || '').split('/');
+      const newItem = { '@type': firstTokenSegments[firstTokenSegments.length - 1] || '' };
+
+      if (itempropValue && currentScope) {
+        ticketingAssignMicrodataProperty(currentScope, itempropValue, newItem);
+      } else if (!itempropValue) {
+        const matchesRequestedType = itemtypeTokens.some(function (token) {
+          const segments = token.split('/');
+          return segments[segments.length - 1] === itemTypeName;
+        });
+        if (matchesRequestedType) {
+          results.push(newItem);
+        }
+      }
+
+      if (!isVoid) {
+        stack.push({ tagName: tagName, item: newItem });
+      }
+    } else if (itempropValue && currentScope) {
+      const rawValue =
+        attributes['content'] !== undefined
+          ? attributes['content']
+          : attributes['datetime'] !== undefined
+            ? attributes['datetime']
+            : attributes['href'] !== undefined
+              ? attributes['href']
+              : attributes['src'] !== undefined
+                ? attributes['src']
+                : '';
+      ticketingAssignMicrodataProperty(currentScope, itempropValue, ticketingDecodeHtmlEntities(rawValue));
+      if (!isVoid) {
+        stack.push({ tagName: tagName, item: null });
+      }
+    } else if (!isVoid) {
+      stack.push({ tagName: tagName, item: null });
+    }
+
+    match = TICKETING_MICRODATA_TAG_PATTERN.exec(text);
+  }
+
+  return results;
+}
+
+/**
  * ticketBodyLooksProcessable — the shared body-content gate behind both
  * admission points. Returns true when `senderKey` has no registered detector
  * (fail-open, see the registry's JSDoc), otherwise the detector's verdict on
- * `ticketingMessageBodyText(message)` (quick-261026-ma6: previously
- * `message.getPlainBody()` directly — every portal whose plain body is
- * non-blank still sees byte-identical input, since the fallback only
- * triggers when that is blank). Pure, no GAS globals.
+ * `ticketingBodyInputForSender(message, senderKey)` (quick-261026-ma6:
+ * previously `message.getPlainBody()` directly; quick-261029-pmx, D-01:
+ * now routes through ticketingBodyInputForSender, which reads the RAW
+ * HTML for a sender in TICKET_BODY_RAW_HTML_SENDERS — every other sender
+ * still sees byte-identical input via ticketingMessageBodyText). Pure, no
+ * GAS globals.
  */
 function ticketBodyLooksProcessable(message, senderKey) {
   const detector = TICKET_BODY_CONTENT_DETECTORS_BY_IDENTIFYING_EMAIL[senderKey];
@@ -3569,7 +4484,7 @@ function ticketBodyLooksProcessable(message, senderKey) {
     return true;
   }
 
-  return detector(ticketingMessageBodyText(message)) === true;
+  return detector(ticketingBodyInputForSender(message, senderKey)) === true;
 }
 
 /**
@@ -3692,6 +4607,15 @@ function isDuplicateTicketPurchase(ticketIdentifier, calendarId) {
   return false;
 }
 
+// TICKET_UTC_OFFSET_PATTERN (D-05, quick-261029-pmx) — validates an
+// explicit UTC offset suffix ('Z' or '+HH:MM'/'-HH:MM') before it is
+// appended VERBATIM to a Calendar API dateTime string in
+// buildTicketCalendarEventResource below. Anchored both ends so a
+// malformed or unexpected value (e.g. '+1:00', a bare 'UTC', or an IANA
+// zone name) is silently ignored rather than producing an invalid
+// dateTime string.
+const TICKET_UTC_OFFSET_PATTERN = /^(?:Z|[+-]\d{2}:\d{2})$/;
+
 /**
  * buildTicketCalendarEventResource — the PURE half of
  * createTicketCalendarEvent: given a `parsedTicket`, an already-resolved
@@ -3721,6 +4645,19 @@ function isDuplicateTicketPurchase(ticketIdentifier, calendarId) {
  * VERBATIM as the end components instead of the
  * DEFAULT_EVENT_DURATION_MINUTES fallback below. No pre-existing parser
  * sets `parsedTicket.end`, so this is a no-op for every other portal.
+ *
+ * EXPLICIT UTC OFFSET (quick-261029-pmx, D-05): when `parsedTicket.utcOffset`
+ * is a string matching TICKET_UTC_OFFSET_PATTERN (only GoOut's parser
+ * ever sets this — its microdata startDate is itself offset-qualified),
+ * that offset is appended VERBATIM to BOTH `start.dateTime` and
+ * `end.dateTime`, alongside the still-present `timeZone` field (the
+ * Calendar API's own events.insert sample sends both together). This
+ * makes the created instant EXACT regardless of the resolved calendar's
+ * own zone, at the cost of a documented limitation: an event spanning a
+ * DST transition keeps the START's offset for its END too (accepted). A
+ * malformed value (e.g. `'+1:00'`, an IANA zone name, or a non-string)
+ * is silently ignored, producing today's unsuffixed strings — a no-op
+ * for every portal that never sets this field.
  */
 function buildTicketCalendarEventResource(parsedTicket, timeZone, attachments) {
   const startComponents = {
@@ -3740,11 +4677,14 @@ function buildTicketCalendarEventResource(parsedTicket, timeZone, attachments) {
       }
     : addMinutesToWallClockComponents(startComponents, DEFAULT_EVENT_DURATION_MINUTES);
 
+  const utcOffsetSuffix =
+    typeof parsedTicket.utcOffset === 'string' && TICKET_UTC_OFFSET_PATTERN.test(parsedTicket.utcOffset) ? parsedTicket.utcOffset : '';
+
   const resource = {
     summary: parsedTicket.eventName,
     location: parsedTicket.location,
-    start: { dateTime: formatWallClockComponentsIso(startComponents), timeZone: timeZone },
-    end: { dateTime: formatWallClockComponentsIso(endComponents), timeZone: timeZone },
+    start: { dateTime: formatWallClockComponentsIso(startComponents) + utcOffsetSuffix, timeZone: timeZone },
+    end: { dateTime: formatWallClockComponentsIso(endComponents) + utcOffsetSuffix, timeZone: timeZone },
   };
 
   // description: OPTIONAL, backward-compatible. Only Ticketmaster CZ's and
@@ -3997,24 +4937,42 @@ function processTicketPdfAttachment(attachment, portal) {
  * pre-existing body parsers each take fewer parameters and simply ignore the
  * extra arguments, so their behavior is unchanged.
  *
+ * RAW-HTML BODY SOURCE (quick-261029-pmx, D-01): `senderKey` is computed
+ * ONCE at the top and reused by every lookup below. For a sender in
+ * TICKET_BODY_RAW_HTML_SENDERS (GoOut), step 1 logs a dedicated line and
+ * reads `ticketingBodyInputForSender(message, senderKey)` directly —
+ * `message.getPlainBody()` is NEVER called for such a sender, since its
+ * event data lives only in HTML tag attributes that every plain-text
+ * rendering discards. Every other sender keeps the EXACT pre-existing
+ * blank-plain-body-then-HTML-fallback behavior.
+ *
  * GAS-only (GmailMessage/DriveApp/CalendarApp/Calendar globals) — not
  * unit-tested, proven only by the live checkpoint; the pure logic it
  * depends on (parseKinoArtTicketText and friends) IS fully unit-tested.
  */
 function processTicketFromMessageBody(message, portal) {
   const calendarId = resolveTicketingCalendarId(portal, CONFIG.calendarId);
-  const rawPlainBody = message.getPlainBody();
-  const plainBodyIsBlank = !rawPlainBody || String(rawPlainBody).trim() === '';
-  const bodyText = ticketingMessageBodyText(message);
+  const senderKey = ticketingExtractEmailAddress(portal.identifyingEmail);
 
-  if (plainBodyIsBlank && typeof message.getBody === 'function') {
-    console.log(
-      'Ticketing portal: message.getPlainBody() was blank for ' + portal.identifyingEmail +
-        "; parsing the HTML body's own text rendering instead."
-    );
+  let bodyText;
+  if (TICKET_BODY_RAW_HTML_SENDERS.indexOf(senderKey) !== -1) {
+    console.log('Ticketing portal: reading the raw HTML body (schema.org microdata) for ' + portal.identifyingEmail + '.');
+    bodyText = ticketingBodyInputForSender(message, senderKey);
+  } else {
+    const rawPlainBody = message.getPlainBody();
+    const plainBodyIsBlank = !rawPlainBody || String(rawPlainBody).trim() === '';
+
+    if (plainBodyIsBlank && typeof message.getBody === 'function') {
+      console.log(
+        'Ticketing portal: message.getPlainBody() was blank for ' + portal.identifyingEmail +
+          "; parsing the HTML body's own text rendering instead."
+      );
+    }
+
+    bodyText = ticketingBodyInputForSender(message, senderKey);
   }
 
-  const parseTicketBody = TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL[ticketingExtractEmailAddress(portal.identifyingEmail)];
+  const parseTicketBody = TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL[senderKey];
   if (!parseTicketBody) {
     throw new Error('No ticket-body parser registered for ticketing portal: ' + portal.identifyingEmail);
   }
@@ -4030,7 +4988,7 @@ function processTicketFromMessageBody(message, portal) {
   const attachments = [];
 
   if (portal.insertPdfIntoEvent) {
-    const findPortalTicketPdfAttachment = TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL[ticketingExtractEmailAddress(portal.identifyingEmail)];
+    const findPortalTicketPdfAttachment = TICKET_BODY_MODE_PDF_FINDERS_BY_IDENTIFYING_EMAIL[senderKey];
     const pdfAttachment = findPortalTicketPdfAttachment ? findPortalTicketPdfAttachment(message) : null;
 
     if (pdfAttachment) {
@@ -4061,7 +5019,7 @@ function processTicketFromMessageBody(message, portal) {
   // creation: an EMPTY result sends a separate notification email and
   // then carries straight on to create the event. A PARTIAL result is not
   // a failure worth an email.
-  const fetchPortalAttachments = TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL[ticketingExtractEmailAddress(portal.identifyingEmail)];
+  const fetchPortalAttachments = TICKET_BODY_MODE_ATTACHMENT_FETCHERS_BY_IDENTIFYING_EMAIL[senderKey];
   if (fetchPortalAttachments) {
     const fetchedAttachments = fetchPortalAttachments(message, parsedTicket, portal);
 
@@ -4443,6 +5401,17 @@ if (typeof module !== 'undefined' && module.exports) {
     findWebticketTicketPdfAttachment: findWebticketTicketPdfAttachment,
     TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL: TICKET_ICS_PARSED_TICKET_BUILDERS_BY_IDENTIFYING_EMAIL,
     parseWebticketOrderText: parseWebticketOrderText,
+    // The ninth portal, GoOut (quick-261029-pmx) -- BODY-SOURCED from
+    // schema.org EventReservation microdata in its RAW HTML.
+    parseGooutTicketHtml: parseGooutTicketHtml,
+    gooutHtmlHasConfirmedReservation: gooutHtmlHasConfirmedReservation,
+    ticketingReadMicrodataItems: ticketingReadMicrodataItems,
+    ticketingDecodeHtmlEntities: ticketingDecodeHtmlEntities,
+    ticketingStripHtmlScriptStyleAndComments: ticketingStripHtmlScriptStyleAndComments,
+    TICKET_BODY_RAW_HTML_SENDERS: TICKET_BODY_RAW_HTML_SENDERS,
+    ticketingBodyInputForSender: ticketingBodyInputForSender,
+    ticketingMessageRawHtml: ticketingMessageRawHtml,
+    findGooutTicketPdfAttachment: findGooutTicketPdfAttachment,
   };
 }
 
