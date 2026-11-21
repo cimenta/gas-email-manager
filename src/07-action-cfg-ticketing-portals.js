@@ -30,7 +30,9 @@
  * quick-261029-pmx, a body-sourced portal (GoOut) is parsed from the
  * schema.org reservation MICRODATA in its RAW HTML rather than any text
  * rendering, since every text rendering strips the attributes that
- * microdata lives in.
+ * microdata lives in. Since quick-261120-ue1, a SECOND PDF/OCR-sourced
+ * portal (Golden Tours) exists alongside enigoo.cz — the first to use the
+ * PDF/OCR PARSER CONTRACT's new inert second (subject) argument.
  */
 const TICKETING_PORTALS_ACTION_CONFIG = {
   // Cross-cutting per-action enable/disable toggle, same convention as
@@ -61,7 +63,7 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // whether it then survives in the permanent folder + becomes a real
   // Calendar attachment, or is deleted).
   //
-  // The shipped default seeds NINE entries: enigoo.cz (the original portal
+  // The shipped default seeds TEN entries: enigoo.cz (the original portal
   // this feature was built from, PDF/OCR-sourced — see the sibling action
   // file's parseEnigooTicketText), Kino Art (kinoart.cz, a Czech cinema,
   // added quick-260731-kar, BODY-SOURCED — see the sibling action file's
@@ -80,20 +82,24 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // file's parseSmsticketTicketText), WebTicket.cz
   // (automat@webticket.cz, added quick-261028-h1n, ICS-SOURCED like
   // Ticketportal.cz — see the sibling action file's
-  // buildWebticketParsedTicket), and GoOut (info@mg.goout.net, added
+  // buildWebticketParsedTicket), GoOut (info@mg.goout.net, added
   // quick-261029-pmx, BODY-SOURCED from the schema.org EventReservation
   // microdata in its raw HTML — see the sibling action file's
-  // parseGooutTicketHtml). The first five entries, the seventh AND THE
-  // NINTH ship with calendarId left null and insertPdfIntoEvent left
+  // parseGooutTicketHtml), and Golden Tours (assistant@curatedplanet.com,
+  // added quick-261120-ue1, PDF/OCR-sourced, the SECOND portal to use this
+  // mode after enigoo.cz — see the sibling action file's
+  // parseGoldenToursTicketText). The first five entries, the seventh AND
+  // THE NINTH ship with calendarId left null and insertPdfIntoEvent left
   // false — the owner fills in the real calendar ID and decides the
   // attachment toggle live, per entry, via rebuildScriptProperties() +
   // Script Properties, matching the now-established settings workflow
   // (never committed to git — same placeholder-calendar-ID convention as
-  // CONFIG.calendarId itself). The SIXTH AND EIGHTH entries (Ticketportal.cz
-  // and WebTicket.cz) ship with insertPdfIntoEvent TRUE — an owner decision,
-  // not a placeholder: both portals' ticket PDFs also supply the dedup
-  // ticketIdentifier (see TICKETPORTAL.CZ and WEBTICKET.CZ below), so
-  // there is no reason to ship either off.
+  // CONFIG.calendarId itself). The SIXTH, EIGHTH AND TENTH entries
+  // (Ticketportal.cz, WebTicket.cz and Golden Tours) ship with
+  // insertPdfIntoEvent TRUE — an owner decision, not a placeholder: all
+  // three portals' ticket PDFs also supply the dedup ticketIdentifier (see
+  // TICKETPORTAL.CZ, WEBTICKET.CZ and GOLDEN TOURS below), so there is no
+  // reason to ship any of them off. The NINTH entry (GoOut) stays false.
   //
   // FEVER (hello@feverup.com): the sender also sends ordinary marketing
   // mail, which is why a content detector (feverTextHasPurchaseDetails) is
@@ -228,6 +234,46 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // may add its OWN copy of the event from this same markup — that copy
   // is Google's, not this script's, and carries no ticketIdentifier tag.
   //
+  // GOLDEN TOURS (assistant@curatedplanet.com, quick-261120-ue1): PDF/OCR-
+  // SOURCED, the TENTH portal, the SECOND ever to use this mode (after
+  // enigoo.cz). The confirmation email's body carries only a short
+  // marketing-style summary with no usable event data (no .ics, no
+  // schema.org microdata); every real detail (the product name, the exact
+  // meeting point and time, and the dedup identifier) lives only inside
+  // the attached voucher PDF, whose filename is literally "voucher" with
+  // no .pdf extension at all — isTicketPdfAttachment's existing
+  // content-type fallback already matches it with zero code change
+  // (D-03). Dedup is keyed on the voucher PDF's OWN "Order Reference" —
+  // almost certainly the value its own QR code encodes, the real
+  // boarding/entry credential — NEVER curatedplanet.com's own
+  // booking-platform reference shown in the confirmation email's subject
+  // and body (D-05). A new English 3-letter month-abbreviation map
+  // (GOLDEN_TOURS_MONTH_ABBREVIATIONS, D-04) parses the voucher's own
+  // "Travel Date" field, since neither pre-existing month table fits.
+  // curatedplanet.com's own booking-platform reference is still captured
+  // — from the message SUBJECT, not the body — via the PDF/OCR PARSER
+  // CONTRACT's new inert-by-default second argument (D-06), surfaced in
+  // the event description for the owner's own inbox-search convenience,
+  // never used for dedup. insertPdfIntoEvent ships TRUE below (D-07): the
+  // voucher PDF is both the real boarding/entry credential and the source
+  // of the dedup ticketIdentifier, so there is no placeholder reason to
+  // ship it off. NO content detector is registered for this sender
+  // (D-09), despite curatedplanet.com's own purpose beyond this one
+  // sample being unconfirmed (it could plausibly be a white-label
+  // booking-confirmation platform shared by other brands, the same risk
+  // category as Entradio/GoOut) — per this codebase's own established
+  // FAIL-OPEN-BY-DESIGN, discovered-live philosophy, a detector is an
+  // opt-in fix for a problem found LIVE, never a speculative preemptive
+  // one; every REQUIRED anchor already fails loudly with the complete raw
+  // OCR text in the owner's failure-notification email if this sender is
+  // ever observed sending something that isn't a Golden Tours voucher.
+  // FIXTURE-PROVENANCE CAVEAT (D-10): this plan's own test fixture is a
+  // RECONSTRUCTION of the real voucher's OCR'd text, not a byte-exact
+  // transcription (the plan was authored with no live OCR access) — the
+  // owner's live checkpoint must specifically compare the real voucher's
+  // OCR'd text against this parser's anchors before trusting the fixture
+  // tests as proof the real pipeline works.
+  //
   // Script Property override: 07-action-ticketing-portals-TICKETING_PORTALS
   // (json — array of {identifyingEmail, calendarId, insertPdfIntoEvent}
   // objects).
@@ -237,7 +283,7 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
   // src/05-action-cfg-ics-import.js for the exact same JSON-vs-JS-object-
   // literal pitfall a real owner mistake already hit once for that other
   // JSON-typed setting):
-  // [{"identifyingEmail":"no-reply@enigoo.cz","calendarId":"abc123@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":"def456@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"noreply@ticketmaster.cz","calendarId":"ghi789@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"no-reply@app.entradio.cz","calendarId":"jkl012@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"hello@feverup.com","calendarId":"mno345@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"vstupenky@ticketportal.cz","calendarId":"pqr678@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"info@smsticket.cz","calendarId":"stu901@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"automat@webticket.cz","calendarId":"vwx234@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"info@mg.goout.net","calendarId":"yza567@group.calendar.google.com","insertPdfIntoEvent":false}]
+  // [{"identifyingEmail":"no-reply@enigoo.cz","calendarId":"abc123@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"rezervace@kinoart.cz","calendarId":"def456@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"noreply@ticketmaster.cz","calendarId":"ghi789@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"no-reply@app.entradio.cz","calendarId":"jkl012@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"hello@feverup.com","calendarId":"mno345@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"vstupenky@ticketportal.cz","calendarId":"pqr678@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"info@smsticket.cz","calendarId":"stu901@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"automat@webticket.cz","calendarId":"vwx234@group.calendar.google.com","insertPdfIntoEvent":true},{"identifyingEmail":"info@mg.goout.net","calendarId":"yza567@group.calendar.google.com","insertPdfIntoEvent":false},{"identifyingEmail":"assistant@curatedplanet.com","calendarId":"bcd890@group.calendar.google.com","insertPdfIntoEvent":true}]
   get ticketingPortals() {
     return getJsonSetting(
       '07-action-ticketing-portals-TICKETING_PORTALS',
@@ -251,6 +297,7 @@ const TICKETING_PORTALS_ACTION_CONFIG = {
         { identifyingEmail: 'info@smsticket.cz', calendarId: null, insertPdfIntoEvent: false },
         { identifyingEmail: 'automat@webticket.cz', calendarId: null, insertPdfIntoEvent: true },
         { identifyingEmail: 'info@mg.goout.net', calendarId: null, insertPdfIntoEvent: false },
+        { identifyingEmail: 'assistant@curatedplanet.com', calendarId: null, insertPdfIntoEvent: true },
       ],
       isValidTicketingPortalsShape
     );

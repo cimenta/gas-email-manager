@@ -8,7 +8,7 @@ Five actions ship today:
 
 - **ICS-to-Calendar import** — any sender, generic `.ics` calendar attachments
 - **Booking.com reservation management** — booking.com
-- **Ticketing-portal import** — enigoo.cz, Kino Art (kinoart.cz), Ticketmaster CZ (ticketmaster.cz), Entradio (app.entradio.cz), Fever (feverup.com), Ticketportal.cz (ticketportal.cz), smsticket (smsticket.cz), WebTicket (webticket.cz), GoOut (goout.net)
+- **Ticketing-portal import** — enigoo.cz, Kino Art (kinoart.cz), Ticketmaster CZ (ticketmaster.cz), Entradio (app.entradio.cz), Fever (feverup.com), Ticketportal.cz (ticketportal.cz), smsticket (smsticket.cz), WebTicket (webticket.cz), GoOut (goout.net), Golden Tours (via curatedplanet.com)
 - **Transport ticket import** — RegioJet (regiojet.cz), IDOS.cz (idos.svt.cz)
 - **Meetings** — body-sourced meeting invites with no `.ics` attachment, matched by sender domain; Teamio (teamio.com) ships first
 
@@ -238,6 +238,7 @@ only the extraction differs.
 | Portal | Mode | Where the event data comes from |
 | --- | --- | --- |
 | enigoo.cz | PDF/OCR | the attached PDF ticket |
+| Golden Tours (via curatedplanet.com) | PDF/OCR | the attached PDF voucher |
 | Kino Art (kinoart.cz) | body | the plain-text email body |
 | Ticketmaster CZ (ticketmaster.cz) | body | the plain-text email body |
 | Entradio (app.entradio.cz) | body | the plain-text email body |
@@ -271,6 +272,22 @@ no native PDF text parser, this mode:
    your permanent configured Drive folder and attaches it to the event as a
    real Calendar attachment; otherwise deletes it. Nothing lingers in
    either Drive folder unless you asked for it.
+
+**Golden Tours** (`assistant@curatedplanet.com`) is worth calling out:
+the voucher PDF carries its OWN order reference, a different literal
+value from the booking reference shown in the confirmation email's
+subject and body — since this mode only ever reads the OCR'd PDF text,
+the PDF's own reference is what dedup uses. The booking-platform's own
+reference is still captured — from the email's subject line, not its
+body — and surfaced in the event's description, so the owner can
+cross-reference their inbox. The event's location is the voucher's own
+meeting point; its date and time come from the voucher's own "Travel
+Date"/"Meeting Time" fields, including an English three-letter month
+abbreviation (e.g. "Jan") via a small lookup table. The ticket PDF is
+attached by default (`insertPdfIntoEvent` shipped on), since it is both
+the real boarding voucher and the source of the dedup identifier. No
+content detector is registered for this sender; this plan's SUMMARY
+documents why.
 
 ### Body mode
 

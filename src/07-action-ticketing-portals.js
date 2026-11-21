@@ -13,7 +13,14 @@
  *     carries no usable event data — everything (event name, date/time,
  *     venue) is inside an attached PDF ticket, extracted via Google
  *     Drive's PDF-to-Google-Docs OCR conversion, since Apps Script has no
- *     native PDF text parser.
+ *     native PDF text parser. Since quick-261120-ue1, a SECOND PDF/OCR-
+ *     sourced portal (Golden Tours, assistant@curatedplanet.com) exists
+ *     alongside enigoo.cz — its parser (parseGoldenToursTicketText) is the
+ *     FIRST to use this mode's PARSER CONTRACT's new, inert-by-default
+ *     second (subject) argument, which surfaces curatedplanet.com's own
+ *     booking-platform reference (read from the message subject) in the
+ *     event description without changing the dedup `ticketIdentifier`,
+ *     which stays the voucher PDF's own "Order Reference" (D-05, D-06).
  *   - Body-sourced (e.g. Kino Art, Ticketmaster CZ): the event data is
  *     parsed directly from the email's plain-text body. When that body is
  *     BLANK (smsticket.cz, quick-261026-ma6: its real text/plain MIME part
@@ -62,7 +69,11 @@
  * fresh UID for every sent email, so a re-send would otherwise duplicate
  * the event). GoOut's (quick-261029-pmx) identifier is the order's own
  * `reservationNumber`, identical across its per-ticket microdata blocks,
- * never a per-seat `ticketNumber` (which differs per block).
+ * never a per-seat `ticketNumber` (which differs per block). Golden
+ * Tours' (quick-261120-ue1) identifier is the voucher PDF's OWN "Order
+ * Reference" — never curatedplanet.com's own booking-platform reference
+ * (which this mode never even reads from the message body); that other
+ * reference is only ever surfaced in the event description (D-05).
  *
  * ALL PORTAL-SPECIFIC PARSING LOGIC LIVES IN THIS ONE FILE: every parser is
  * a clearly-separated, well-named function/section within THIS file (e.g.
@@ -331,6 +342,375 @@ function parseEnigooTicketText(text) {
     hour: hour,
     minute: minute,
     ticketIdentifier: ticketIdentifier,
+  };
+}
+
+// =============================================================================
+// GOLDEN TOURS (assistant@curatedplanet.com) — the TENTH supported portal,
+// the SECOND PDF/OCR-sourced one (quick-261120-ue1)
+// =============================================================================
+
+// GOLDEN_TOURS_MONTH_ABBREVIATIONS (D-04) — English, lowercase, 3-letter
+// month abbreviations ("jan".."dec") mapped to zero-indexed month numbers,
+// as printed on the voucher's own "Travel Date" field (e.g. "Tue 05 Jan,
+// 2027"). Neither pre-existing month table fits: TICKETMASTER_CZ_MONTH_NAMES
+// holds FULL English month names ("january", not "jan"), and
+// FEVER_MONTH_ABBREVIATIONS holds CZECH 3-letter abbreviations ("led",
+// "uno", "bre"...). Looked up via `.toLowerCase()` on the matched token — no
+// diacritic folding is needed, since English month abbreviations carry none.
+// Not separately exported, same precedent as FEVER_MONTH_ABBREVIATIONS
+// (tested indirectly through the parser, never as its own exported object).
+const GOLDEN_TOURS_MONTH_ABBREVIATIONS = {
+  jan: 0,
+  feb: 1,
+  mar: 2,
+  apr: 3,
+  may: 4,
+  jun: 5,
+  jul: 6,
+  aug: 7,
+  sep: 8,
+  oct: 9,
+  nov: 10,
+  dec: 11,
+};
+
+// GOLDEN_TOURS_DATE_PATTERN / GOLDEN_TOURS_TIME_PATTERN (debug/golden-tours-
+// no-event) — the self-terminating VALUE SHAPES for the Travel Date and
+// Meeting Time fields, shared with every caller of
+// goldenToursFindValueNearestLabel below. GLOBAL flag required (that helper
+// scans every occurrence via a loop); it resets `.lastIndex` on every call,
+// so reusing these two module-level RegExp literals across repeated
+// parseGoldenToursTicketText calls (one per processed message) is safe.
+const GOLDEN_TOURS_DATE_PATTERN = /(?:[A-Za-z]+\s+)?(\d{1,2})\s+([A-Za-z]+),?\s*(\d{4})/g;
+const GOLDEN_TOURS_TIME_PATTERN = /(\d{1,2}):(\d{2})\s*(AM|PM)/gi;
+
+/**
+ * goldenToursFindValueNearestLabel (debug/golden-tours-no-event) — locates
+ * whichever occurrence of `valuePattern` (a GLOBAL RegExp) in `text` starts
+ * CLOSEST, by absolute character distance, to the FIRST occurrence of the
+ * literal `label`.
+ *
+ * WHY NEAREST, NOT "WHATEVER FOLLOWS THE LABEL": Google Drive's real
+ * PDF->Docs OCR conversion of this voucher's two-column visual layout does
+ * not preserve the voucher's own logical reading order (see this file's
+ * parseGoldenToursTicketText doc, below) — a field's value can land BEFORE
+ * its own label just as easily as directly after it (the real sample's
+ * Travel Date row reads "...Tue 05 Jan, 2027 Name: Travel Date:" — value
+ * before both labels). Matching by nearest distance resolves either
+ * ordering with the SAME code, with no "is this the scrambled layout or
+ * the clean one" branch — as long as `valuePattern`'s shape has exactly
+ * one legitimate candidate within whatever `text` the caller passes in.
+ * Every caller below bounds `text` to one of this voucher's own existing
+ * literal section anchors for exactly that reason, rather than searching
+ * the full raw OCR text unbounded — a stray coincidental match deep in
+ * unrelated boilerplate must never be preferred over a genuinely missing
+ * field.
+ *
+ * Returns `null` when `label` does not occur in `text` at all, or when
+ * `valuePattern` has zero matches anywhere in `text` — both read by every
+ * caller as "field not found", preserving this parser's fail-loud
+ * contract: this helper never guesses a value when none can be found. On a
+ * match, returns the regex match array (with its own capture groups) for
+ * the nearest candidate. Pure, no GAS globals.
+ */
+function goldenToursFindValueNearestLabel(text, label, valuePattern) {
+  const labelIndex = text.indexOf(label);
+  if (labelIndex === -1) {
+    return null;
+  }
+
+  valuePattern.lastIndex = 0;
+  let best = null;
+  let bestDistance = Infinity;
+  let match;
+  while ((match = valuePattern.exec(text)) !== null) {
+    const distance = Math.abs(match.index - labelIndex);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = match;
+    }
+  }
+
+  return best;
+}
+
+/**
+ * parseGoldenToursTicketText — the Golden Tours-specific ticket-text parser
+ * (see this file's class-level JSDoc for why every portal's parser lives
+ * here, not in its own file). The SECOND PDF/OCR-sourced parser ever
+ * written, after parseEnigooTicketText.
+ *
+ * PATTERN-ANCHORED EXTRACTION, NOT LINE-POSITION: every field is anchored to
+ * its own literal label, matching this file's established discipline (see
+ * parseEnigooTicketText's own JSDoc) rather than assuming a fixed line/
+ * paragraph layout:
+ *   - SELF-TERMINATING-SHAPE fields need no "next label" bound at all: the
+ *     Order Reference (an alphanumeric run), the Meeting Time (an
+ *     `HH:MM AM/PM` shape) and the Travel Date (an optional weekday
+ *     abbreviation, day, 3-letter month abbreviation, comma, year) each
+ *     stop matching on their own once their own shape is satisfied.
+ *   - FREE-TEXT fields (Product, Option, Tickets, Meeting Point) are each
+ *     bounded between their own literal label and the NEXT literal label
+ *     that could legitimately follow it in the voucher's own field order —
+ *     expressed as a lookahead alternation so an OPTIONAL field being
+ *     absent (Option/Tickets) never breaks the bound for the field that
+ *     follows it.
+ *
+ * NOT ALWAYS LABEL-THEN-OWN-VALUE (debug/golden-tours-no-event): the first
+ * live run (quick-261120-ue1 was merged but never run against real Google
+ * Drive OCR output before this) surfaced that this voucher's real OCR text
+ * does NOT always read label-immediately-followed-by-its-own-value, the
+ * way the pre-live reconstructed fixture assumed. Google Drive's PDF->Docs
+ * OCR conversion of this voucher's two-column visual layout scrambles the
+ * reading order in (at least) two ways: a two-word label split across its
+ * own line with the colon dropped ("Order" alone, then "Reference
+ * X6HZEZX0" on the next line), and label/value RUNS where a value can sit
+ * BEFORE its own label ("...Tue 05 Jan, 2027 Name: Travel Date:" — the
+ * Travel Date value precedes both that label and "Name:") or where two
+ * sibling labels sit adjacently and BOTH their values follow together
+ * afterward ("Meeting Point: Meeting Time:" then, on the next line,
+ * "Golden Tours Visitor Centre ... UK 09:40 AM Product Code: WB"). Three of
+ * the five required anchors are affected:
+ *   - Order Reference's regex now allows the label's own two words to be
+ *     separated by ANY whitespace (a run of spaces or a line break) with
+ *     an OPTIONAL colon, rather than requiring the literal one-line
+ *     "Order Reference:" — this alone fixes that anchor for both the
+ *     direct and the real-OCR shape.
+ *   - Travel Date and Meeting Time are each resolved via
+ *     goldenToursFindValueNearestLabel (above): find the label's own
+ *     position, then pick whichever occurrence of that field's own
+ *     distinctive value SHAPE (date-shape / time-shape) sits CLOSEST to
+ *     it, searched only within a scope bounded by this voucher's own
+ *     existing anchors (Travel Date: before "Product:"; Meeting Time:
+ *     within the Meeting Point/Time field group's own scope, below) — this
+ *     resolves a value landing either before or after its label with the
+ *     SAME code, never a "which ordering is this" branch.
+ *   - Meeting Point (location) is then derived by CARVING that same
+ *     Meeting Point/Time scope and stripping the "Meeting Time:" label and
+ *     its own already-resolved value out of it — whatever free text
+ *     survives, in EITHER ordering, is the location.
+ * Product, Option and Tickets are unaffected — the real OCR text keeps
+ * each of those in direct label-then-value order, so their original
+ * lookahead-bounded capture needed no change.
+ *
+ * REQUIRED vs. OPTIONAL ANCHORS (D-08): "Order Reference", "Product"
+ * (eventName), "Meeting Point" (location), "Travel Date" and "Meeting Time"
+ * are REQUIRED — each throws a controlled Error naming the missing/
+ * unrecognized field if not found. "Option" and "Tickets" are OPTIONAL
+ * enrichments, simply omitted from the description when absent, never
+ * blocking event creation. The subject-sourced booking-platform reference
+ * (see `subject` below) is likewise OPTIONAL.
+ *
+ * THE PDF/OCR PARSER CONTRACT'S NEW SECOND ARGUMENT (D-06): `subject` is the
+ * message's own subject line, used ONLY to extract curatedplanet.com's own
+ * booking-platform reference (a `Ref: <token>` match) for the owner's own
+ * inbox-search convenience in the description — NEVER for dedup (the voucher
+ * PDF's own "Order Reference" is the single source of truth for
+ * `ticketIdentifier`, D-05) and NEVER blocking event creation: a missing or
+ * non-matching `subject` simply omits that one description paragraph. This
+ * is the FIRST time this file's PDF/OCR PARSER CONTRACT has taken a second
+ * argument, mirroring the already-established precedent of extending a
+ * shared contract with one new inert trailing argument for exactly one
+ * portal's need (the BODY-PARSER CONTRACT's `referenceDate`/`subject`
+ * extension for Fever, and the ICS BUILDER CONTRACT's fifth `bodyText`
+ * argument for WebTicket.cz).
+ *
+ * 12-HOUR-TO-24-HOUR CONVERSION reuses the exact noon/midnight handling
+ * already established by parseFeverTicketText (`hour === 12 ? ... : ...`),
+ * not a newly invented shape.
+ *
+ * Returns `{ eventName, location, year, month, day, hour, minute,
+ * ticketIdentifier, description }` (month zero-indexed). `description`
+ * joins, with `'\n\n'`: the Option paragraph (if present), the Tickets
+ * paragraph (if present), the Order-reference paragraph (always present,
+ * since Order Reference is a required anchor) and the confirmation-ref
+ * paragraph (only when `subject` carries a matching `Ref:` token).
+ *
+ * DIAGNOSTIC-ON-FAILURE: every throw below appends the COMPLETE raw `text`
+ * argument (the whole DocumentApp-extracted OCR body text, untruncated),
+ * matching parseEnigooTicketText's own established discipline. Pure, no GAS
+ * globals.
+ */
+function parseGoldenToursTicketText(text, subject) {
+  const rawText = String(text || '');
+
+  // REQUIRED anchor 1: Order Reference. The real Google Drive OCR of this
+  // voucher's two-column layout (debug/golden-tours-no-event) splits the
+  // two-word label across its OWN line -- "Order" alone, then "Reference
+  // X6HZEZX0" on the next line, with NO colon at all between "Reference"
+  // and the value. `\s+` between "Order" and "Reference" matches either a
+  // single space (the direct/clean format) or a line break (the real
+  // OCR); the colon is now OPTIONAL for the same reason. This is the SOLE
+  // source of the dedup ticketIdentifier (D-05) -- never
+  // curatedplanet.com's own booking-platform reference, which this mode
+  // never reads from the message body at all.
+  const orderReferenceMatch = /Order\s+Reference:?\s*([A-Za-z0-9]+)/.exec(rawText);
+  if (!orderReferenceMatch) {
+    throw new Error('Unrecognized Golden Tours voucher text: no "Order Reference" field found. Full extracted text:\n' + rawText);
+  }
+  const ticketIdentifier = orderReferenceMatch[1];
+
+  // REQUIRED anchor 2: Product (eventName) -- bounded between its own label
+  // and whichever later label actually appears next (Option/Tickets are
+  // optional, so their absence must not break this bound). Unaffected by
+  // the real OCR's reading-order scrambling (debug/golden-tours-no-event):
+  // "Product:" and its value stay in direct label-then-value order even
+  // where later fields do not. `productMatch.index` (the "Product:"
+  // label's own position) also bounds the Travel Date search below.
+  const productMatch = /Product:\s*([\s\S]+?)\s*(?=Option:|Tickets:|Meeting Point:|Meeting Time:|Product Code:|Payment Details:|Additional information|Please note:|$)/.exec(
+    rawText
+  );
+  if (!productMatch || !productMatch[1].trim()) {
+    throw new Error('Unrecognized Golden Tours voucher text: no "Product" field found. Full extracted text:\n' + rawText);
+  }
+  const eventName = productMatch[1].trim();
+
+  // OPTIONAL enrichment: Option -- never blocks event creation when absent.
+  const optionMatch = /Option:\s*([\s\S]+?)\s*(?=Tickets:|Meeting Point:|Meeting Time:|Product Code:|Payment Details:|Additional information|Please note:|$)/.exec(
+    rawText
+  );
+  const option = optionMatch ? optionMatch[1].trim() : null;
+
+  // OPTIONAL enrichment: Tickets -- never blocks event creation when absent.
+  const ticketsMatch = /Tickets:\s*([\s\S]+?)\s*(?=Meeting Point:|Meeting Time:|Product Code:|Payment Details:|Additional information|Please note:|$)/.exec(
+    rawText
+  );
+  const tickets = ticketsMatch ? ticketsMatch[1].trim() : null;
+
+  // REQUIRED anchor 3: Travel Date -- NEAREST-BY-DISTANCE match of the date
+  // shape to its own "Travel Date:" label, not a direct "label then value"
+  // capture (debug/golden-tours-no-event): the real OCR reads this field's
+  // whole row BACKWARDS -- "...Tue 05 Jan, 2027 Name: Travel Date:" -- so
+  // the date VALUE sits before both the "Name:" and "Travel Date:" labels,
+  // not after either one. Searched only within the text BEFORE this
+  // voucher's own "Product:" anchor (never the whole raw OCR text), so a
+  // coincidental date-shaped run elsewhere (none exists in the one real
+  // sample this was built from, but nothing about the shape rules one out
+  // in principle) can never be preferred over a genuinely missing field.
+  const travelDateScope = rawText.slice(0, productMatch.index);
+  const travelDateMatch = goldenToursFindValueNearestLabel(travelDateScope, 'Travel Date:', GOLDEN_TOURS_DATE_PATTERN);
+  if (!travelDateMatch) {
+    throw new Error('Unrecognized Golden Tours voucher text: no "Travel Date" field found. Full extracted text:\n' + rawText);
+  }
+  const day = Number(travelDateMatch[1]);
+  const monthToken = travelDateMatch[2].toLowerCase();
+  if (!Object.prototype.hasOwnProperty.call(GOLDEN_TOURS_MONTH_ABBREVIATIONS, monthToken)) {
+    throw new Error(
+      'Unrecognized Golden Tours voucher text: unrecognized month abbreviation "' + travelDateMatch[2] + '". Full extracted text:\n' + rawText
+    );
+  }
+  const month = GOLDEN_TOURS_MONTH_ABBREVIATIONS[monthToken];
+  const year = Number(travelDateMatch[3]);
+
+  // REQUIRED anchors 4 & 5: Meeting Point (location) and Meeting Time,
+  // resolved TOGETHER rather than independently (debug/golden-tours-
+  // no-event): the real OCR groups BOTH labels adjacently -- "Meeting
+  // Point: Meeting Time:" -- immediately followed, on the NEXT line, by
+  // BOTH their values run together -- "Golden Tours Visitor Centre ...
+  // UK 09:40 AM Product Code: WB". No single regex capture is correct for
+  // both that inverted ordering and the direct (label-then-its-own-value)
+  // ordering, so:
+  //   1. Confirm the "Meeting Point:" label itself exists -- its OWN
+  //      required-anchor check, independent of whether Meeting Time is
+  //      also present.
+  //   2. Carve the SCOPE from just after "Meeting Point:" to the next
+  //      definite boundary ("Product Code:" / "Payment Details:" /
+  //      "Additional information" / "Please note:" / end of string).
+  //      This scope contains BOTH fields' labels and BOTH their values,
+  //      in EITHER ordering.
+  //   3. Resolve Meeting Time via nearest-by-distance WITHIN that scope
+  //      only (never the whole raw text) -- its own required-anchor
+  //      check.
+  //   4. Derive the location by stripping the "Meeting Time:" label and
+  //      the ALREADY-RESOLVED Meeting Time value's own matched substring
+  //      (removed by its literal text, not by position -- both labels
+  //      and both values are disjoint, non-overlapping runs within this
+  //      scope, so order of removal does not matter) out of the scope
+  //      text. Whatever free text survives, collapsed and trimmed, is the
+  //      location, in EITHER ordering.
+  const meetingPointLabel = 'Meeting Point:';
+  const meetingPointLabelIndex = rawText.indexOf(meetingPointLabel);
+  if (meetingPointLabelIndex === -1) {
+    throw new Error('Unrecognized Golden Tours voucher text: no "Meeting Point" field found. Full extracted text:\n' + rawText);
+  }
+  const meetingPointScopeStart = meetingPointLabelIndex + meetingPointLabel.length;
+  const meetingPointBoundaryMatch = /Product Code:|Payment Details:|Additional information|Please note:/.exec(
+    rawText.slice(meetingPointScopeStart)
+  );
+  const meetingPointScopeEnd = meetingPointBoundaryMatch ? meetingPointScopeStart + meetingPointBoundaryMatch.index : rawText.length;
+  const meetingPointScope = rawText.slice(meetingPointScopeStart, meetingPointScopeEnd);
+
+  // REQUIRED anchor 5: Meeting Time -- self-terminating `HH:MM AM/PM`
+  // shape, resolved nearest-by-distance within the scope above (see point
+  // 3 in the comment above). 12-hour-to-24-hour conversion reuses
+  // parseFeverTicketText's own noon/midnight handling exactly.
+  const meetingTimeMatch = goldenToursFindValueNearestLabel(meetingPointScope, 'Meeting Time:', GOLDEN_TOURS_TIME_PATTERN);
+  if (!meetingTimeMatch) {
+    throw new Error('Unrecognized Golden Tours voucher text: no "Meeting Time" field found. Full extracted text:\n' + rawText);
+  }
+  let hour = Number(meetingTimeMatch[1]);
+  const minute = Number(meetingTimeMatch[2]);
+  const meridiem = meetingTimeMatch[3].toLowerCase();
+
+  if (hour < 1 || hour > 12) {
+    throw new Error('Hour out of range (1-12) in Golden Tours "Meeting Time" match. Full extracted text:\n' + rawText);
+  }
+  if (meridiem === 'pm') {
+    hour = hour === 12 ? 12 : hour + 12;
+  } else {
+    hour = hour === 12 ? 0 : hour;
+  }
+
+  if (minute < 0 || minute > 59) {
+    throw new Error('Minute out of range (0-59) in Golden Tours "Meeting Time" match. Full extracted text:\n' + rawText);
+  }
+
+  // Derive the location (see point 4 in the comment above): strip the
+  // "Meeting Time:" label and the already-resolved Meeting Time value out
+  // of the shared scope; whatever free text survives is the location.
+  const location = meetingPointScope
+    .split('Meeting Time:')
+    .join(' ')
+    .split(meetingTimeMatch[0])
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!location) {
+    throw new Error('Unrecognized Golden Tours voucher text: no "Meeting Point" field found. Full extracted text:\n' + rawText);
+  }
+
+  // description: Option (if present), Tickets (if present), the Order
+  // reference (ALWAYS present, since Order Reference is a required anchor),
+  // then curatedplanet.com's own booking-platform reference (D-06) -- read
+  // from `subject`, OPTIONAL, never blocking, omitted entirely when absent
+  // or non-matching.
+  const descriptionParagraphs = [];
+  if (option) {
+    descriptionParagraphs.push('Option: ' + option);
+  }
+  if (tickets) {
+    descriptionParagraphs.push('Tickets: ' + tickets);
+  }
+  descriptionParagraphs.push('Order reference: ' + ticketIdentifier);
+
+  if (subject) {
+    const subjectRefMatch = /Ref:\s*([A-Za-z0-9]+)/.exec(String(subject));
+    if (subjectRefMatch) {
+      descriptionParagraphs.push('Golden Tours confirmation ref (for your own inbox search): ' + subjectRefMatch[1]);
+    }
+  }
+
+  return {
+    eventName: eventName,
+    location: location,
+    year: year,
+    month: month,
+    day: day,
+    hour: hour,
+    minute: minute,
+    ticketIdentifier: ticketIdentifier,
+    description: descriptionParagraphs.join('\n\n'),
   };
 }
 
@@ -3317,6 +3697,9 @@ const TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL = {
 // above).
 const TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL = {
   'no-reply@enigoo.cz': parseEnigooTicketText,
+  // The tenth portal, Golden Tours (quick-261120-ue1) -- the SECOND
+  // PDF/OCR-sourced portal ever, after enigoo.cz.
+  'assistant@curatedplanet.com': parseGoldenToursTicketText,
 };
 
 /**
@@ -4494,10 +4877,18 @@ function ticketBodyLooksProcessable(message, senderKey) {
  * `GmailMessage` objects in production, plain duck-typed fakes in tests)
  * and `portals` (the TICKETING_PORTALS config array), returns an array of
  * processing jobs, EACH TAGGED WITH A `mode`:
- *   - `{ mode: 'pdf', attachment, portal }` — ONE JOB PER QUALIFYING PDF
- *     ATTACHMENT, for a portal whose sender resolves against
+ *   - `{ mode: 'pdf', attachment, portal, message }` — ONE JOB PER
+ *     QUALIFYING PDF ATTACHMENT, for a portal whose sender resolves against
  *     TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL (PDF/OCR-sourced, e.g.
- *     enigoo.cz).
+ *     enigoo.cz). The `message` key (quick-261120-ue1, D-06 — the FIRST
+ *     extension of the PDF/OCR PARSER CONTRACT, mirroring the
+ *     already-established BODY-PARSER CONTRACT/ICS BUILDER CONTRACT
+ *     precedents of adding one inert trailing argument for exactly one
+ *     portal's need) was previously carried only by the `'body'`/`'ics'`
+ *     jobs below; all three modes are now consistent, letting
+ *     processTicketPdfAttachment call the registered parser with the
+ *     message's own subject as a second, inert-by-default argument
+ *     (Golden Tours' parseGoldenToursTicketText is the first to use it).
  *   - `{ mode: 'body', message, portal }` — EXACTLY ONE JOB PER MATCHING
  *     MESSAGE, for a portal whose sender resolves against
  *     TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL (body-sourced, e.g. Kino
@@ -4513,7 +4904,10 @@ function ticketBodyLooksProcessable(message, senderKey) {
  * A message whose sender does not resolve to any configured portal, or
  * whose portal resolves to none of the three registries, or (for a
  * PDF/ICS-sourced portal) carries no qualifying attachment, contributes NO
- * jobs.
+ * jobs. The middle case ("configured, but the running code has no handler")
+ * is NOT a silent skip at the action level: findUnhandledTicketingPortalSenders
+ * below detects it, and appliesTo/run turn it into a loud failure
+ * (debug/golden-tours-no-event).
  * Pure, no GAS globals — every GAS-shaped method call here is invoked ON
  * THE PASSED-IN objects only, so this is fully unit-testable under Node
  * with fake message/attachment objects.
@@ -4543,7 +4937,7 @@ function resolveTicketProcessingJobs(messages, portals) {
     if (TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL[senderKey]) {
       const pdfAttachments = findTicketPdfAttachments(message);
       for (let j = 0; j < pdfAttachments.length; j++) {
-        jobs.push({ mode: 'pdf', attachment: pdfAttachments[j], portal: portal });
+        jobs.push({ mode: 'pdf', attachment: pdfAttachments[j], portal: portal, message: message });
       }
     } else if (TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL[senderKey] && ticketBodyLooksProcessable(message, senderKey)) {
       jobs.push({ mode: 'body', message: message, portal: portal });
@@ -4553,6 +4947,70 @@ function resolveTicketProcessingJobs(messages, portals) {
   }
 
   return jobs;
+}
+
+/**
+ * ticketingPortalHasProcessingMode (debug/golden-tours-no-event) — true when
+ * `senderKey` (an already-lowercased address, as ticketingExtractEmailAddress
+ * returns it) is registered in AT LEAST ONE of the three processing-mode
+ * registries resolveTicketProcessingJobs dispatches on:
+ * TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL ('pdf'),
+ * TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL ('body') or TICKET_ICS_MODE_SENDERS
+ * ('ics'). Uses the SAME three lookups as resolveTicketProcessingJobs' own
+ * branch conditions (minus their per-message attachment/content halves), so
+ * the two can never disagree about which senders the running code can handle.
+ * Pure, no GAS globals.
+ */
+function ticketingPortalHasProcessingMode(senderKey) {
+  return Boolean(
+    TICKET_TEXT_PARSERS_BY_IDENTIFYING_EMAIL[senderKey] ||
+      TICKET_BODY_PARSERS_BY_IDENTIFYING_EMAIL[senderKey] ||
+      TICKET_ICS_MODE_SENDERS.indexOf(senderKey) !== -1
+  );
+}
+
+/**
+ * findUnhandledTicketingPortalSenders (debug/golden-tours-no-event) — the
+ * lowercased identifyingEmail of every CONFIGURED portal that some message in
+ * `messages` resolves to, but for which the RUNNING code registers no
+ * processing mode at all (ticketingPortalHasProcessingMode false).
+ * Deduplicated, in first-seen order; `[]` when there are none or `messages`
+ * is null/empty. Pure, no GAS globals.
+ *
+ * WHY THIS EXISTS: the owner added the Golden Tours entry to the live
+ * 07-action-ticketing-portals-TICKETING_PORTALS Script Property while the
+ * live Apps Script project had not been clasp-pushed since before Golden
+ * Tours support existed. Script Properties take effect the moment they are
+ * saved; code changes only on a manual `clasp push` — so a configured portal
+ * running AHEAD of the deployed code is a structurally reachable state.
+ * resolveTicketProcessingJobs gives such a message zero jobs, the SAME result
+ * as unrelated mail, so the action used to be skipped and the thread labeled
+ * processed with no event, no failed label and no notification. That is a
+ * deployment/config error, never "not applicable": appliesTo claims such a
+ * thread and run throws, which dispatchActions turns into the failed label
+ * plus the owner's failure notification.
+ *
+ * Deliberately NOT covered (and still silent, by design): a portal that IS
+ * handled but whose message simply does not qualify (no ticket PDF/.ics, or
+ * a body that fails its content detector) — that is "not applicable".
+ */
+function findUnhandledTicketingPortalSenders(messages, portals) {
+  const list = messages || [];
+  const unhandled = [];
+
+  for (let i = 0; i < list.length; i++) {
+    const portal = resolveTicketingPortal(list[i].getFrom(), portals);
+    if (!portal) {
+      continue;
+    }
+
+    const senderKey = ticketingExtractEmailAddress(portal.identifyingEmail);
+    if (!ticketingPortalHasProcessingMode(senderKey) && unhandled.indexOf(senderKey) === -1) {
+      unhandled.push(senderKey);
+    }
+  }
+
+  return unhandled;
 }
 
 /**
@@ -4766,8 +5224,16 @@ function createTicketCalendarEvent(parsedTicket, calendarId, attachments) {
  * this is what guarantees a temp PDF is never left orphaned when
  * `parseTicketText` throws or anything downstream (calendar resolution,
  * the Calendar API call) throws.
+ *
+ * `message` (quick-261120-ue1, D-06) is the third parameter, the PDF/OCR
+ * PARSER CONTRACT's first-ever extension: the registered parser is called
+ * with `message.getSubject()` as its own second argument, inert for
+ * enigoo.cz's one-argument parseEnigooTicketText (JS silently ignores an
+ * extra call argument a function doesn't declare) and used by Golden
+ * Tours' parseGoldenToursTicketText to surface curatedplanet.com's own
+ * booking-platform reference in the event description.
  */
-function processTicketPdfAttachment(attachment, portal) {
+function processTicketPdfAttachment(attachment, portal, message) {
   // Resolved ONCE at the top and threaded explicitly through every
   // downstream Calendar API call site below, rather than each call site
   // independently re-reading `portal.calendarId` -- see
@@ -4810,7 +5276,7 @@ function processTicketPdfAttachment(attachment, portal) {
     if (!parseTicketText) {
       throw new Error('No ticket-text parser registered for ticketing portal: ' + portal.identifyingEmail);
     }
-    const parsedTicket = parseTicketText(extractedText);
+    const parsedTicket = parseTicketText(extractedText, message.getSubject());
 
     // DEDUP SAFETY NET: if this ticket's parser could extract a stable
     // ticketIdentifier, check whether an event already carries that exact
@@ -5237,6 +5703,12 @@ const TICKETING_PORTALS_ACTION = {
    * (debug/ticketmaster-cz-order-confirm). appliesTo is a SECOND, independent
    * gate — dispatchActions consults it before run — so it must repeat the
    * check rather than rely on resolveTicketProcessingJobs.
+   *
+   * Also TRUE (debug/golden-tours-no-event) when a message's sender matches
+   * a configured portal for which the running code registers NO processing
+   * mode at all — claimed, not skipped, so run can fail loudly instead of the
+   * thread being labeled processed in silence. See
+   * findUnhandledTicketingPortalSenders.
    */
   appliesTo: function (thread) {
     const messages = thread.getMessages();
@@ -5258,6 +5730,9 @@ const TICKETING_PORTALS_ACTION = {
       if (TICKET_ICS_MODE_SENDERS.indexOf(senderKey) !== -1 && findTicketIcsAttachments(messages[i]).length > 0) {
         return true;
       }
+      if (!ticketingPortalHasProcessingMode(senderKey)) {
+        return true;
+      }
     }
 
     return false;
@@ -5276,20 +5751,41 @@ const TICKETING_PORTALS_ACTION = {
    * attachments/messages get processed here. A message matching neither a
    * configured portal nor any processing mode's requirements contributes
    * no job and is skipped gracefully.
+   *
+   * EXCEPTION (debug/golden-tours-no-event): a message from a CONFIGURED
+   * portal that the running code has no processing mode for is a
+   * deployment/config error, not "no requirements met". After every handled
+   * job has run (so it never blocks a legitimate event on the same thread),
+   * run THROWS naming each such sender — dispatchActions then applies the
+   * failed label and notifies the owner. See
+   * findUnhandledTicketingPortalSenders.
    */
   run: function (thread) {
     const messages = thread.getMessages();
-    const jobs = resolveTicketProcessingJobs(messages, TICKETING_PORTALS_ACTION.config.ticketingPortals);
+    const portals = TICKETING_PORTALS_ACTION.config.ticketingPortals;
+    const jobs = resolveTicketProcessingJobs(messages, portals);
 
     jobs.forEach(function (job) {
       if (job.mode === 'pdf') {
-        processTicketPdfAttachment(job.attachment, job.portal);
+        processTicketPdfAttachment(job.attachment, job.portal, job.message);
       } else if (job.mode === 'body') {
         processTicketFromMessageBody(job.message, job.portal);
       } else if (job.mode === 'ics') {
         processTicketFromIcsAttachment(job.message, job.portal);
       }
     });
+
+    const unhandledSenders = findUnhandledTicketingPortalSenders(messages, portals);
+    if (unhandledSenders.length > 0) {
+      throw new Error(
+        'Ticketing portal configured but not supported by the running code: ' +
+          unhandledSenders.join(', ') +
+          '. The 07-action-ticketing-portals-TICKETING_PORTALS setting lists this sender, but no processing mode ' +
+          '(PDF/OCR text parser, body parser or .ics mode) is registered for it in the code this Apps Script project is ' +
+          'actually running. If support for this portal was added recently, the live project is probably stale: run ' +
+          'clasp push, then remove this email\'s labels so it is reprocessed. Otherwise remove the entry from that setting.'
+      );
+    }
   },
 };
 
@@ -5338,6 +5834,10 @@ if (typeof module !== 'undefined' && module.exports) {
     findKinoArtTicketPdfAttachment: findKinoArtTicketPdfAttachment,
     findTicketmasterCzTicketPdfAttachment: findTicketmasterCzTicketPdfAttachment,
     resolveTicketProcessingJobs: resolveTicketProcessingJobs,
+    // debug/golden-tours-no-event: the "configured portal, no handler in the
+    // running code" guard.
+    ticketingPortalHasProcessingMode: ticketingPortalHasProcessingMode,
+    findUnhandledTicketingPortalSenders: findUnhandledTicketingPortalSenders,
     TICKETING_PORTALS_ACTION: TICKETING_PORTALS_ACTION,
     // processTicketFromMessageBody IS exported despite being GAS-only
     // (GmailMessage/DriveApp/CalendarApp/Calendar/UrlFetchApp), unlike its
@@ -5412,6 +5912,12 @@ if (typeof module !== 'undefined' && module.exports) {
     ticketingBodyInputForSender: ticketingBodyInputForSender,
     ticketingMessageRawHtml: ticketingMessageRawHtml,
     findGooutTicketPdfAttachment: findGooutTicketPdfAttachment,
+    // The tenth portal, Golden Tours (quick-261120-ue1), the SECOND
+    // PDF/OCR-sourced one.
+    parseGoldenToursTicketText: parseGoldenToursTicketText,
+    // debug/golden-tours-no-event: the real-OCR scrambled-reading-order
+    // fix's own shared helper (Travel Date / Meeting Time nearest-match).
+    goldenToursFindValueNearestLabel: goldenToursFindValueNearestLabel,
   };
 }
 
